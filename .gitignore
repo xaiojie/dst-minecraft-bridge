@@ -1,0 +1,9 @@
+.worktrees/
+.superpowers/
+**/.gradle/
+**/build/
+mc/run/
+evidence/
+*.dylib
+*.class
+__pycache__/
