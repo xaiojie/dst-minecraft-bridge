@@ -12,3 +12,27 @@ contract-test: $(BUILD)/frame_contract_test java-contract-classes
 	DSTMC_JAVA="$(JAVA)" ./$(BUILD)/frame_contract_test ../protocol/fixtures/frame-v2.bin
 clean:
 	rm -rf $(BUILD)
+
+GLFLAGS := -Wno-deprecated-declarations -framework OpenGL -framework Cocoa
+.PHONY: all gl-test
+all: $(BUILD)/libdstmc_probe.dylib
+$(BUILD)/gl_state_test: tests/gl_state_test.mm src/gl_observer.mm include/gl_observer.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/gl_state_test.mm src/gl_observer.mm -o $@
+gl-test: $(BUILD)/gl_state_test
+	./$(BUILD)/gl_state_test
+$(BUILD)/frame_reader_test: tests/frame_reader_test.cpp src/frame_reader.cpp include/gl_observer.h include/frame_protocol.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) tests/frame_reader_test.cpp src/frame_reader.cpp -o $@
+.PHONY: reader-test
+reader-test: $(BUILD)/frame_reader_test
+	./$(BUILD)/frame_reader_test
+$(BUILD)/loader_test: tests/loader_test.mm
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(GLFLAGS) $< -o $@
+.PHONY: loader-test
+loader-test: $(BUILD)/loader_test all
+	@d=$$(mktemp -d); DSTMC_PROBE_DIR="$$d" DYLD_INSERT_LIBRARIES="$(CURDIR)/$(BUILD)/libdstmc_probe.dylib" ./$(BUILD)/loader_test; result=$$?; rm -rf "$$d"; exit $$result
+$(BUILD)/libdstmc_probe.dylib: src/entry.mm src/gl_observer.mm src/frame_reader.cpp include/gl_observer.h include/frame_protocol.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/gl_observer.mm src/frame_reader.cpp -o $@
