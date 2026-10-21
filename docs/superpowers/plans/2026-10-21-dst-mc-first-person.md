@@ -69,11 +69,11 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 **Interfaces:** 产生上述全部共享类型；Java `WorldTransform.toMc(Vec3): Vec3` / `toDst(Vec3): Vec3`、`PairingStore.loadOrCreate(PairKey, Vec3 dstOrigin, Vec3 mcOrigin): WorldTransform`、`RequestLedger.receive(Command): CommandResult` / `finish(UUID, CommandResult): void`；C++ `read_frame(const void*, size_t, FrameKey expected): optional<FrameView>`，`FrameView` 为已校验的只读槽视图。
 
-- [ ] 写失败测试：`coordinate_roundtrip` 断言 DST 原点 `(100,0,-50)`、MC 原点 `(0,64,0)` 时 `(106.5,2,-47)` 映射为 `(6.5,66,3)` 且可逆；`restart_keeps_origin` 重启存储后原点相同；`foreign_epoch_rejected` 拒绝旧会话；`receipt_is_not_application` 收到只返回 PENDING，重复收到不执行两次，重启后未决项为 UNRESOLVED。
-- [ ] 从旧工程仅复制 wrapper 和已核对的版本配置，建立独立 Java main 测试总入口 `ContractTests.main(String[])`，后续任务的测试加入同一总入口；执行 `cd mc && ./gradlew coreTest --console plain`，确认失败针对未实现接口；随后实现上述协议核心，不复制旧自动 TNT 和传送循环。核心断言包括 `toMc(new Vec3(106.5,2,-47)).equals(new Vec3(6.5,66,3))`、`receive(c).status()==PENDING`、`receive(oldEpoch).status()==REJECTED`。
-- [ ] 写并运行 C++ 失败测试：Java 导出的固定二进制样本可读；截断文件、奇数序列、超大尺寸、NaN 矩阵、不同会话均不可读；用 `make -C native contract-test` 观察预期失败，再实现布局读取与边界检查。原子提交和租约测试使用真实共享映射，不仅检查打包字节。
-- [ ] 运行 `./gradlew coreTest` 与 `make -C native contract-test`；输出 Java ARM64 写入、C++ x86_64 读取同一样本的通过记录。固定样本的格式断言属于跨语言兼容测试。
-- [ ] 仅提交本任务列出的实现、配置和样本：`git commit -m "feat: add versioned bridge protocol and persistent world pairing"`。
+- [x] 写失败测试：`coordinate_roundtrip` 断言 DST 原点 `(100,0,-50)`、MC 原点 `(0,64,0)` 时 `(106.5,2,-47)` 映射为 `(6.5,66,3)` 且可逆；`restart_keeps_origin` 重启存储后原点相同；`foreign_epoch_rejected` 拒绝旧会话；`receipt_is_not_application` 收到只返回 PENDING，重复收到不执行两次，重启后未决项为 UNRESOLVED。
+- [x] 从旧工程仅复制 wrapper 和已核对的版本配置，建立独立 Java main 测试总入口 `ContractTests.main(String[])`，后续任务的测试加入同一总入口；执行 `cd mc && ./gradlew coreTest --console plain`，确认失败针对未实现接口；随后实现上述协议核心，不复制旧自动 TNT 和传送循环。核心断言包括 `toMc(new Vec3(106.5,2,-47)).equals(new Vec3(6.5,66,3))`、`receive(c).status()==PENDING`、`receive(oldEpoch).status()==REJECTED`。
+- [x] 写并运行 C++ 失败测试：Java 导出的固定二进制样本可读；截断文件、奇数序列、超大尺寸、NaN 矩阵、不同会话均不可读；用 `make -C native contract-test` 观察预期失败，再实现布局读取与边界检查。原子提交和租约测试使用真实共享映射，不仅检查打包字节。
+- [x] 运行 `./gradlew coreTest` 与 `make -C native contract-test`；输出 Java ARM64 写入、C++ x86_64 读取同一样本的通过记录。固定样本的格式断言属于跨语言兼容测试。
+- [x] 仅提交本任务列出的实现、配置和样本：`git commit -m "feat: add versioned bridge protocol and persistent world pairing"`。
 
 ## Task 2: DST 原生扩展的加载与渲染诊断
 
