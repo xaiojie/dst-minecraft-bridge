@@ -81,11 +81,11 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 **Interfaces:** 消费 `FrameView`；产生 `RenderProbe(frame_no, context_id, viewport, draw_no, projection, modelview, depth_enabled, depth_mask, depth_range, blend_state, target_id)` 诊断 JSONL。C++ `observe_draw(const RenderProbe&): void`、`capture_probe_frame(): ProbeCapture`；`ProbeCapture` 包含场景颜色/深度和阶段信息。`preflight.py --json` 输出可执行文件哈希、架构、权限、端口和存档锁状态。
 
-- [ ] 写 CGL 离屏失败测试 `gl_state_restored`：预先设置非默认 viewport、纹理绑定、blend、depth、program/FBO，调用一次扩展诊断后逐项相同；`context_recreated` 在销毁并新建上下文后没有复用旧 GL 对象。运行 `make -C native gl-test` 观察失败。
-- [ ] 实现 x86_64 Objective-C++ 动态库，以 `NSOpenGLContext` 的呈现方法和可核验 OpenGL 调用为入口采样；对上下文分别保存状态，避免递归调用。加载器只通过专用启动入口设置本次 `DYLD_INSERT_LIBRARIES`，不修改可执行文件或签名。未识别的绘制状态只记录，不注入合成绘制。
-- [ ] `make -C native all gl-test` 通过后做现场预检；请用户保存并退出当前 DST，再用专用入口重新启动同一测试世界。不得强行结束现有游戏。采样一次地面、树木、生物和 UI 场景，输出 `evidence/render-probe/` 的颜色、原始深度、矩阵、调用阶段和扩展加载记录。
-- [ ] 执行 `python3 tools/capture_render_probe.py --seconds 10 --out evidence/render-probe`。人工检查原生场景是否提供透视深度及 alpha 裁剪；记录哪些 draw 属于场景和 UI，并生成带版本/哈希的识别配置。不能由一张非全黑深度图认定可用。
-- [ ] 若需要额外深度通道，诊断报告必须明确原深度缺失在哪些物体；任务 4 负责验证补充通道。提交 `feat: add macOS DST render diagnostics and isolated launcher`。
+- [x] 写 CGL 离屏失败测试 `gl_state_restored`：预先设置非默认 viewport、纹理绑定、blend、depth、program/FBO，调用一次扩展诊断后逐项相同；`context_recreated` 在销毁并新建上下文后没有复用旧 GL 对象。运行 `make -C native gl-test` 观察失败。
+- [x] 实现 x86_64 Objective-C++ 动态库，以 `NSOpenGLContext` 的呈现方法和可核验 OpenGL 调用为入口采样；对上下文分别保存状态，避免递归调用。加载器只通过专用启动入口设置本次 `DYLD_INSERT_LIBRARIES`，不修改可执行文件或签名。未识别的绘制状态只记录，不注入合成绘制。
+- [x] `make -C native all gl-test` 通过后做现场预检；请用户保存并退出当前 DST，再用专用入口重新启动同一测试世界。不得强行结束现有游戏。采样一次地面、树木、生物和 UI 场景，输出 `evidence/render-probe/` 的颜色、原始深度、矩阵、调用阶段和扩展加载记录。
+- [x] 执行 `python3 tools/capture_render_probe.py --seconds 10 --out evidence/render-probe`。人工检查原生场景是否提供透视深度及 alpha 裁剪；记录哪些 draw 属于场景和 UI，并生成带版本/哈希的识别配置。不能由一张非全黑深度图认定可用。
+- [x] 若需要额外深度通道，诊断报告必须明确原深度缺失在哪些物体；任务 4 负责验证补充通道。提交 `feat: add macOS DST render diagnostics and isolated launcher`。
 
 ## Task 3: MC 真实画面捕获与帧传输
 
