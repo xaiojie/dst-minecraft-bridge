@@ -2,6 +2,7 @@ package dev.jay.dstmc.protocol;
 import java.util.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.math.BigDecimal;
 public final class BridgeTypes {
     private BridgeTypes() {}
     public static String canonicalPair(PairKey p) {
@@ -32,9 +33,8 @@ public final class BridgeTypes {
             return b.append('"').toString();
         }
         if (value instanceof Boolean) return value.toString();
-        if (value instanceof Number n) {
-            if (!Double.isFinite(n.doubleValue())) throw new IllegalArgumentException("non-finite JSON number");
-            return new java.math.BigDecimal(n.toString()).stripTrailingZeros().toPlainString();
+        if (value instanceof Number number) {
+            return snapshotNumber(number).stripTrailingZeros().toPlainString();
         }
         if (value instanceof Map<?,?> map) {
             var keys = new TreeMap<String,Object>();
@@ -72,7 +72,16 @@ public final class BridgeTypes {
     private static Map<String,Object> freezeMap(Map<String,Object> map) {
         var copy=new TreeMap<String,Object>(); map.forEach((k,v)->copy.put(Objects.requireNonNull(k), freeze(v))); return Collections.unmodifiableMap(copy);
     }
+    /** Capture the decimal representation once; never retain mutable Number subclasses or narrow through double. */
+    private static BigDecimal snapshotNumber(Number number) {
+        try {
+            return new BigDecimal(number.toString());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("JSON number must be a finite decimal", e);
+        }
+    }
     private static Object freeze(Object value) {
+        if (value instanceof Number number) return snapshotNumber(number);
         if(value instanceof Map<?,?> map) { var copy=new TreeMap<String,Object>(); map.forEach((k,v)->{ if(!(k instanceof String)) throw new IllegalArgumentException("JSON key"); copy.put((String)k,freeze(v)); }); return Collections.unmodifiableMap(copy); }
         if(value instanceof List<?> list) return Collections.unmodifiableList(list.stream().map(BridgeTypes::freeze).toList());
         return value;

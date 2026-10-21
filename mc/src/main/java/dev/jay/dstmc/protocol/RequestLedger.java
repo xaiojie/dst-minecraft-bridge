@@ -43,28 +43,48 @@ public final class RequestLedger implements AutoCloseable {
     }
     public synchronized CommandResult receive(Command command) {
         requireOpen();
-        if(!pair.equals(command.pair()) || !epoch.equals(command.epoch())) return new CommandResult(command.id(),Status.REJECTED,"foreign pair or epoch");
+        if (!pair.equals(command.pair()) || !epoch.equals(command.epoch())) {
+            return new CommandResult(command.id(), Status.REJECTED, "foreign pair or epoch");
+        }
         String fingerprint=HexFormat.of().formatHex(sha256(json(command.kind())+":"+json(command.payload())));
         Entry existing=entries.get(command.id());
         if(existing!=null) {
-            if(!existing.epoch.equals(command.epoch()) || !existing.fingerprint.equals(fingerprint)) return new CommandResult(command.id(),Status.REJECTED,"command id reused with different epoch or parameters");
+            if (!existing.epoch.equals(command.epoch()) || !existing.fingerprint.equals(fingerprint)) {
+                return new CommandResult(command.id(), Status.REJECTED, "command id reused with different epoch or parameters");
+            }
             return existing.result;
         }
-        var result=new CommandResult(command.id(),Status.PENDING,"received; awaiting game thread");
-        var entry=new Entry(epoch,fingerprint,result); persist(command.id(),entry); entries.put(command.id(),entry); pending.add(command); return result;
+        var result = new CommandResult(command.id(), Status.PENDING, "received; awaiting game thread");
+        var entry = new Entry(epoch, fingerprint, result);
+        persist(command.id(), entry);
+        entries.put(command.id(), entry);
+        pending.add(command);
+        return result;
     }
     /** Only the game-thread consumer calls this. A duplicate HTTP receipt never requeues. */
-    public synchronized Optional<Command> pollPending() { requireOpen(); return Optional.ofNullable(pending.poll()); }
+    public synchronized Optional<Command> pollPending() {
+        requireOpen();
+        return Optional.ofNullable(pending.poll());
+    }
     public synchronized void finish(UUID id,CommandResult result) {
         requireOpen();
         Entry old=entries.get(id);
-        if(old==null || !id.equals(result.id()) || !old.epoch.equals(epoch)) throw new IllegalArgumentException("unknown or foreign command");
-        if(result.status()==Status.PENDING) throw new IllegalArgumentException("finish requires final result");
-        if(old.result.status()!=Status.PENDING && old.result.status()!=Status.UNRESOLVED) {
-            if(!old.result.equals(result)) throw new IllegalStateException("terminal result is immutable");
+        if (old == null || !id.equals(result.id()) || !old.epoch.equals(epoch)) {
+            throw new IllegalArgumentException("unknown or foreign command");
+        }
+        if (result.status() == Status.PENDING) {
+            throw new IllegalArgumentException("finish requires final result");
+        }
+        if (old.result.status() != Status.PENDING && old.result.status() != Status.UNRESOLVED) {
+            if (!old.result.equals(result)) {
+                throw new IllegalStateException("terminal result is immutable");
+            }
             return;
         }
-        var entry=new Entry(old.epoch,old.fingerprint,result); persist(id,entry); entries.put(id,entry); pending.removeIf(c->c.id().equals(id));
+        var entry = new Entry(old.epoch, old.fingerprint, result);
+        persist(id, entry);
+        entries.put(id, entry);
+        pending.removeIf(command -> command.id().equals(id));
     }
     private void requireOpen() { if(closed) throw new IllegalStateException("closed ledger"); }
     @Override public synchronized void close() {

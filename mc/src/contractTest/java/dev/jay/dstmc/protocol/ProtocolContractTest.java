@@ -2,6 +2,9 @@ package dev.jay.dstmc.protocol;
 import java.nio.file.*;
 import java.nio.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import static dev.jay.dstmc.protocol.BridgeTypes.*;
 public final class ProtocolContractTest {
     public static final PairKey PAIR = new PairKey(UUID.fromString("11111111-1111-1111-1111-111111111111"), "Master", UUID.fromString("22222222-2222-2222-2222-222222222222"), "minecraft:overworld", "ground");
@@ -119,7 +122,7 @@ public final class ProtocolContractTest {
             try(var ledger=new RequestLedger(dir,PAIR,EPOCH)) {
                 ledger.receive(original);
                 check(ledger.receive(new Command(id,PAIR,EPOCH,"damage",Map.of("amount",6))).status()==Status.REJECTED,"reused id changed parameters");
-                check(ledger.pollPending().orElseThrow().payload().get("amount").equals(5),"changed payload entered queue");
+                check(BridgeTypes.json(ledger.pollPending().orElseThrow().payload().get("amount")).equals("5"),"changed payload entered queue");
                 var applied=new CommandResult(id,Status.APPLIED,"confirmed");ledger.finish(id,applied);ledger.finish(id,applied);
                 boolean rejected=false;try { ledger.finish(id,new CommandResult(id,Status.REJECTED,"rewrite")); } catch(IllegalStateException expected) { rejected=true; }
                 check(rejected,"terminal state was overwritten");
@@ -127,6 +130,41 @@ public final class ProtocolContractTest {
             try(var nextEpoch=new RequestLedger(dir,PAIR,UUID.randomUUID())) {
                 check(nextEpoch.receive(original).status()==Status.REJECTED,"old epoch command accepted after restart");
                 check(nextEpoch.pollPending().isEmpty(),"old epoch work replayed");
+            }
+        });
+        // Break caught: caller mutation changes a queued effect after its fingerprint was persisted.
+        test("mutable_number_snapshot_matches_receipt", () -> {
+            Path dir=Files.createTempDirectory("ledger-number-snapshot");
+            var id=UUID.randomUUID();
+            var amount=new AtomicInteger(5);
+            var nestedAmount=new AtomicInteger(7);
+            var command=new Command(id,PAIR,EPOCH,"damage",Map.of("amount",amount,"nested",List.of(Map.of("amount",nestedAmount))));
+            try(var ledger=new RequestLedger(dir,PAIR,EPOCH)) {
+                check(ledger.receive(command).status()==Status.PENDING,"initial command was not received");
+                amount.set(99);
+                nestedAmount.set(101);
+                var queued=ledger.pollPending().orElseThrow();
+                check(BridgeTypes.json(queued.payload()).equals("{\"amount\":5,\"nested\":[{\"amount\":7}]}"),"queued command changed after receipt: "+BridgeTypes.json(queued.payload()));
+                var duplicate=new Command(id,PAIR,EPOCH,"damage",Map.of("amount",5,"nested",List.of(Map.of("amount",7))));
+                check(ledger.receive(duplicate).status()==Status.PENDING,"persisted identity no longer matches queued effect");
+                check(ledger.pollPending().isEmpty(),"equivalent numeric retry queued twice");
+            }
+        });
+        // Break caught: passing exact decimal/integer values through double loses range or precision.
+        test("exact_finite_json_numbers_preserved", () -> {
+            var huge=new BigInteger("9007199254740993123456789012345678901234567890");
+            var exact=new BigDecimal("0.123456789012345678901234567890123456789");
+            var outOfDoubleRange=new BigDecimal("1e309");
+            var command=new Command(UUID.randomUUID(),PAIR,EPOCH,"numbers",Map.of("huge",huge,"exact",exact,"large",outOfDoubleRange));
+            String payload=BridgeTypes.json(command.payload());
+            check(payload.contains("\"huge\":9007199254740993123456789012345678901234567890"),"integer precision changed");
+            check(payload.contains("\"exact\":0.123456789012345678901234567890123456789"),"decimal precision changed");
+            check(new BigDecimal(BridgeTypes.json(command.payload().get("large"))).compareTo(outOfDoubleRange)==0,"finite large decimal changed");
+            for(Number invalid:List.of(Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,Float.NaN,Float.POSITIVE_INFINITY)) {
+                boolean rejected=false;
+                try { new Command(UUID.randomUUID(),PAIR,EPOCH,"invalid",Map.of("amount",invalid)); }
+                catch(IllegalArgumentException expected) { rejected=true; }
+                check(rejected,"non-finite floating-point value accepted");
             }
         });
         // Break caught: publication acknowledged without writing a complete mapped frame.
