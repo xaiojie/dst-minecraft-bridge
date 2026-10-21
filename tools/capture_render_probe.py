@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Request two bounded frames from the loaded extension, retaining raw GL evidence."""
-import argparse, hashlib, json, math, os, pathlib, shutil, struct, sys, time, zlib
+import argparse, hashlib, json, math, os, pathlib, shutil, struct, sys, tempfile, time, zlib
 
 def png(path,width,height,rgba):
  def chunk(tag,data):return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
@@ -12,7 +12,7 @@ def summarize_capture(meta_path):
  color=(base/meta['color']).read_bytes();depth=(base/meta['depth']).read_bytes()
  if len(color)!=w*h*4:raise ValueError(meta.get('error') or 'incomplete color capture')
  png(meta_path.with_suffix('.png'),w,h,color)
- result={'metadata':meta_path.name,'frame_no':p['frame_no'],'draw_no':p['draw_no'],'stage':p['stage'],'viewport':p['viewport'],'target_id':p['target_id'],'program':p['program'],'error':meta.get('error'),'color_sha256':hashlib.sha256(color).hexdigest(),'depth_sha256':hashlib.sha256(depth).hexdigest()}
+ result={'metadata':meta_path.name,'context_id':p['context_id'],'frame_no':p['frame_no'],'draw_no':p['draw_no'],'stage':p['stage'],'viewport':p['viewport'],'target_id':p['target_id'],'program':p['program'],'error':meta.get('error'),'color_sha256':hashlib.sha256(color).hexdigest(),'depth_sha256':hashlib.sha256(depth).hexdigest()}
  if depth:
   if len(depth)!=w*h*4:raise ValueError('incomplete depth capture')
   values=struct.unpack('<'+'f'*(w*h),depth);finite=sorted(x for x in values if math.isfinite(x));result['depth_stats']={'finite':len(finite),'total':w*h,'min':finite[0] if finite else None,'max':finite[-1] if finite else None,'below_clear_one':sum(x<.999999 for x in finite),'distinct_values':len(set(finite))}
@@ -38,6 +38,33 @@ def write_batch(source,name,metas,draws):
  (destination/'draws.jsonl').write_text(''.join(json.dumps(d)+'\n' for d in draws))
  return destination
 
+def publish_request(directory, request):
+    """Expose a complete request in one same-directory rename."""
+    fd, name = tempfile.mkstemp(prefix='.capture.request-', dir=directory)
+    os.close(fd)
+    temporary = pathlib.Path(name)
+    try:
+        # write_text closes its stream before the public path becomes visible.
+        temporary.write_text(request, encoding='utf-8')
+        os.replace(temporary, directory / 'capture.request')
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def select_draws(path, captures):
+    # Frame counters are local to a context, including after context recreation.
+    frames = {(item['context_id'], item['frame_no']) for item in captures}
+    draws = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                draw = json.loads(line)
+            except ValueError:
+                continue
+            if (draw['context_id'], draw['frame_no']) in frames:
+                draws.append(draw)
+    return draws
+
 def main():
  p=argparse.ArgumentParser();p.add_argument('--seconds',type=float,default=10);p.add_argument('--metadata-only',action='store_true',help='record all draw metadata and only two before-present images');p.add_argument('--draws',help='1 to 7 comma-separated draw endpoints from a prior sample');p.add_argument('--batch',help='new evidence subdirectory; never overwritten');p.add_argument('--out',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'evidence/render-probe');a=p.parse_args();out=a.out.resolve()
  try:
@@ -54,19 +81,14 @@ def main():
   request='metadata\n' if a.metadata_only else checkpoint_request(a.draws) if a.draws else 'default\n'
   if a.batch and (pathlib.Path(a.batch).name!=a.batch or a.batch in ('.','..') or (out/a.batch).exists()):raise ValueError('batch must be a new directory name')
  except ValueError as error:print(json.dumps({'error':str(error)}));return 1
- start=time.time();(out/'capture.request').write_text(request);time.sleep(a.seconds)
+ start=time.time();publish_request(out,request);time.sleep(a.seconds)
  captures=[];errors=[];metas=[]
  for path in sorted(out.glob('ctx*-f*-d*.json')):
   if path.stat().st_mtime<start:continue
   metas.append(path)
   try:captures.append(summarize_capture(path))
   except (OSError,ValueError,KeyError) as error:errors.append({'file':path.name,'error':str(error)})
- frames={(x['frame_no']) for x in captures};draws=[]
- if (out/'draws.jsonl').exists():
-  for line in (out/'draws.jsonl').read_text().splitlines():
-   try:d=json.loads(line)
-   except ValueError:continue
-   if d['frame_no'] in frames:draws.append(d)
+ draws=select_draws(out/'draws.jsonl',captures)
  groups={}
  for d in draws:
   key=(d['context_id'],d['program'],d['target_id'],d['depth_enabled'],d['depth_mask'])

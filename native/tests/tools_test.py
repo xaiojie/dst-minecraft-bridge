@@ -1,10 +1,68 @@
-import importlib.util, json, os, pathlib, subprocess, sys, tempfile, unittest
+import importlib.util, json, os, pathlib, struct, subprocess, sys, tempfile, unittest
+from unittest.mock import patch
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('preflight',ROOT/'tools/preflight.py')
 preflight=importlib.util.module_from_spec(spec);spec.loader.exec_module(preflight)
 capture_spec=importlib.util.spec_from_file_location('capture',ROOT/'tools/capture_render_probe.py')
 capture=importlib.util.module_from_spec(capture_spec);capture_spec.loader.exec_module(capture)
 class ToolsTest(unittest.TestCase):
+ def test_request_remains_old_until_complete_publication(self):
+  # A renderer may read at any write boundary. It must see old or complete-new,
+  # never a public partial request. The adapter still writes real files.
+  with tempfile.TemporaryDirectory() as d:
+   directory=pathlib.Path(d);public=directory/'capture.request'
+   public.write_text('default\n');observed=[];real_open=pathlib.Path.open
+   class ObservedWriter:
+    def __init__(self, stream):self.stream=stream
+    def __enter__(self):return self
+    def __exit__(self,*args):return self.stream.__exit__(*args)
+    def write(self,text):
+     split=len(text)//2
+     self.stream.write(text[:split]);self.stream.flush()
+     observed.append(public.read_text() if public.exists() else None)
+     self.stream.write(text[split:]);self.stream.flush()
+     observed.append(public.read_text() if public.exists() else None)
+     return len(text)
+   def observed_open(path,*args,**kwargs):
+    stream=real_open(path,*args,**kwargs)
+    mode=args[0] if args else kwargs.get('mode','r')
+    return ObservedWriter(stream) if 'w' in mode else stream
+   request='checkpoints 3 5\n'
+   with patch.object(pathlib.Path,'open',observed_open):capture.publish_request(directory,request)
+   self.assertEqual(public.read_text(),request)
+   self.assertTrue(observed);self.assertEqual(observed,['default\n','default\n'])
+   self.assertEqual({p.name for p in directory.iterdir()},{'capture.request'})
+
+ def test_failed_request_write_preserves_public_request(self):
+  with tempfile.TemporaryDirectory() as d:
+   directory=pathlib.Path(d);public=directory/'capture.request'
+   public.write_text('metadata\n');real_open=pathlib.Path.open
+   class FailingWriter:
+    def __init__(self,stream):self.stream=stream
+    def __enter__(self):return self
+    def __exit__(self,*args):return self.stream.__exit__(*args)
+    def write(self,text):
+     self.stream.write(text[:3]);self.stream.flush()
+     raise OSError('injected write failure')
+   def failing_open(path,*args,**kwargs):
+    stream=real_open(path,*args,**kwargs)
+    mode=args[0] if args else kwargs.get('mode','r')
+    return FailingWriter(stream) if 'w' in mode else stream
+   with patch.object(pathlib.Path,'open',failing_open):
+    with self.assertRaisesRegex(OSError,'injected write failure'):capture.publish_request(directory,'checkpoints 3 5\n')
+   self.assertEqual(public.read_text(),'metadata\n')
+   self.assertEqual({p.name for p in directory.iterdir()},{'capture.request'})
+
+ def test_draw_selection_keeps_captured_context_and_frame(self):
+  with tempfile.TemporaryDirectory() as d:
+   directory=pathlib.Path(d);meta=directory/'ctx2-f7-d1.json'
+   (directory/'color.rgba').write_bytes(bytes([1,2,3,255]));(directory/'depth.f32').write_bytes(struct.pack('<f',.5))
+   meta.write_text(json.dumps({'probe':{'context_id':2,'frame_no':7,'draw_no':1,'stage':'before-present','viewport':[0,0,1,1],'target_id':0,'program':0},'color':'color.rgba','depth':'depth.f32','error':''}))
+   rows=[{'context_id':1,'frame_no':7,'draw_no':1},{'context_id':2,'frame_no':7,'draw_no':1},{'context_id':2,'frame_no':8,'draw_no':1}]
+   log=directory/'draws.jsonl';log.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+   selected=capture.select_draws(log,[capture.summarize_capture(meta)])
+   self.assertEqual(selected,[{'context_id':2,'frame_no':7,'draw_no':1}])
+
  def test_checkpoint_request_is_bounded(self):
   self.assertEqual(capture.checkpoint_request('109,117,134,260'),'checkpoints 109 117 134 260\n')
   for invalid in ('0','1,1','1,2,3,4,5,6,7,8','20001','x'):
