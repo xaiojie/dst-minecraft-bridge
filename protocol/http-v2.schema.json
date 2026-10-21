@@ -1,0 +1,829 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:dev.jay:dstmc:http:v2",
+  "title": "DST / Minecraft local bridge HTTP protocol v2",
+  "$defs": {
+    "UUID": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "UInt64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "Vec3": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false
+    },
+    "Box": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "max": {
+          "$ref": "#/$defs/Vec3"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "additionalProperties": false,
+      "description": "Half-open AABB; semantic validation requires min <= max on each axis."
+    },
+    "Cell": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "y": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "z": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false
+    },
+    "PairKey": {
+      "type": "object",
+      "properties": {
+        "dst_world": {
+          "$ref": "#/$defs/UUID"
+        },
+        "dst_shard": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mc_world": {
+          "$ref": "#/$defs/UUID"
+        },
+        "mc_dimension": {
+          "type": "string",
+          "minLength": 1
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "dst_world",
+        "dst_shard",
+        "mc_world",
+        "mc_dimension",
+        "region"
+      ],
+      "additionalProperties": false
+    },
+    "Matrix4": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 16,
+      "maxItems": 16,
+      "description": "16 finite float32 values, column-major; reject overflow when converting JSON numbers to float32."
+    },
+    "Space": {
+      "enum": [
+        "MC",
+        "DST"
+      ]
+    },
+    "Pose": {
+      "type": "object",
+      "properties": {
+        "space": {
+          "$ref": "#/$defs/Space"
+        },
+        "position": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "forward": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "up": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "view": {
+          "$ref": "#/$defs/Matrix4"
+        },
+        "projection": {
+          "$ref": "#/$defs/Matrix4"
+        }
+      },
+      "required": [
+        "space",
+        "position",
+        "forward",
+        "up",
+        "view",
+        "projection"
+      ],
+      "additionalProperties": false
+    },
+    "FrameKey": {
+      "type": "object",
+      "properties": {
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "id": {
+          "$ref": "#/$defs/UInt64"
+        }
+      },
+      "required": [
+        "pair",
+        "epoch",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "FrameLease": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/FrameKey"
+        },
+        "pose": {
+          "$ref": "#/$defs/Pose"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1920
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1080
+        }
+      },
+      "required": [
+        "key",
+        "pose",
+        "width",
+        "height"
+      ],
+      "additionalProperties": false
+    },
+    "Body": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "box": {
+          "$ref": "#/$defs/Box"
+        },
+        "health": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_health": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "revision": {
+          "$ref": "#/$defs/UInt64"
+        }
+      },
+      "required": [
+        "id",
+        "box",
+        "health",
+        "max_health",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "BlockChange": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/UInt64"
+        },
+        "cell": {
+          "$ref": "#/$defs/Cell"
+        },
+        "state": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "revision",
+        "cell",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "TerrainCell": {
+      "type": "object",
+      "properties": {
+        "cell": {
+          "$ref": "#/$defs/Cell"
+        },
+        "boxes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Box"
+          }
+        }
+      },
+      "required": [
+        "cell",
+        "boxes"
+      ],
+      "additionalProperties": false
+    },
+    "ActorSnapshot": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/UInt64"
+        },
+        "bodies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Body"
+          }
+        }
+      },
+      "required": [
+        "revision",
+        "bodies"
+      ],
+      "additionalProperties": false
+    },
+    "Command": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "pair",
+        "epoch",
+        "kind",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "CommandResult": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "APPLIED",
+            "REJECTED",
+            "UNRESOLVED"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "DamageEvent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "source": {
+          "$ref": "#/$defs/Space"
+        },
+        "target": {
+          "$ref": "#/$defs/UUID"
+        },
+        "position": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "amount": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id",
+        "pair",
+        "epoch",
+        "source",
+        "target",
+        "position",
+        "amount",
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "HandshakeRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "dst_origin": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "mc_origin": {
+          "$ref": "#/$defs/Vec3"
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "dst_origin",
+        "mc_origin"
+      ],
+      "additionalProperties": false
+    },
+    "HandshakeResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "dst_origin": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "mc_origin": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "axes": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 9,
+          "maxItems": 9
+        },
+        "frame_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "dst_origin",
+        "mc_origin",
+        "axes",
+        "frame_path"
+      ],
+      "additionalProperties": false
+    },
+    "ExchangeRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Command"
+          }
+        },
+        "damage_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DamageEvent"
+          }
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "commands",
+        "damage_events"
+      ],
+      "additionalProperties": false
+    },
+    "ExchangeResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandResult"
+          }
+        },
+        "actors": {
+          "$ref": "#/$defs/ActorSnapshot"
+        },
+        "block_changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BlockChange"
+          }
+        },
+        "terrain": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TerrainCell"
+          }
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "results",
+        "actors",
+        "block_changes",
+        "terrain"
+      ],
+      "additionalProperties": false
+    },
+    "StatusResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "status": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "CameraLeaseRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "key": {
+          "$ref": "#/$defs/FrameKey"
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "key"
+      ],
+      "additionalProperties": false
+    },
+    "CameraLeaseResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "lease": {
+          "$ref": "#/$defs/FrameLease"
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "lease"
+      ],
+      "additionalProperties": false,
+      "description": "Lease pose is in DST space. Shared image pose is in MC space."
+    },
+    "CameraAppliedRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "key": {
+          "$ref": "#/$defs/FrameKey"
+        },
+        "applied": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "key",
+        "applied"
+      ],
+      "additionalProperties": false
+    },
+    "CameraAppliedResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "key": {
+          "$ref": "#/$defs/FrameKey"
+        },
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol",
+        "pair",
+        "epoch",
+        "key",
+        "accepted"
+      ],
+      "additionalProperties": false
+    },
+    "WindowResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "screen_x": {
+          "type": "number"
+        },
+        "screen_y": {
+          "type": "number"
+        },
+        "logical_width": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "logical_height": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "physical_width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "physical_height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "protocol",
+        "screen_x",
+        "screen_y",
+        "logical_width",
+        "logical_height",
+        "physical_width",
+        "physical_height",
+        "scale"
+      ],
+      "additionalProperties": false,
+      "description": "Screen origin and logical size in macOS points; physical size in framebuffer pixels; content area excludes window chrome."
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "protocol",
+        "error",
+        "reason"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "#/$defs/HandshakeRequest"
+    },
+    {
+      "$ref": "#/$defs/HandshakeResponse"
+    },
+    {
+      "$ref": "#/$defs/ExchangeRequest"
+    },
+    {
+      "$ref": "#/$defs/ExchangeResponse"
+    },
+    {
+      "$ref": "#/$defs/StatusResponse"
+    },
+    {
+      "$ref": "#/$defs/CameraLeaseRequest"
+    },
+    {
+      "$ref": "#/$defs/CameraLeaseResponse"
+    },
+    {
+      "$ref": "#/$defs/CameraAppliedRequest"
+    },
+    {
+      "$ref": "#/$defs/CameraAppliedResponse"
+    },
+    {
+      "$ref": "#/$defs/WindowResponse"
+    },
+    {
+      "$ref": "#/$defs/ErrorResponse"
+    }
+  ],
+  "x-endpoints": {
+    "127.0.0.1:39379/v2/handshake": {
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/HandshakeRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/HandshakeResponse"
+        }
+      }
+    },
+    "127.0.0.1:39379/v2/exchange": {
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/ExchangeRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/ExchangeResponse"
+        }
+      }
+    },
+    "127.0.0.1:39379/v2/status": {
+      "GET": {
+        "response": {
+          "$ref": "#/$defs/StatusResponse"
+        }
+      }
+    },
+    "127.0.0.1:39380/v2/camera/lease": {
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/CameraLeaseRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/CameraLeaseResponse"
+        }
+      }
+    },
+    "127.0.0.1:39380/v2/camera/applied": {
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/CameraAppliedRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/CameraAppliedResponse"
+        }
+      }
+    },
+    "127.0.0.1:39380/v2/window": {
+      "GET": {
+        "response": {
+          "$ref": "#/$defs/WindowResponse"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+plugins { id 'java' }
+// Protocol contracts deliberately do not load Loom or game classes.
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+sourceSets {
+    contractTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+tasks.withType(JavaCompile).configureEach { options.release = 21 }
+tasks.register('coreTest', JavaExec) {
+    dependsOn contractTestClasses
+    classpath = sourceSets.contractTest.runtimeClasspath
+    mainClass = 'dev.jay.dstmc.ContractTests'
+    workingDir = rootDir
+}
+check.dependsOn coreTest
