@@ -1,30 +1,30 @@
 {
   "task": 4,
-  "status": "NOT_VERIFIED",
+  "status": "IN_PROGRESS",
   "task_complete": false,
   "allow_task_5": false,
-  "checked_at": "2026-10-22T13:48:54.656956+00:00",
-  "base_commit": "b8b82820017427c6069c058d194e5fb007700264",
+  "checked_at": "2026-10-23T00:05:00+08:00",
+  "base_commit": "a0de3bcadcf1976f9c1cf671c2bf239584b1cde2",
   "gates": {
     "camera": {
-      "status": "NOT_VERIFIED",
-      "reason": "Steam native process and bounded first-person camera motion observed in two real frames; reflected X axes confirmed. Matching an actual MC frame/camera is pending persistent-axis fix and dual-game validation."
+      "status": "OBSERVED",
+      "reason": "Real first-person composite uses the leased pose and the DST camera follows it; composited frames stable (60/60). Continuous walk/turn tracking evidence still to be recorded."
     },
     "same_frame": {
-      "status": "NOT_VERIFIED",
-      "reason": "No real MC client is paired in this run; no combined same-FrameKey presentation observed."
+      "status": "OBSERVED",
+      "reason": "compose matches one exact FrameKey and its pose (status=0 matched complete frame). /v2/window activation proof not yet sampled at the same instant."
     },
     "transparency": {
       "status": "NOT_VERIFIED",
-      "reason": "No real dual-game transparent MC input window/composite observed in this run."
+      "reason": "Glass window exists in the stage scene but no pixel-level transparency check has been captured."
     },
     "depth_occlusion": {
       "status": "NOT_VERIFIED",
-      "reason": "Native metadata-only calibration sampled shoreline/water; final presentation depth is cleared. Real MC/DST foreground/background and alpha-edge occlusion remain untested."
+      "reason": "Stone wall, near block and a tree exist, but mutual occlusion and DST creature front/back relations are untested."
     },
     "ui": {
-      "status": "NOT_VERIFIED",
-      "reason": "Native UI visible in calibration images, but paired MC HUD/native UI/input ownership acceptance remains untested."
+      "status": "OBSERVED",
+      "reason": "DST HUD draws above the composite; MC HUD overlaps DST HUD at the bottom and the expected split is not yet defined."
     }
   },
   "additional_checks": {
@@ -32,34 +32,28 @@
     "sixty_second_performance": "NOT_VERIFIED"
   },
   "local_checks": {
-    "native_gpu_compositor_and_alpha_replay": "PASSED",
-    "native_http_resize_ack_expiry": "PASSED",
-    "lua_camera_and_connection": "PASSED",
-    "mc_compile_and_publisher": "PASSED"
+    "java_contract": "PASSED (mc/gradlew -p mc check)",
+    "native_all": "PASSED (gl-state, lease, compositor, transform-status, frame-reader, frame-contract, http-framing)",
+    "python_suite": "PASSED (22 tests with lupa+jsonschema)",
+    "handshake_contract": "PASSED (real Lua payload accepted by real Java gate; negative controls rejected)"
   },
   "runtime_evidence": [
-    "evidence/first-person-calibration-1/",
-    "evidence/first-person-calibration-2/",
-    "evidence/first-person-calibration-3/",
-    "evidence/steam-launches/22817-041x8qcv/calibration-forward-negz-1/"
+    "handoff/observations/task4-live/first-composite-74.png",
+    "handoff/observations/task4-live/first-composite.json",
+    "evidence/steam-launches/40431-uxy8dtfu/camera-gate.jsonl"
   ],
-  "next_step": "Complete/review persistent X reflection across stores, frames and native camera; safely refresh via Steam after user save/exit, then validate actual dual-game graphics gate. Final MC test copy remains unpaired.",
-  "checkpoint_commit": "2ea975d63592f11a263462550a7a5da5fbf41419",
-  "review_fix_1_commit": "7c7804808187c6a7cec6ea35cf7e0b1016c47b35",
-  "review_fix_1_candidate": "/tmp/dstmc-task4-review1/libdstmc_probe.dylib",
-  "review_fix_1_scope": "code only; nullable discovery and make deps approved; window proof completed by reviewed fix2; no actual dual-game acceptance",
-  "review_fix_2_commit": "60c5591b80c6ba2455026b359e508c0121f77c6f",
-  "review_fix_2_candidate": "/tmp/dstmc-task4-review2/libdstmc_probe.dylib",
-  "review_fix_2_scope": "code only; identity-bound actual composite proof independently approved; no actual dual-game acceptance",
   "runtime_milestones": {
     "steam_start": "OBSERVED",
     "native_extension_load": "OBSERVED",
     "native_advancing_present_callback": "OBSERVED",
     "bounded_native_first_person_camera": "OBSERVED",
     "fixed_axes_mismatch": "CONFIRMED_X_REFLECTION",
-    "mc_pair_or_composite": "NOT_OBSERVED",
-    "native_pid": 22823,
-    "native_loaded_sha256": "8079000eb6e56fa915e91fe1d5c6ae465e5eeaf494b1efced3480f0c2737a77d"
+    "mc_pair": "OBSERVED",
+    "first_person_composite": "OBSERVED (key 4082; stable at key 74)",
+    "transparent_input_window": "NOT_OBSERVED",
+    "sixty_second_performance": "NOT_OBSERVED"
   },
-  "local_checks_scope": "historical reviewed Task4 WIP and fixes; new persistent-axis code not covered by these historical passes"
+  "native_sha256": "556ec05615c07a8cbbdbc8a0af7694670ba19f4c04df7d1aa3ac601665a10a7e",
+  "next_step": "Restart the MC dev client, re-pave the stage floor over the barrier fill, then capture camera/same_frame/transparency/depth_occlusion/ui acceptance evidence and the transparent-window input test before Task 5.",
+  "notes": "Task 4 is not complete. Composite hides when the MC stream is empty (MC left the stage dimension) or when the DST window aspect differs from the stream."
 }

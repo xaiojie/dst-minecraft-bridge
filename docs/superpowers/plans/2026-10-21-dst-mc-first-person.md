@@ -104,7 +104,7 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 ## Task 4: 第一人称镜头与原生深度合成——画面关口
 
-> 当前执行状态（2026-10-22）：候选代码及两轮审查修复已保存。已修正 Steam 的 Intel 环境触发 ARM-only Python 工具链失败的问题，用户由 Steam 进入原世界，图形扩展加载和持续回调已实测。两帧 960×540 原生第一人称校准及红蓝标记确认 X 反射，正在把固定轴变换贯穿持久配对、帧和镜头。camera、same-frame、transparency、depth occlusion、UI 五项双游戏实机验收仍为 NOT_VERIFIED；任务 4 未完成，不进入任务 5。后台仍有部分 Klei 服务 SSL 错误，不能据此宣称联网完全恢复。
+> 当前执行状态（2026-10-23）：坐标轴 WIP 已经独立复核，两个握手契约不一致（region / mc_origin）已用跨语言契约测试修好；租约生命周期、宽高比匹配、present 前合成、native HTTP 封帧与 DST 断线重连均已修复。**真实双游戏第一人称合成已稳定出现**（`compose status=0 matched complete frame`，连续 60/60 通过，960×540 与 480×270 两种流尺寸都成立），证据见 `handoff/observations/task4-live/`。camera / same_frame / UI 三项已观察，transparency / depth occlusion 未做像素级验收，透明窗口键鼠/放块与 60 秒性能未验证；任务 4 仍未完成，不进入任务 5。详见 `handoff/development-log/task-4-live-report.md`。
 
 **Files:** 创建 `native/src/{camera_service.cpp,compositor.mm,scene_depth.mm}`、`native/include/{camera_service.h,compositor.h}`、`native/tests/{lease_test.cpp,compositor_test.mm}`；创建 `dst-mod/{modmain.lua,modinfo.lua}`、`dst-mod/scripts/dstmc/{camera.lua,connection.lua,world.lua}`、`dst-mod/scripts/components/dstmcidentity.lua`；创建 `mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java`、`mc/src/client/java/dev/jay/dstmc/client/mixin/{WindowCreateMixin,WindowPresentMixin}.java`、`tests/test_first_person_gate.py`，修改 `native/src/entry.mm`。
 

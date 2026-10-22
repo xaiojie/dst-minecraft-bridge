@@ -1,0 +1,23 @@
+{
+  "captured_at": "2026-10-23T00:07+08:00",
+  "native_sha256": "556ec05615c07a8cbbdbc8a0af7694670ba19f4c04df7d1aa3ac601665a10a7e",
+  "evidence_dir": "evidence/steam-launches/40431-uxy8dtfu",
+  "frame_key": 74,
+  "compose_last60": {
+    "COMPOSITED": 59,
+    "total": 60
+  },
+  "note": "First composited Minecraft first-person view inside the real DST window: stone floor, stone wall with glass window, oak tree and a near stone block, with DST HUD intact. Composite is written into the drawable in present() before flushBuffer.",
+  "image": "handoff/observations/task4-live/first-composite-74.png",
+  "gates": {
+    "camera": "OBSERVED (pose follows lease; view is first person)",
+    "same_frame": "OBSERVED for key 74 (compose matches exact frame pose)",
+    "transparency": "NOT_VERIFIED (glass window present, needs pixel check)",
+    "depth_occlusion": "NOT_VERIFIED (needs near/far object + creature test)",
+    "ui": "OBSERVED (DST HUD draws above the composite)"
+  },
+  "additional_checks": {
+    "transparent_window_keyboard_mouse_and_block_placement": "NOT_VERIFIED",
+    "sixty_second_performance": "NOT_VERIFIED"
+  }
+}
