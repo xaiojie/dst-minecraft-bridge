@@ -19,13 +19,18 @@ public final class FrameCapture implements AutoCloseable {
     private WorldExchange.HandshakeResult session;
     private long context,generation;
     private int width,height;
-    private ByteBuffer color,depth,hud;
+    private ByteBuffer color,depth,hud,display;
     public void captureWorld(Pose pose){
         if(!BridgeClient.active()||pose==null){close();return;}
         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();var bridge=BridgeMod.server;
         try {
             long current=GLFW.glfwGetCurrentContext();
-            if(publisher==null||session!=bridge.active()||context!=current){close();session=bridge.active();context=current;publisher=new FramePublisher(bridge.framesDirectory(),session.pair(),session.epoch(),session.transform());}
+            if(publisher==null||session!=bridge.active()){close();session=bridge.active();context=current;publisher=new FramePublisher(bridge.framesDirectory(),session.pair(),session.epoch(),session.transform());}
+            else if(context!=current){
+                // The CPU publisher owns epoch-wide IDs, independent of the GL context.
+                // Recreate readback buffers and generation without resetting those IDs.
+                releaseBuffers();context=current;bridge.invalidateStream();
+            }
             if(width!=target.width||height!=target.height){
                 releaseBuffers();FrameLayout.layerBytes(target.width,target.height);width=target.width;height=target.height;
                 publisher.resize(width,height);generation=publisher.generation();bridge.invalidateStream();int bytes=FrameLayout.layerBytes(width,height);
@@ -44,6 +49,30 @@ public final class FrameCapture implements AutoCloseable {
         if(target.width!=width||target.height!=height){publisher.discardPending();return;}
         read(target,false,hud,null);zeroTransparent(hud);publisher.hud(generation,hud);
         publisher.publishCompleted().ifPresent(key->BridgeMod.server.updateStream(session,new BridgeServer.Stream(key,publisher.path().toString(),generation,width,height)));
+        if(PassthroughWindow.configured()&&!PassthroughWindow.active())restoreDisplay(target);
+    }
+    /** Rebuild the normal MC image after separate HUD capture when native fusion stops. */
+    private void restoreDisplay(com.mojang.blaze3d.pipeline.RenderTarget target){
+        if(display==null)display=MemoryUtil.memAlloc(color.capacity());
+        for(int i=0;i<color.capacity();i+=4){
+            int inverseAlpha=255-Byte.toUnsignedInt(hud.get(i+3));
+            for(int channel=0;channel<4;channel++){
+                int value=Byte.toUnsignedInt(hud.get(i+channel))+(Byte.toUnsignedInt(color.get(i+channel))*inverseAlpha+127)/255;
+                display.put(i+channel,(byte)Math.min(255,value));
+            }
+            display.put(i+3,(byte)255); // Normal MC display is opaque even though the capture has transparent sky.
+        }
+        int texture=GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D),unpack=GL11.glGetInteger(GL21.GL_PIXEL_UNPACK_BUFFER_BINDING);
+        int[] names={GL11.GL_UNPACK_ALIGNMENT,GL11.GL_UNPACK_ROW_LENGTH,GL11.GL_UNPACK_SKIP_ROWS,GL11.GL_UNPACK_SKIP_PIXELS,GL11.GL_UNPACK_SWAP_BYTES};
+        int[] values=new int[names.length];for(int i=0;i<names.length;i++)values[i]=GL11.glGetInteger(names[i]);
+        try{
+            GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER,0);GL11.glBindTexture(GL11.GL_TEXTURE_2D,((GlTexture)target.getColorTexture()).glId());
+            for(int i=0;i<names.length;i++)GL11.glPixelStorei(names[i],i==0?1:0);
+            GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D,0,0,0,width,height,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,display);
+        }finally{
+            for(int i=0;i<names.length;i++)GL11.glPixelStorei(names[i],values[i]);
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D,texture);GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER,unpack);
+        }
     }
     private static void zeroTransparent(ByteBuffer bytes){for(int i=0;i<bytes.limit();i+=4)if(bytes.get(i+3)==0){bytes.put(i,(byte)0);bytes.put(i+1,(byte)0);bytes.put(i+2,(byte)0);}}
     private static void read(com.mojang.blaze3d.pipeline.RenderTarget target,boolean withDepth,ByteBuffer rgba,ByteBuffer depth){
@@ -64,6 +93,6 @@ public final class FrameCapture implements AutoCloseable {
             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldFbo);GL30.glDeleteFramebuffers(fbo);
         }
     }
-    private void releaseBuffers(){if(color!=null)MemoryUtil.memFree(color);if(depth!=null)MemoryUtil.memFree(depth);if(hud!=null)MemoryUtil.memFree(hud);color=depth=hud=null;width=height=0;}
+    private void releaseBuffers(){if(color!=null)MemoryUtil.memFree(color);if(depth!=null)MemoryUtil.memFree(depth);if(hud!=null)MemoryUtil.memFree(hud);if(display!=null)MemoryUtil.memFree(display);color=depth=hud=display=null;width=height=0;}
     @Override public void close(){try{if(publisher!=null)publisher.close();}catch(java.io.IOException e){throw new java.io.UncheckedIOException(e);}finally{publisher=null;session=null;releaseBuffers();var bridge=BridgeMod.server;if(bridge!=null)bridge.invalidateStream();}}
 }

@@ -1,1 +1,16 @@
-{"required":true,"package":"dev.jay.dstmc.client.mixin","compatibilityLevel":"JAVA_21","client":["WorldCaptureMixin","GuiCaptureMixin","BridgeSceneMixin","FixtureWorldLoadMixin"],"injectors":{"defaultRequire":1}}
+{
+  "required": true,
+  "package": "dev.jay.dstmc.client.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "WorldCaptureMixin",
+    "GuiCaptureMixin",
+    "BridgeSceneMixin",
+    "FixtureWorldLoadMixin",
+    "WindowCreateMixin",
+    "WindowPresentMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
