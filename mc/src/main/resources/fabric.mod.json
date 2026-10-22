@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"dst_mc_bridge","version":"0.1.0","name":"DST MC First Person Bridge","environment":"*","entrypoints":{"main":["dev.jay.dstmc.BridgeMod"],"client":["dev.jay.dstmc.client.BridgeClient"]},"mixins":[{"config":"dst_mc_bridge.client.mixins.json","environment":"client"}],"depends":{"fabricloader":">=0.19.5","minecraft":"1.21.11","java":">=21","fabric-api":"*"}}

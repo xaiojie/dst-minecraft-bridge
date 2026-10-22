@@ -114,3 +114,61 @@ cd .. && make -C native contract-test
 ```
 
 `ContractTests.main(String[])` is the common Java test entry point; subsequent tasks add their suites there. Java tests regenerate the deterministic golden binary. Native tests compile explicitly for x86_64 and execute against that Java ARM64 file. The two-process test launches Java explicitly with `arch -arm64`, maps the same runtime file, pins all three slots, proves backpressure and safe reuse, then verifies 200 concurrent frame publications. No game launch, mod install or original save is involved.
+
+## Task 3 runtime discovery and capture
+
+`GET 127.0.0.1:39379/v2/status` is the strict `StatusResponse` in the HTTP schema.
+Before handshake it reports `status: UNPAIRED`, the copy's persistent `mc_world`,
+`pid`, random process `run_id`, `started_at_ms`, server tick `heartbeat`,
+`peer_last_seen_ms` (0 before heartbeat exchange), `fixture` and `stage_ready`.
+`pair`, `epoch`, `frame_path`, `generation`, `latest_frame`, `width`, `height` are null.
+After handshake status is `PAIRED` and pair/epoch identify the active session.
+Until a complete current-generation frame commits, stream fields remain null.
+Then `latest_frame` is the exact committed FrameKey and MUST match active pair/epoch;
+`frame_path` is an absolute mmap path, `generation` is positive, width/height are
+physical pixels. Fetch status and use the native leased exact-key reader; retry
+status if the advertised frame has already rotated out. Never inspect mutable
+slot headers as an unleased selector. A resize or handshake creates a distinct
+mapping; old files remain for outstanding readers. Generation is scoped to a
+publisher epoch; path is globally unique even if an epoch is explicitly reused.
+
+All JSON integers emitted to Lua are in `[0, 9007199254740991]`; frame IDs fail
+with `HTTP_UINT64_NOT_EXACT` at exhaustion. Binary frame fields remain uint64.
+Existing handshake input remains unchanged. The MC origin must be `(0,64,0)`;
+only `dst_mc_bridge:stage` / `ground` is supported. Each independent copied save
+stores one MC UUID and at most one DST pair; a different DST world/shard is rejected
+with `WORLD_MISMATCH`, including after restart. Re-handshake retains the first origin.
+The final intended copy is reserved for the real DST world. Mock pairing tests
+run in `DST-MC-Frame-Fixture`, selected explicitly by `-PtestSave=...` at launch.
+Its `/test/scene` endpoint is available only under the fixture VM property AND
+the exact current save directory `DST-MC-Frame-Fixture`. A fixture launch that
+manually selects any other save fails with `FIXTURE_SAVE_MISMATCH` before creating
+bridge identity or serving HTTP. The dev-only fixture loader continues the
+experimental-world backup gate only for that same dual guard, after the official
+`makeWorldBackup()` succeeds. Other saves keep Minecraft's ordinary prompt;
+backup failure never runs the world-load continuation.
+
+World capture occurs before GameRenderer's hand depth clear. It uses current
+RenderTarget GlTexture IDs and synchronous `glReadPixels`, so publication can
+only follow completed GPU readback of world RGBA/depth and subsequent hand/HUD.
+Images use OpenGL bottom-left row origin. Color buffers are already premultiplied
+by MC blending over transparent black; zero-alpha RGB is normalized to zero.
+No second premultiplication is applied to already blended HUD pixels. The shared
+view is `rotation * translate(-eye)` (full MC world view), using the actual world
+projection passed to LevelRenderer. Hurt/bob/nausea cosmetic transforms are disabled
+while bridging. Sky/cloud backgrounds are excluded in the stage; genuine blocks,
+entities and particles use the regular MC renderer. The initial plane consists
+of invisible vanilla barriers; the one visible stone is the graphics fixture.
+
+Local verification uses JDK21 and `./gradlew build coreTest --console plain`
+with no dev client running. Launch the fixture using
+`./gradlew runClient -PtestSave=DST-MC-Frame-Fixture -x downloadAssets --console plain`;
+the installed assets directory and index29 are used without redistributing game assets.
+For a fresh development run directory, complete accessibility onboarding, or set
+only that development directory's `options.txt` `onboardAccessibility:false`
+while its client is stopped. The live Python test requires `jsonschema` and
+`DSTMC_EXPECT_PID` / `DSTMC_LAUNCH_AFTER_MS`, rejects any other process/run, and
+compiles its native leased reader explicitly for x86_64. It captures real stone,
+removes that block via the fixture-only server-thread API, verifies the pixels
+disappear, checks matched camera pose/depth/premultiplied alpha, then samples
+continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowed.

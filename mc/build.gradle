@@ -1,10 +1,25 @@
-plugins { id 'java' }
-// Protocol contracts deliberately do not load Loom or game classes.
+plugins { id 'net.fabricmc.fabric-loom-remap' version "${loom_version}" }
 java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+}
+loom {
+    splitEnvironmentSourceSets()
+    mods { dst_mc_bridge { sourceSet sourceSets.main; sourceSet sourceSets.client } }
+    runs { client {
+        runDir 'run'
+        programArgs '--username', 'DSTBridgeTest', '--quickPlaySingleplayer', providers.gradleProperty('testSave').getOrElse('DST-MC-FirstPerson-Test'), '--width', '960', '--height', '540'
+        vmArg '-Xmx2G'
+        if (providers.gradleProperty('testSave').getOrElse('') == 'DST-MC-Frame-Fixture') vmArg '-Ddstmc.frameFixture=true'
+    } }
+}
 sourceSets {
     contractTest {
-        compileClasspath += sourceSets.main.output
-        runtimeClasspath += sourceSets.main.output
+        compileClasspath += sourceSets.main.output + sourceSets.client.output + sourceSets.main.compileClasspath + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.client.output + sourceSets.main.runtimeClasspath + sourceSets.client.runtimeClasspath
     }
 }
 tasks.withType(JavaCompile).configureEach { options.release = 21 }
@@ -15,3 +30,12 @@ tasks.register('coreTest', JavaExec) {
     workingDir = rootDir
 }
 check.dependsOn coreTest
+tasks.register('publisherTest', JavaExec) { dependsOn contractTestClasses; classpath = sourceSets.contractTest.runtimeClasspath; mainClass = 'dev.jay.dstmc.client.FramePublisherTest' }
+tasks.register('exchangeTest', JavaExec) { dependsOn contractTestClasses; classpath = sourceSets.contractTest.runtimeClasspath; mainClass = 'dev.jay.dstmc.server.WorldExchangeTest' }
+tasks.named('runClient') {
+    doFirst {
+        def launch = file('.gradle/loom-cache/launch.cfg')
+        def installed = '/Users/jay/Downloads/.minecraft/assets'
+        launch.text = launch.text.replace("${gradle.gradleUserHomeDir}/caches/fabric-loom/assets", installed).replace('\t1.21.11-29', '\t29')
+    }
+}
