@@ -145,10 +145,33 @@ void discover(dstmc::FrameKey expected) {
   NSDictionary *s = get_status();
   if (![s[@"protocol"] isEqual:@2] || ![s[@"status"] isEqual:@"PAIRED"])
     throw std::runtime_error("MC not paired");
-  // Refresh physical size even while an exact frame is pinned. A new mapping
-  // announced after resize must invalidate the old camera acknowledgment.
-  state().service.resize([s[@"width"] unsignedIntValue],
-                         [s[@"height"] unsignedIntValue]);
+  // A paired session normally has no stream during handshake/resize. Reject
+  // nulls and wrong types before sending any Foundation numeric selectors.
+  auto integer = [](id value, uint64_t maximum) -> uint64_t {
+    if (![value isKindOfClass:[NSNumber class]] ||
+        CFGetTypeID((CFTypeRef)value) == CFBooleanGetTypeID())
+      throw std::runtime_error("incomplete stream number");
+    double n = [value doubleValue];
+    if (!std::isfinite(n) || n < 1 || n > maximum || n != std::floor(n))
+      throw std::runtime_error("invalid stream number");
+    return [value unsignedLongLongValue];
+  };
+  uint32_t width, height;
+  NSString *path;
+  try {
+    width = integer(s[@"width"], 1920);
+    height = integer(s[@"height"], 1080);
+    integer(s[@"generation"], 9007199254740991ULL);
+    path = string(s[@"frame_path"]);
+    if (!path.length)
+      throw std::runtime_error("empty stream path");
+    object(s[@"latest_frame"]);
+  } catch (const std::exception &) {
+    state().service.release();
+    throw;
+  }
+  // Refresh physical size even while an exact frame is pinned.
+  state().service.resize(width, height);
   auto latest = parse_key(object(s[@"latest_frame"]));
   if (!dstmc::same_key(latest, expected))
     throw std::runtime_error("exact frame changed; retry");
@@ -157,7 +180,6 @@ void discover(dstmc::FrameKey expected) {
     throw std::runtime_error("status session mismatch");
   if (state().service.lease_latest(expected.pair_hash, expected.epoch))
     return; // Keep the existing slot; never attempt a second reader lease.
-  NSString *path = string(s[@"frame_path"]);
   int fd = open(path.fileSystemRepresentation, O_RDWR | O_NOFOLLOW);
   if (fd < 0)
     throw std::runtime_error("frame open failed");
@@ -177,8 +199,7 @@ void discover(dstmc::FrameKey expected) {
   auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
   if (!frame)
     throw std::runtime_error("exact complete frame unavailable");
-  if (frame->width != [s[@"width"] unsignedIntValue] ||
-      frame->height != [s[@"height"] unsignedIntValue])
+  if (frame->width != width || frame->height != height)
     throw std::runtime_error("stream resize");
   state().service.offer(std::make_shared<dstmc::FrameView>(std::move(*frame)),
                         mapping);

@@ -44,7 +44,7 @@ $(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_
 lease-test: $(BUILD)/lease_test
 	./$(BUILD)/lease_test
 
-$(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h
+$(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h include/camera_service.h include/frame_protocol.h include/gl_observer.h
 	mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp -o $@
 gl-test: compositor-test

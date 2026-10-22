@@ -14,6 +14,7 @@ import pathlib
 import subprocess
 import unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+NATIVE_BUILD=pathlib.Path(os.environ.get('DSTMC_TEST_NATIVE_BUILD',ROOT/'native/build'))
 try:
     from lupa import LuaRuntime
 except ImportError:
@@ -21,10 +22,10 @@ except ImportError:
 
 class NativeGateTests(unittest.TestCase):
     def test_lease_lifecycle(self):
-        result=subprocess.run([str(ROOT/'native/build/lease_test')],capture_output=True,text=True,check=True)
+        result=subprocess.run([str(NATIVE_BUILD/'lease_test')],capture_output=True,text=True,check=True)
         self.assertIn('late_camera_ack_rejected',result.stdout)
     def test_real_offscreen_depth_and_state(self):
-        result=subprocess.run([str(ROOT/'native/build/compositor_test')],capture_output=True,text=True,check=True)
+        result=subprocess.run([str(NATIVE_BUILD/'compositor_test')],capture_output=True,text=True,check=True)
         self.assertIn('transparent_pixel_preserves_host',result.stdout)
         self.assertIn('closer_surface_wins',result.stdout)
 
@@ -40,15 +41,15 @@ class NativeHttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='dstmc-http-fixture-') as temp:
             temp=pathlib.Path(temp);frame=temp/'frame.bin'
             shutil.copyfile(ROOT/'protocol/fixtures/frame-v2.bin',frame)
-            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'])
+            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'],generation=1)
             class Status(BaseHTTPRequestHandler):
                 def do_GET(self):
                     data=json.dumps(status).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
                 def log_message(self,*args):pass
             server=HTTPServer(('127.0.0.1',39379),Status)
             thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True);thread.start()
-            env=os.environ|{'DSTMC_PROBE_DIR':str(temp),'DSTMC_FIRST_PERSON':'1','DYLD_INSERT_LIBRARIES':str(ROOT/'native/build/libdstmc_probe.dylib')}
-            proc=subprocess.Popen([str(ROOT/'native/build/lease_test'),'--http-fixture'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            env=os.environ|{'DSTMC_PROBE_DIR':str(temp),'DSTMC_FIRST_PERSON':'1','DYLD_INSERT_LIBRARIES':str(NATIVE_BUILD/'libdstmc_probe.dylib')}
+            proc=subprocess.Popen([str(NATIVE_BUILD/'lease_test'),'--http-fixture'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             def post(path,body):
                 data=body if isinstance(body,bytes) else json.dumps(body).encode()
                 request=urllib.request.Request('http://127.0.0.1:39380'+path,data=data,headers={'Content-Type':'application/json'})
@@ -56,13 +57,28 @@ class NativeHttpTests(unittest.TestCase):
                 except urllib.error.HTTPError as error:response=error
                 return response.status,json.loads(response.read())
             try:
-                for _ in range(100):
-                    if (temp/'camera-gate.jsonl').exists():break
+                for _ in range(500):
+                    ready=temp/'camera-gate.jsonl'
+                    if ready.exists():
+                        events=ready.read_text()
+                        self.assertNotIn('camera_service_failed',events)
+                        if 'camera_service_started' in events:break
                     if proc.poll() is not None:self.fail('HTTP fixture process exited before listening')
                     time.sleep(.01)
+                else:self.fail('HTTP fixture did not become ready within 5 seconds')
                 request=dict(protocol=2,pair=key['pair'],epoch=key['epoch'],key=key)
                 for invalid in (b'',b'null',b'[]',b'{',b'{}'):
                     code,response=post('/v2/camera/lease',invalid);self.assertEqual(code,409);self.assertEqual(response['error'],'GATE_NOT_READY')
+                complete=status.copy()
+                status.update({field:None for field in ('frame_path','generation','latest_frame','width','height')})
+                code,response=post('/v2/camera/lease',request);self.assertEqual(code,409)
+                self.assertIsNone(proc.poll(),'PAIRED null stream must not crash native HTTP')
+                status.update(complete)
+                for field,value in [('width','2'),('height',True),('generation',None),('generation',1.5),('width',1921)]:
+                    status[field]=value
+                    code,response=post('/v2/camera/lease',request);self.assertEqual(code,409,(field,value))
+                    self.assertIsNone(proc.poll())
+                    status.update(complete)
                 code,response=post('/v2/camera/lease',request);self.assertEqual(code,200,response);self.assertEqual(response['lease']['key'],key);self.assertEqual(response['lease']['pose']['space'],'DST')
                 self.assertTrue(any(struct.unpack_from('<Q',frame.read_bytes(),4096+i*struct.unpack_from('<Q',frame.read_bytes(),32)[0]+8)[0] for i in range(3)))
                 code,response=post('/v2/camera/applied',request|{'applied':True});self.assertEqual(code,200);self.assertTrue(response['accepted'])
@@ -84,8 +100,44 @@ class NativeHttpTests(unittest.TestCase):
                 code,response=post('/v2/camera/applied',request|{'applied':True});self.assertFalse(response['accepted'])
                 self.assertIsNone(proc.poll())
             finally:
-                if proc.poll() is None:proc.communicate('stop\n',timeout=3)
+                _,stderr=proc.communicate('stop\n' if proc.poll() is None else None,timeout=3)
+                if proc.returncode:self.fail('native HTTP fixture exited: '+stderr[-2500:])
                 server.shutdown();server.server_close();thread.join(timeout=1)
+
+class WindowActivationTests(unittest.TestCase):
+    def test_session_and_dispatch_deadline(self):
+        java_home=pathlib.Path('/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home')
+        source=ROOT/'mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java'
+        harness="""
+package dev.jay.dstmc.client;
+public class WindowActivationCheck {
+    public static void main(String[] args) {
+        WindowActivation proof = new WindowActivation();
+        Object first = new Object(), second = new Object();
+        proof.session(first);
+        var stale = proof.dispatch(1_000_000_000L);
+        proof.session(second);
+        boolean oldAccepted = proof.accept(stale, 1_010_000_000L);
+        var late = proof.dispatch(2_000_000_000L);
+        boolean lateAccepted = proof.accept(late, 2_201_000_000L);
+        if (oldAccepted || lateAccepted)
+            throw new AssertionError("old_response_after_repair="+oldAccepted+", completed_response_after_deadline="+lateAccepted);
+        var current = proof.dispatch(3_000_000_000L);
+        if (!proof.accept(current, 3_100_000_000L) || !proof.active(second, 3_199_000_000L))
+            throw new AssertionError("current response must activate");
+        if (proof.active(second, 3_200_000_000L) || proof.active(first, 3_110_000_000L))
+            throw new AssertionError("proof must expire at dispatch deadline and reject changed session before next tick");
+        proof.session(first);
+        if (proof.active(first, 3_110_000_000L)) throw new AssertionError("session change must clear cached proof");
+        System.out.println("PASS old_response_after_repair completed_response_after_deadline current_response_activates");
+    }
+}
+"""
+        with tempfile.TemporaryDirectory(prefix='dstmc-window-policy-') as temp:
+            check=pathlib.Path(temp)/'WindowActivationCheck.java';check.write_text(harness)
+            subprocess.run([str(java_home/'bin/javac'),'-d',temp,str(source),str(check)],check=True,capture_output=True,text=True)
+            result=subprocess.run([str(java_home/'bin/java'),'-cp',temp,'dev.jay.dstmc.client.WindowActivationCheck'],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
 
 @unittest.skipUnless(LuaRuntime,'Lua behavioral checks require lupa (isolated test environment)')
 class LuaCameraTests(unittest.TestCase):

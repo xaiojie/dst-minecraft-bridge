@@ -1,6 +1,7 @@
 package dev.jay.dstmc.client;
 
 import com.google.gson.JsonParser;
+import dev.jay.dstmc.BridgeMod;
 import net.minecraft.client.Minecraft;
 import org.lwjgl.glfw.*;
 import org.lwjgl.opengl.*;
@@ -22,9 +23,11 @@ public final class PassthroughWindow {
     }
     private static final boolean CONFIGURED=Boolean.getBoolean("dstmc.firstPerson")&&System.getProperty("os.name").startsWith("Mac");
     private static final HttpClient HTTP=HttpClient.newBuilder().connectTimeout(Duration.ofMillis(150)).build();
-    private static CompletableFuture<WindowBounds> pending;
+    private record Pending(WindowActivation.Ticket ticket, CompletableFuture<WindowBounds> response) {}
+    private static final WindowActivation ACTIVATION = new WindowActivation();
+    private static Pending pending;
     private static boolean active;
-    private static long validUntil,lastPoll,cocoa;
+    private static long lastPoll,cocoa;
     private static int x,y,width,height,decorated,floating;
     private static boolean ignoresMouse,shadow;
     private static WindowBounds bounds;
@@ -32,25 +35,37 @@ public final class PassthroughWindow {
     private static boolean getBool(long target,String selector){return JNI.invokePPZ(target,ObjCRuntime.sel_registerName(selector),msgSend());}
     private static void setBool(long target,String selector,boolean value){JNI.invokePPV(target,ObjCRuntime.sel_registerName(selector),value,msgSend());}
     public static boolean configured(){return CONFIGURED;}
-    public static boolean active(){return active&&System.nanoTime()<validUntil;}
+    public static boolean active(){return active&&BridgeClient.active()&&ACTIVATION.active(BridgeMod.server.active(),System.nanoTime());}
     public static void creationHints(){if(CONFIGURED){GLFW.glfwWindowHint(GLFW.GLFW_TRANSPARENT_FRAMEBUFFER,GLFW.GLFW_TRUE);GLFW.glfwWindowHint(GLFW.GLFW_COCOA_RETINA_FRAMEBUFFER,GLFW.GLFW_FALSE);}}
     public static void tick(){
         if(!CONFIGURED)return;
-        if(!BridgeClient.active()){if(pending!=null){pending.cancel(false);pending=null;}restore();return;}
-        long now=System.nanoTime();
-        if(pending!=null&&pending.isDone()){
-            var result=pending;pending=null;
-            try{WindowBounds value=result.join();validUntil=now+200_000_000L;enable(value);}catch(Exception e){restore();}
+        // Capture session identity only on the client thread. Re-pairing may keep
+        // BridgeClient.active() true, so a boolean is not an activation proof.
+        Object session=BridgeClient.active()?BridgeMod.server.active():null;
+        if(ACTIVATION.session(session)){
+            if(pending!=null){pending.response().cancel(false);pending=null;}
+            restore();
         }
-        if(active&&now>=validUntil)restore();
+        if(session==null){restore();return;}
+        long now=System.nanoTime();
+        if(pending!=null&&pending.response().isDone()){
+            var result=pending;pending=null;
+            try{
+                WindowBounds value=result.response().join();
+                if(ACTIVATION.accept(result.ticket(),now))enable(value);else restore();
+            }catch(Exception e){restore();}
+        }
+        if(active&&!ACTIVATION.active(session,now))restore();
         if(pending==null&&now-lastPoll>=50_000_000L){
             lastPoll=now;
             var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window")).timeout(Duration.ofMillis(150)).GET().build();
-            pending=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
+            var ticket=ACTIVATION.dispatch(now);
+            var responseFuture=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
                 if(response.statusCode()!=200||response.body().length()>4096)throw new IllegalStateException("native fusion inactive");
                 var j=JsonParser.parseString(response.body()).getAsJsonObject();if(j.get("protocol").getAsInt()!=2)throw new IllegalStateException("native protocol mismatch");
                 return new WindowBounds((int)Math.round(j.get("screen_x").getAsDouble()),(int)Math.round(j.get("screen_y").getAsDouble()),(int)Math.round(j.get("logical_width").getAsDouble()),(int)Math.round(j.get("logical_height").getAsDouble()),j.get("physical_width").getAsInt(),j.get("physical_height").getAsInt(),j.get("scale").getAsDouble());
             });
+            pending=new Pending(ticket,responseFuture);
         }
     }
     public static void enable(WindowBounds value){
@@ -67,8 +82,9 @@ public final class PassthroughWindow {
         int[] w=new int[1],h=new int[1];GLFW.glfwGetFramebufferSize(handle,w,h);if(w[0]!=value.physicalWidth()||h[0]!=value.physicalHeight())restore();
     }
     public static void restore(){
+        ACTIVATION.invalidate();
         if(!active)return;
-        long handle=Minecraft.getInstance().getWindow().handle();active=false;bounds=null;validUntil=0;
+        long handle=Minecraft.getInstance().getWindow().handle();active=false;bounds=null;
         GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,decorated);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_FLOATING,floating);GLFW.glfwSetWindowSize(handle,width,height);GLFW.glfwSetWindowPos(handle,x,y);
         setBool(cocoa,"setIgnoresMouseEvents:",ignoresMouse);setBool(cocoa,"setHasShadow:",shadow);
         net.minecraft.client.KeyMapping.releaseAll();Minecraft.getInstance().mouseHandler.releaseMouse();
