@@ -151,6 +151,12 @@ int main() {
     assert(matching_camera(f,p) && "actual_native_reflection_matches_saved_basis");
     f.axes[0]=1;assert(!matching_camera(f,p));f.axes[0]=-1;
     p.shader_matrices[0].value[12]+=.01;assert(!matching_camera(f,p));
+    p.shader_matrices[0].value[12]-=.01;
+    // Same 16:9 geometry at another drawable size still matches; a different
+    // aspect changes the rays and must be rejected.
+    p.viewport={0,0,1280,720};assert(matching_camera(f,p) && "same_aspect_any_size_matches");
+    p.viewport={0,0,882,635};assert(!matching_camera(f,p) && "other_aspect_rejected");
+    p.viewport={0,0,960,540};
     std::cout<<"PASS measured_native_reflection_and_origins_match\n";
   }
 
@@ -244,7 +250,7 @@ int main() {
     assert(c.compose(f->key, p, host).status == ComposeStatus::SKIPPED_MISMATCH && "identity_view_rejected_for_reflected_binding");
     f->axes[0] = 1;
     assert(c.compose(f->key, p, 0).status == ComposeStatus::DEPTH_UNAVAILABLE);
-    now = 250;
+    now = 1000;
     assert(c.compose(f->key, p, host).status == ComposeStatus::SKIPPED_STALE);
     assert(glGetError() == GL_NO_ERROR);
   }

@@ -67,35 +67,46 @@ int main(int argc, char **argv) {
   s.offer(f, {});
   auto l = s.lease_latest(f->key.pair_hash, f->key.epoch);
   assert(l && l->pose.position.x == 11 && l->pose.position.z == 23);
-  auto next = frame(2);
-  s.offer(next, {});
-  assert(s.lease_latest(f->key.pair_hash, f->key.epoch)->key.id == 1 &&
-         "lease_pins_matching_pose");
   assert(s.camera_applied(f->key));
   assert(s.ready(f->key));
-  now += 250;
-  assert(!s.ready(f->key) && "stale_frame_releases_camera");
-  assert(!s.camera_applied(f->key) && "late_camera_ack_rejected");
-  s.offer(f, {});
-  assert(!s.lease_latest(f->key.pair_hash, f->key.epoch) &&
-         "expired_frame_must_not_be_released_again");
+  // A newer frame is available for the next lease but must not disturb the
+  // pose the client has already applied and confirmed.
+  auto next = frame(2);
   s.offer(next, {});
-  assert(s.lease_latest(next->key.pair_hash, next->key.epoch));
+  assert(s.ready(f->key) && "newer_offer_keeps_pinned_frame");
+  assert(!s.ready(next->key));
+  auto pinned = s.lease_latest(next->key.pair_hash, next->key.epoch);
+  assert(pinned && pinned->key.id == 2 && "lease_pins_newest_frame");
+  assert(!s.ready(next->key) && "new_lease_requires_new_ack");
+  assert(s.camera_applied(next->key));
+  assert(s.ready(next->key) && "acked_frame_composites_on_every_draw");
+  assert(s.ready(next->key) && "pin_survives_presentation");
+  now += 1000;
+  assert(!s.ready(next->key) && "stale_frame_releases_camera");
+  assert(!s.camera_applied(next->key) && "late_camera_ack_rejected");
+  // Offering a frame is not the same as leasing it.
+  auto later = frame(4);
+  s.offer(later, {});
+  assert(!s.ready(later->key) && "offer_alone_does_not_pin");
+  s.lease_latest(later->key.pair_hash, later->key.epoch);
+  assert(s.camera_applied(later->key) && s.ready(later->key));
   s.resize(1920, 1080);
-  assert(!s.camera_applied(next->key) && "retina_resize_cancels_lease");
-  auto newer = frame(3);
+  assert(!s.ready(later->key) && "retina_resize_cancels_lease");
+  assert(!s.lease_latest(later->key.pair_hash, later->key.epoch) &&
+         "resize_discards_frames");
+  auto newer = frame(5);
   s.offer(newer, {});
+  assert(s.lease_latest(newer->key.pair_hash, newer->key.epoch));
   s.release();
   assert(!s.camera_applied(newer->key));
-  s.offer(newer, {});
   assert(!s.lease_latest(newer->key.pair_hash, newer->key.epoch) &&
          "release_invalidates_old_callbacks");
-  auto other = frame(1);
+  auto other = frame(6);
   other->key.epoch[0] = 2;
   s.offer(other, {});
   assert(s.lease_latest(other->key.pair_hash, other->key.epoch));
   assert(!s.camera_applied(f->key));
-  std::cout << "PASS lease_pins_matching_pose late_camera_ack_rejected "
+  std::cout << "PASS lease_pins_newest_frame late_camera_ack_rejected "
                "stale_frame_releases_camera retina_resize_cancels_lease "
                "release_invalidates_old_callbacks\n";
 }

@@ -40,6 +40,10 @@ dstmc::FrameKey key() {
   return state().current_key;
 }
 void log(NSDictionary *record) {
+  // Monotonic timestamp so gate events from different processes can be ordered.
+  NSMutableDictionary *stamped = [record mutableCopy];
+  stamped[@"t"] = @(milliseconds());
+  record = stamped;
   NSData *data = [NSJSONSerialization dataWithJSONObject:record
                                                  options:0
                                                    error:nil];
@@ -195,8 +199,16 @@ void discover_frame(dstmc::FrameKey expected) {
   // Refresh physical size even while an exact frame is pinned.
   state().service.resize(width, height);
   auto latest = parse_key(object(s[@"latest_frame"]));
-  if (!dstmc::same_key(latest, expected))
-    throw std::runtime_error("exact frame changed; retry");
+  // The client's key may lag the newest publication for a few frames: a lease
+  // request crosses status, lease and a native status read, while MC publishes
+  // every ~34 ms. Honour any still-published exact frame of the same session
+  // instead of demanding the newest key. read_frame re-validates pair, epoch
+  // and frame id, so pose and pixels still come from one exact frame; a
+  // rotated-out key fails with "exact complete frame unavailable" and the
+  // client retries from a fresh status.
+  if (latest.pair_hash != expected.pair_hash ||
+      latest.epoch != expected.epoch)
+    throw std::runtime_error("status session mismatch");
   if (![s[@"pair"] isEqual:object(s[@"latest_frame"])[@"pair"]] ||
       ![s[@"epoch"] isEqual:object(s[@"latest_frame"])[@"epoch"]])
     throw std::runtime_error("status session mismatch");
@@ -219,6 +231,12 @@ void discover_frame(dstmc::FrameKey expected) {
   if (mapping->base == MAP_FAILED)
     throw std::runtime_error("mapping failed");
   auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
+  // A slow round trip can let the requested slot rotate out of the three-slot
+  // ring. Fall back to the newest published frame of the same session; the
+  // lease then reports that frame's key so pose, pixels and acknowledgement all
+  // name one exact frame.
+  if (!frame && !dstmc::same_key(latest, expected))
+    frame = dstmc::read_frame(mapping->base, mapping->length, latest);
   if (!frame)
     throw std::runtime_error("exact complete frame unavailable");
   if (!dstmc::same_transform(*frame,transform))
@@ -281,6 +299,12 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
       if (dstmc::same_key(k, state().current_key))
         state().service.release();
     }
+    {  // Gate diagnostics: the acknowledgement outcome with its timing.
+      auto ls = state().service.lease_state();
+      log(@{ @"event" : @"ack", @"key" : @(k.id), @"accepted" : @(accepted),
+             @"pinned" : @(ls.key_id), @"acked" : @(ls.acked),
+             @"remaining_ms" : @(ls.remaining_ms) });
+    }
     return @{
       @"protocol" : @2,
       @"pair" : body[@"pair"],
@@ -290,15 +314,22 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
     };
   }
   // Repeated requests return the pinned pose, never a different image under the
-  // requested key.
+  // requested key. The response key names the frame actually pinned: it can be
+  // newer than the requested key when that slot already rotated out, and the
+  // caller must confirm and compose exactly that key.
   discover(k);
   auto l = state().service.lease_latest(k.pair_hash, k.epoch);
-  if (!l || !dstmc::same_key(l->key, k))
+  if (!l)
     throw std::runtime_error("different frame pinned or stale");
   {
     std::lock_guard<std::mutex> lock(state().key_mutex);
-    state().current_key = k;
+    state().current_key = l->key;
   }
+  NSDictionary *leased_key = @{
+    @"pair" : body[@"pair"],
+    @"epoch" : body[@"epoch"],
+    @"id" : @(l->key.id)
+  };
   NSDictionary *pose = @{
     @"space" : @"DST",
     @"position" : vec(l->pose.position),
@@ -312,103 +343,203 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
     @"pair" : body[@"pair"],
     @"epoch" : body[@"epoch"],
     @"lease" : @{
-      @"key" : key,
+      @"key" : leased_key,
       @"pose" : pose,
       @"width" : @(l->width),
       @"height" : @(l->height)
     }
   };
 }
+bool send_all(int client, const std::string &bytes) {
+  size_t sent = 0;
+  while (sent < bytes.size()) {
+    ssize_t n = send(client, bytes.data() + sent, bytes.size() - sent, 0);
+    if (n <= 0)
+      return false;
+    sent += n;
+  }
+  return true;
+}
+// The game's own HTTP client decides framing; it is not ours to assume. A
+// request whose body arrived chunked or behind Expect: 100-continue is valid
+// HTTP and must be read, otherwise the endpoint silently rejects a client that
+// speaks it (the Java half accepts both).
+struct SocketReader {
+  int client;
+  std::string buffer;
+  bool fill(size_t need) {
+    char chunk[4096];
+    while (buffer.size() < need) {
+      ssize_t n = recv(client, chunk, sizeof(chunk), 0);
+      if (n <= 0 || buffer.size() + n > 1u << 20)
+        return false;
+      buffer.append(chunk, n);
+    }
+    return true;
+  }
+  bool take(size_t n, std::string &out) {
+    if (!fill(n))
+      return false;
+    out.assign(buffer, 0, n);
+    buffer.erase(0, n);
+    return true;
+  }
+  bool line(std::string &out) {
+    for (;;) {
+      size_t pos = buffer.find("\r\n");
+      if (pos != std::string::npos) {
+        out.assign(buffer, 0, pos);
+        buffer.erase(0, pos + 2);
+        return true;
+      }
+      if (!fill(buffer.size() + 1))
+        return false;
+    }
+  }
+};
+// One accepted connection: read the request, answer it, close. Kept separate
+// from the accept loop so framing can be tested without a real port.
+void serve_client(int client) {
+  @autoreleasepool {
+    timeval timeout{0, 300000};
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    int no_sigpipe = 1;
+    setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
+               sizeof(no_sigpipe));
+    NSDictionary *response = nil;
+    std::string request;
+    int code = 200;
+    try {
+      size_t end = std::string::npos;
+      char buffer[4096];
+      while ((end = request.find("\r\n\r\n")) == std::string::npos) {
+        ssize_t n = recv(client, buffer, sizeof(buffer), 0);
+        if (n <= 0 || request.size() + n > 8192)
+          throw std::runtime_error("invalid HTTP header");
+        request.append(buffer, n);
+      }
+      std::istringstream headers(request.substr(0, end));
+      std::string method, path, version, line;
+      headers >> method >> path >> version;
+      std::getline(headers, line);
+      long long length = -1;
+      bool chunked = false, expect_continue = false;
+      while (std::getline(headers, line)) {
+        std::transform(line.begin(), line.end(), line.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        auto value = [&line](size_t from) {
+          std::string v = line.substr(from);
+          size_t first = v.find_first_not_of(" \t\r");
+          size_t last = v.find_last_not_of(" \t\r");
+          return first == std::string::npos ? std::string()
+                                           : v.substr(first, last - first + 1);
+        };
+        if (line.rfind("transfer-encoding:", 0) == 0) {
+          if (value(18).find("chunked") == std::string::npos)
+            throw std::runtime_error("unsupported transfer encoding");
+          chunked = true;
+        } else if (line.rfind("content-length:", 0) == 0) {
+          if (length >= 0)
+            throw std::runtime_error("duplicate length");
+          length = std::stoll(value(15));
+          if (length < 0 || length > 65536)
+            throw std::runtime_error("body too large");
+        } else if (line.rfind("expect:", 0) == 0) {
+          if (value(7).find("100-continue") != std::string::npos)
+            expect_continue = true;
+        }
+      }
+      size_t offset = end + 4;
+      std::string payload;
+      if (chunked || length > 0) {
+        if (expect_continue &&
+            !send_all(client, "HTTP/1.1 100 Continue\r\n\r\n"))
+          throw std::runtime_error("continue write failed");
+        SocketReader reader{client, request.substr(offset)};
+        if (chunked) {
+          std::string size_line, decoded, crlf;
+          for (;;) {
+            if (!reader.line(size_line))
+              throw std::runtime_error("incomplete chunk");
+            size_t semi = size_line.find(';');
+            std::string hex =
+                semi == std::string::npos ? size_line : size_line.substr(0, semi);
+            if (hex.empty())
+              throw std::runtime_error("invalid chunk size");
+            size_t n = std::stoul(hex, nullptr, 16);
+            if (n == 0)
+              break;
+            if (payload.size() + n > 65536)
+              throw std::runtime_error("body too large");
+            if (!reader.take(n, decoded))
+              throw std::runtime_error("incomplete body");
+            payload += decoded;
+            if (!reader.line(crlf) || !crlf.empty())
+              throw std::runtime_error("invalid chunk terminator");
+          }
+        } else if (!reader.take((size_t)length, payload)) {
+          throw std::runtime_error("incomplete body");
+        }
+      }
+      NSDictionary *body = nil;
+      if (!payload.empty()) {
+        NSData *d = [NSData dataWithBytes:payload.data()
+                                   length:payload.size()];
+        body = object([NSJSONSerialization JSONObjectWithData:d
+                                                      options:0
+                                                        error:nil]);
+      }
+      response = handle([NSString stringWithUTF8String:path.c_str()],
+                        [NSString stringWithUTF8String:method.c_str()], body);
+    } catch (const std::exception &e) {
+      code = 409;
+      // A rejected request is invisible from the game side (its client only
+      // sees a non-200), so record why it was rejected.
+      size_t line_end = request.find("\r\n");
+      log(@{
+        @"event" : @"request_error",
+        @"reason" : [NSString stringWithUTF8String:e.what()],
+        @"request" : [NSString
+            stringWithUTF8String:request.substr(0, std::min<size_t>(
+                                                       line_end == std::string::npos
+                                                           ? request.size()
+                                                           : line_end,
+                                                       120))
+                                .c_str()]
+      });
+      response = @{
+        @"protocol" : @2,
+        @"error" : @"GATE_NOT_READY",
+        @"reason" : [NSString stringWithUTF8String:e.what()]
+      };
+    }
+    NSData *json = [NSJSONSerialization dataWithJSONObject:response
+                                                   options:0
+                                                     error:nil];
+    std::string header =
+        "HTTP/1.1 " + std::to_string(code) +
+        " OK\r\nContent-Type: application/json\r\nConnection: "
+        "close\r\nContent-Length: " +
+        std::to_string(json.length) + "\r\n\r\n";
+    std::string bytes =
+        header + std::string((const char *)json.bytes, json.length);
+    size_t sent = 0;
+    while (sent < bytes.size()) {
+      ssize_t n = send(client, bytes.data() + sent, bytes.size() - sent, 0);
+      if (n <= 0)
+        break;
+      sent += n;
+    }
+  }
+  close(client);
+}
 void serve(int server) {
   for (;;) {
     int client = accept(server, nullptr, nullptr);
     if (client < 0)
       break;
-    @autoreleasepool {
-      timeval timeout{0, 300000};
-      setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-      setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-      int no_sigpipe = 1;
-      setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
-                 sizeof(no_sigpipe));
-      NSDictionary *response = nil;
-      int code = 200;
-      try {
-        std::string request;
-        size_t end = std::string::npos;
-        char buffer[4096];
-        while ((end = request.find("\r\n\r\n")) == std::string::npos) {
-          ssize_t n = recv(client, buffer, sizeof(buffer), 0);
-          if (n <= 0 || request.size() + n > 8192)
-            throw std::runtime_error("invalid HTTP header");
-          request.append(buffer, n);
-        }
-        std::istringstream headers(request.substr(0, end));
-        std::string method, path, version, line;
-        headers >> method >> path >> version;
-        std::getline(headers, line);
-        size_t length = 0;
-        bool found = false;
-        while (std::getline(headers, line)) {
-          std::transform(line.begin(), line.end(), line.begin(),
-                         [](unsigned char c) { return std::tolower(c); });
-          if (line.rfind("transfer-encoding:", 0) == 0)
-            throw std::runtime_error("chunked body unsupported");
-          if (line.rfind("content-length:", 0) == 0) {
-            if (found)
-              throw std::runtime_error("duplicate length");
-            found = true;
-            length = std::stoul(line.substr(15));
-            if (length > 65536)
-              throw std::runtime_error("body too large");
-          }
-        }
-        size_t offset = end + 4;
-        while (request.size() - offset < length) {
-          ssize_t n = recv(
-              client, buffer,
-              std::min(sizeof(buffer), length - (request.size() - offset)), 0);
-          if (n <= 0)
-            throw std::runtime_error("incomplete body");
-          request.append(buffer, n);
-        }
-        NSDictionary *body = nil;
-        if (length) {
-          NSData *d = [NSData dataWithBytes:request.data() + offset
-                                     length:length];
-          body = object([NSJSONSerialization JSONObjectWithData:d
-                                                        options:0
-                                                          error:nil]);
-        }
-        response = handle([NSString stringWithUTF8String:path.c_str()],
-                          [NSString stringWithUTF8String:method.c_str()], body);
-      } catch (const std::exception &e) {
-        code = 409;
-        response = @{
-          @"protocol" : @2,
-          @"error" : @"GATE_NOT_READY",
-          @"reason" : [NSString stringWithUTF8String:e.what()]
-        };
-      }
-      NSData *json = [NSJSONSerialization dataWithJSONObject:response
-                                                     options:0
-                                                       error:nil];
-      std::string header =
-          "HTTP/1.1 " + std::to_string(code) +
-          " OK\r\nContent-Type: application/json\r\nConnection: "
-          "close\r\nContent-Length: " +
-          std::to_string(json.length) + "\r\n\r\n";
-      std::string bytes =
-          header + std::string((const char *)json.bytes, json.length);
-      size_t sent = 0;
-      while (sent < bytes.size()) {
-        ssize_t n = send(client, bytes.data() + sent, bytes.size() - sent, 0);
-        if (n <= 0)
-          break;
-        sent += n;
-      }
-    }
-    close(client);
+    serve_client(client);
   }
   close(server);
 }
@@ -440,8 +571,11 @@ void start(const char *dir) {
 }
 void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
                     const dstmc::ComposeResult &result) {
+  auto ls = camera_service().lease_state();
   static uint64_t last = 0;
-  if (milliseconds() - last > 1000) {
+  static const bool gate_all = getenv("DSTMC_GATE_ALL") != nullptr;
+  if (gate_all || result.status == dstmc::ComposeStatus::COMPOSITED ||
+      milliseconds() - last > 1000) {
     last = milliseconds();
     NSMutableArray *matrices = [NSMutableArray array];
     for (auto &m : camera.shader_matrices)
@@ -455,6 +589,13 @@ void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
       @"frame" : @(key.id),
       @"status" : @(int(result.status)),
       @"reason" : [NSString stringWithUTF8String:result.reason.c_str()],
+      @"lease" : @{
+        @"pinned" : @(ls.pinned),
+        @"acked" : @(ls.acked),
+        @"leased" : @(ls.leased),
+        @"key" : @(ls.key_id),
+        @"remaining_ms" : @(ls.remaining_ms)
+      },
       @"matrices" : matrices,
       @"width" : @(camera.viewport[2]),
       @"height" : @(camera.viewport[3])

@@ -152,8 +152,16 @@ bool inverse_matrix(const std::array<float, 16> &a,
   return true;
 }
 bool matching_camera(const FrameView &f, const RenderProbe &p) {
-  if (p.viewport != std::array<int, 4>{0, 0, int(f.width), int(f.height)} ||
-      p.depth_range != std::array<double, 2>{0, 1})
+  if (p.viewport[0] != 0 || p.viewport[1] != 0 || p.viewport[2] <= 0 ||
+      p.viewport[3] <= 0 || p.depth_range != std::array<double, 2>{0, 1})
+    return false;
+  // Resolution independent by construction: the quad covers normalized device
+  // coordinates and the shader samples with normalized texture coordinates, so
+  // the drawable may differ from the stream size as long as the aspect ratio
+  // (and therefore the ray geometry) is the same.
+  const double stream = double(f.width) / double(f.height);
+  const double drawable = double(p.viewport[2]) / double(p.viewport[3]);
+  if (std::abs(stream - drawable) > 0.001 * stream)
     return false;
   const std::array<float, 16> *v = nullptr, *projection = nullptr;
   for (auto &m : p.shader_matrices) {
@@ -180,9 +188,14 @@ bool matching_camera(const FrameView &f, const RenderProbe &p) {
 }
 ComposeResult Compositor::compose(FrameKey key, const RenderProbe &p,
                                   GLuint depth) {
-  auto frame = service_.ready(key);
+  // Compose the frame pinned by the current lease even before its
+  // acknowledgement lands: matching_camera() already proves that the host
+  // camera carries this exact frame's pose, so composing it is safe and the
+  // acknowledgement only gates the window-activation proof. Waiting for the
+  // ack made every lease start with a hole of skipped frames.
+  auto frame = service_.pinned(key);
   if (!frame)
-    return {ComposeStatus::SKIPPED_STALE, "missing ack or expired frame"};
+    return {ComposeStatus::SKIPPED_STALE, "missing lease or expired frame"};
   if (!matching_camera(*frame, p))
     return {ComposeStatus::SKIPPED_MISMATCH,
             "actual view/rays/pixels mismatch"};

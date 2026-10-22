@@ -12,8 +12,6 @@ namespace bridge {
 struct Context {
   dstmc::SceneDepth depth;
   dstmc::Compositor compositor{camera_service()};
-  bool composited = false;
-  std::shared_ptr<const dstmc::FrameView> displayed;
 };
 std::map<CGLContextObj, std::unique_ptr<Context>> contexts;
 std::recursive_mutex contexts_mutex;
@@ -24,34 +22,11 @@ Context &context() {
   return *c;
 }
 void before_draw(const dstmc::RenderProbe &p) {
-  if (!enabled())
-    return;
-  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
-  auto &c = context();
-  if (p.program_fingerprint !=
-          "1cedce6eb12563dcd2ef433dd70128f43272600fbc06755f8c0364af85f612c8" ||
-      !c.depth.texture())
-    return;
-  auto frame_key = key();
-  struct TargetState {
-    GLint fbo, viewport[4];
-    TargetState() {
-      glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
-      glGetIntegerv(GL_VIEWPORT, viewport);
-    }
-    ~TargetState() {
-      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
-      glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-    }
-  } target_state;
-  glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, c.depth.target());
-  auto camera = c.depth.camera();
-  glViewport(0, 0, camera.viewport[2], camera.viewport[3]);
-  auto result = c.compositor.compose(frame_key, camera, c.depth.texture());
-  c.composited = result.status == dstmc::ComposeStatus::COMPOSITED;
-  if (c.composited)
-    c.displayed = camera_service().ready(frame_key);
-  report_compose(camera, frame_key, result);
+  // The scene is still being drawn here: this pass — and every pass after it —
+  // paints over whatever a composite written now would leave behind, so only
+  // the HUD survived into the presented image. Compositing is deferred to
+  // present(), which runs last, right before the back buffer is swapped.
+  (void)p;
 }
 void after_draw(const dstmc::RenderProbe &p,
                 const std::function<void()> &replay) {
@@ -59,25 +34,54 @@ void after_draw(const dstmc::RenderProbe &p,
     return;
   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
   context().depth.after_draw(p, replay);
-  if (context().depth.texture() && p.target_id == context().depth.target())
-    camera_service().resize(p.viewport[2], p.viewport[3]);
+  // Do NOT resize the camera service with the drawable viewport: the stream
+  // size is the Minecraft framebuffer size advertised through /v2/status, and
+  // resize() discards any pinned frame whose size differs. The compositor
+  // samples with normalized texture coordinates, so drawable and stream sizes
+  // are independent. Stream-size invalidation already happens in
+  // discover_frame(), which has the authoritative status dimensions.
 }
 void present() {
   if (!enabled())
     return;
   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
   auto &c = context();
-  bool presented =
-      c.composited && c.displayed && camera_service().ready(c.displayed->key);
+  bool composited = false;
+  std::shared_ptr<const dstmc::FrameView> displayed;
+  if (c.depth.texture()) {
+    auto camera = c.depth.camera();
+    if (camera.viewport[2] > 0 && camera.viewport[3] > 0) {
+      GLint fbo = 0, viewport[4]{};
+      glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
+      glGetIntegerv(GL_VIEWPORT, viewport);
+      // Composite into the drawable the window will present, after the whole
+      // host scene (ground, sprites, lighting, post passes) has been drawn.
+      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+      glViewport(0, 0, camera.viewport[2], camera.viewport[3]);
+      auto frame_key = key();
+      auto result = c.compositor.compose(frame_key, camera, c.depth.texture());
+      composited = result.status == dstmc::ComposeStatus::COMPOSITED;
+      if (composited)
+        displayed = camera_service().pinned(frame_key);
+      report_compose(camera, frame_key, result);
+      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+      glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    }
+  }
+  bool presented = composited && displayed;
+  // Window activation proof additionally requires the acknowledgement, but the
+  // HUD and the composited image do not.
+  bool proven = presented && camera_service().ready(displayed->key);
   if (presented) {
-    c.compositor.hud(*c.displayed);
-    camera_service().release();
+    c.compositor.hud(*displayed);
+    // Do not release the pin here: the pose is still applied to the host
+    // camera, so the same frame may be composited on following draws until the
+    // client leases a new pose or the lease expires. Releasing made every other
+    // draw fall back to the host-only image.
   }
   present_window(c.depth.camera().viewport[2], c.depth.camera().viewport[3],
-                 presented ? std::optional<dstmc::FrameKey>(c.displayed->key)
-                           : std::nullopt);
-  c.composited = false;
-  c.displayed.reset();
+                 proven ? std::optional<dstmc::FrameKey>(displayed->key)
+                        : std::nullopt);
   c.depth.reset();
 }
 void forget(CGLContextObj c) {

@@ -130,7 +130,11 @@ Until a complete current-generation frame commits, stream fields remain null.
 Then `latest_frame` is the exact committed FrameKey and MUST match active pair/epoch;
 `frame_path` is an absolute mmap path, `generation` is positive, width/height are
 physical pixels. Fetch status and use the native leased exact-key reader; retry
-status if the advertised frame has already rotated out. Never inspect mutable
+status if the advertised frame has already rotated out. The native honours a
+lease for any still-published exact frame of the active pair and epoch, so a
+client key that lags the newest publication by a few frames is served with that
+frame's own pose and pixels instead of being refused; a key whose slot has
+already been recycled fails closed with a retryable error. Never inspect mutable
 slot headers as an unleased selector. A resize or handshake creates a distinct
 mapping; old files remain for outstanding readers. Generation is scoped to a
 publisher epoch; path is globally unique even if an epoch is explicitly reused.
@@ -178,12 +182,34 @@ continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowe
 
 ### Window activation identity
 
+`POST /v2/camera/lease` is frame-keyed: the request names an exact FrameKey taken
+from a fresh status (clients may reuse the key returned by their previous lease
+for the same session, which avoids a status round trip per cycle). MC publishes
+roughly every 34 ms while a lease crosses two loopback round trips, so the named
+slot can rotate out of the three-slot ring in flight. The native then pins the
+newest published frame of the same pair and epoch and answers with **that**
+frame's key; its pose, pixels, dimensions and confirmation key all name one
+exact frame. A client must use the returned key for `POST /v2/camera/applied`
+and must not assume the requested key is echoed. A request whose pair, epoch or
+binding transform no longer matches the active status still fails closed.
+
+A lease stays live until the client acknowledges that exact key or until it
+expires (one second from the lease; the reference client cycles in roughly
+half a second, and a dead client must not leave the host camera hijacked). An
+acknowledged frame is composited on **every** subsequent draw of the host, not
+once: presentation does not consume the lease. A newer offered frame does not
+disturb the pinned frame; the client gets it by leasing again, which pins the
+newest frame, drops the previous acknowledgement and requires a new one. Clients
+should therefore keep the returned pose applied between leases (the reference
+Lua keeps it for one second after the last lease) so the host camera does not
+fall back to its own view between cycles.
+
 `GET /v2/window?pair_hash=<hash>&epoch=<uuid>` requires the expected session identity. `hash` is the 64 lowercase hexadecimal characters of SHA-256 of canonical PairKey JSON; `uuid` is the lowercase hyphenated Epoch UUID. Query order is exactly `pair_hash` then `epoch`, with no extra fields or alternate encoding. The native service compares both values against the actual last successfully composited and presented FrameKey, and requires that proof to be younger than 250 ms. Offered or acknowledged camera leases do not create window activation proof. Missing, different or expired identity returns `409 GATE_NOT_READY`. The strict WindowResponse JSON shape is unchanged. MC also binds each request to its local session generation and a 200 ms deadline measured from dispatch, and clears pending/cached activation on session change.
 
 ### Native transform validation
 
 Native discovery requires the active status origins and axes before reusing a pinned lease, and compares them exactly with newly read frame metadata. Missing/malformed/unsupported metadata, mismatched binding or failed discovery releases the cached frame and invalidates window proof. Older status producers without these fields intentionally fail closed; deploy matching Java/native versions together. The binary offsets and identity golden fixture remain unchanged. Readers accept exactly the two supported unit-scale matrices, rejecting NaN, shear, scale and other reflections.
 
-For the saved transform, native converts position and forward/up vectors using the inverse above. View conversion is `V_DST = V_MC * [S, mcOrigin - S*dstOrigin]`. Actual native `MatrixV` must match every resulting entry at the existing tolerance; ray-defining projection entries and viewport/depth range retain existing strict checks. Thus measured native negative-X views match only reflected bindings. No image flip or camera endpoint sign patch is applied. After this view alignment, both inverse projections reconstruct the same camera coordinate basis, so comparing reconstructed camera-space depth remains valid despite different near/far planes; raw cross-engine depth is never compared. Reflection does not alter the existing inverse-projection shader.
+For the saved transform, native converts position and forward/up vectors using the inverse above. View conversion is `V_DST = V_MC * [S, mcOrigin - S*dstOrigin]`. Actual native `MatrixV` must match every resulting entry at the existing tolerance; ray-defining projection entries and depth range retain existing strict checks. The viewport origin must be `(0,0)` and the drawable must share the frame's aspect ratio within 0.1% rather than its exact pixel size: the composite samples the frame with normalized texture coordinates in a full-screen quad and the inverse projections work in NDC, so any same-aspect resolution (for example a 960x540 stream inside a 1280x720 drawable) produces the same image. Thus measured native negative-X views match only reflected bindings. No image flip or camera endpoint sign patch is applied. After this view alignment, both inverse projections reconstruct the same camera coordinate basis, so comparing reconstructed camera-space depth remains valid despite different near/far planes; raw cross-engine depth is never compared. Reflection does not alter the existing inverse-projection shader.
 
 Pure tests use the measured frames 8947/8948 matrices and offscreen fixtures; they do not establish live ground depth, five-item graphics acceptance, or performance. The actual shoreline/water capture is insufficient for those gates.
