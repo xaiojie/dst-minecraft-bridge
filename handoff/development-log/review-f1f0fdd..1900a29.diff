@@ -1,0 +1,1297 @@
+# Review package: f1f0fdd60976f88ce98659bf5c59d6c241721113..1900a29ed25231c61dcc701ed654d3eb220d160d
+
+## Commits
+1900a29 feat: stream real Minecraft world and HUD frames with matched poses
+
+## Files changed
+ mc/build.gradle                                    |  32 +++-
+ mc/settings.gradle                                 |   3 +
+ .../java/dev/jay/dstmc/client/BridgeClient.java    |  24 +++
+ .../java/dev/jay/dstmc/client/FixtureStartup.java  |  11 ++
+ .../java/dev/jay/dstmc/client/FrameCapture.java    |  69 +++++++
+ .../java/dev/jay/dstmc/client/FramePublisher.java  |  66 +++++++
+ .../jay/dstmc/client/mixin/BridgeSceneMixin.java   |  26 +++
+ .../dstmc/client/mixin/FixtureWorldLoadMixin.java  |  22 +++
+ .../jay/dstmc/client/mixin/GuiCaptureMixin.java    |  12 ++
+ .../jay/dstmc/client/mixin/WorldCaptureMixin.java  |  15 ++
+ .../resources/dst_mc_bridge.client.mixins.json     |   1 +
+ .../java/dev/jay/dstmc/ContractTests.java          |   2 +-
+ .../dev/jay/dstmc/client/FixtureStartupTest.java   |  19 ++
+ .../dev/jay/dstmc/client/FramePublisherTest.java   |  38 ++++
+ .../dev/jay/dstmc/server/WorldExchangeTest.java    |  34 ++++
+ mc/src/main/java/dev/jay/dstmc/BridgeMod.java      |  13 ++
+ .../java/dev/jay/dstmc/server/BridgeServer.java    | 107 +++++++++++
+ .../java/dev/jay/dstmc/server/HttpIntegers.java    |   9 +
+ .../java/dev/jay/dstmc/server/WorldExchange.java   |  59 ++++++
+ .../data/dst_mc_bridge/dimension/stage.json        |   1 +
+ mc/src/main/resources/fabric.mod.json              |   1 +
+ protocol/frame-v2.md                               |  58 ++++++
+ protocol/http-v2.schema.json                       | 207 ++++++++++++++++++++-
+ tests/__init__.py                                  |   0
+ tests/test_live_frames.py                          | 119 ++++++++++++
+ tests/test_test_copy.py                            |  50 +++++
+ tools/prepare_test_copy.py                         |  49 +++++
+ 27 files changed, 1037 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/mc/build.gradle b/mc/build.gradle
+index d011103..9dd91d7 100644
+--- a/mc/build.gradle
++++ b/mc/build.gradle
+@@ -1,17 +1,41 @@
+-plugins { id 'java' }
+-// Protocol contracts deliberately do not load Loom or game classes.
++plugins { id 'net.fabricmc.fabric-loom-remap' version "${loom_version}" }
+ java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
++dependencies {
++    minecraft "com.mojang:minecraft:${minecraft_version}"
++    mappings loom.officialMojangMappings()
++    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
++    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
++}
++loom {
++    splitEnvironmentSourceSets()
++    mods { dst_mc_bridge { sourceSet sourceSets.main; sourceSet sourceSets.client } }
++    runs { client {
++        runDir 'run'
++        programArgs '--username', 'DSTBridgeTest', '--quickPlaySingleplayer', providers.gradleProperty('testSave').getOrElse('DST-MC-FirstPerson-Test'), '--width', '960', '--height', '540'
++        vmArg '-Xmx2G'
++        if (providers.gradleProperty('testSave').getOrElse('') == 'DST-MC-Frame-Fixture') vmArg '-Ddstmc.frameFixture=true'
++    } }
++}
+ sourceSets {
+     contractTest {
+-        compileClasspath += sourceSets.main.output
+-        runtimeClasspath += sourceSets.main.output
++        compileClasspath += sourceSets.main.output + sourceSets.client.output + sourceSets.main.compileClasspath + sourceSets.client.compileClasspath
++        runtimeClasspath += sourceSets.main.output + sourceSets.client.output + sourceSets.main.runtimeClasspath + sourceSets.client.runtimeClasspath
+     }
+ }
+ tasks.withType(JavaCompile).configureEach { options.release = 21 }
+ tasks.register('coreTest', JavaExec) {
+     dependsOn contractTestClasses
+     classpath = sourceSets.contractTest.runtimeClasspath
+     mainClass = 'dev.jay.dstmc.ContractTests'
+     workingDir = rootDir
+ }
+ check.dependsOn coreTest
++tasks.register('publisherTest', JavaExec) { dependsOn contractTestClasses; classpath = sourceSets.contractTest.runtimeClasspath; mainClass = 'dev.jay.dstmc.client.FramePublisherTest' }
++tasks.register('exchangeTest', JavaExec) { dependsOn contractTestClasses; classpath = sourceSets.contractTest.runtimeClasspath; mainClass = 'dev.jay.dstmc.server.WorldExchangeTest' }
++tasks.named('runClient') {
++    doFirst {
++        def launch = file('.gradle/loom-cache/launch.cfg')
++        def installed = '/Users/jay/Downloads/.minecraft/assets'
++        launch.text = launch.text.replace("${gradle.gradleUserHomeDir}/caches/fabric-loom/assets", installed).replace('\t1.21.11-29', '\t29')
++    }
++}
+diff --git a/mc/settings.gradle b/mc/settings.gradle
+index 7609c46..f8c9a84 100644
+--- a/mc/settings.gradle
++++ b/mc/settings.gradle
+@@ -1 +1,4 @@
++pluginManagement {
++    repositories { maven { url = 'https://maven.fabricmc.net/' }; mavenCentral(); gradlePluginPortal() }
++}
+ rootProject.name = 'dst-mc-first-person-bridge'
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java b/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java
+new file mode 100644
+index 0000000..1ae759a
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java
+@@ -0,0 +1,24 @@
++package dev.jay.dstmc.client;
++import dev.jay.dstmc.BridgeMod;
++import dev.jay.dstmc.server.BridgeServer;
++import net.fabricmc.api.ClientModInitializer;
++import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
++import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
++import net.minecraft.client.Minecraft;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++public final class BridgeClient implements ClientModInitializer {
++    private String lastScreen="";
++    public static final FrameCapture CAPTURE=new FrameCapture();
++    public static Pose renderPose;
++    public static boolean active(){var mc=Minecraft.getInstance();var bridge=BridgeMod.server;return bridge!=null && bridge.active()!=null && mc.level!=null && mc.level.dimension().equals(BridgeServer.STAGE);}
++    @Override public void onInitializeClient(){
++        ClientTickEvents.END_CLIENT_TICK.register(mc->{
++            if(Boolean.getBoolean("dstmc.frameFixture")){
++                String screen=mc.screen==null?"game":mc.screen.getClass().getName()+": "+mc.screen.getTitle().getString();
++                if(!screen.equals(lastScreen)){org.slf4j.LoggerFactory.getLogger("dstmc-fixture").info("Fixture screen: {}",screen);lastScreen=screen;}
++            }
++            if(BridgeMod.server!=null){mc.options.pauseOnLostFocus=false;mc.options.bobView().set(false);mc.options.screenEffectScale().set(0.0);mc.options.renderDistance().set(4);}
++        });
++        ClientLifecycleEvents.CLIENT_STOPPING.register(mc->CAPTURE.close());
++    }
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/FixtureStartup.java b/mc/src/client/java/dev/jay/dstmc/client/FixtureStartup.java
+new file mode 100644
+index 0000000..39e1cad
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/FixtureStartup.java
+@@ -0,0 +1,11 @@
++package dev.jay.dstmc.client;
++
++/** Bounded dev fixture loading policy; normal saves keep Minecraft's backup prompt. */
++public final class FixtureStartup {
++    public static boolean continuePrepared(boolean enabled,String levelId,Runnable backup,Runnable continuation){
++        if(!enabled || !"DST-MC-Frame-Fixture".equals(levelId))return false;
++        backup.run();
++        continuation.run();
++        return true;
++    }
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java b/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java
+new file mode 100644
+index 0000000..62ef7f5
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java
+@@ -0,0 +1,69 @@
++package dev.jay.dstmc.client;
++
++import com.mojang.blaze3d.opengl.GlTexture;
++import com.mojang.blaze3d.systems.RenderSystem;
++import dev.jay.dstmc.BridgeMod;
++import dev.jay.dstmc.server.*;
++import dev.jay.dstmc.protocol.FrameLayout;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++import net.minecraft.client.Minecraft;
++import org.lwjgl.glfw.GLFW;
++import org.lwjgl.opengl.*;
++import org.lwjgl.system.MemoryUtil;
++import java.nio.*;
++
++/** Synchronous GL readback: glReadPixels returns only after the current GPU writes
++ * complete. No callback can publish partially filled buffers. GL state restored. */
++public final class FrameCapture implements AutoCloseable {
++    private FramePublisher publisher;
++    private WorldExchange.HandshakeResult session;
++    private long context,generation;
++    private int width,height;
++    private ByteBuffer color,depth,hud;
++    public void captureWorld(Pose pose){
++        if(!BridgeClient.active()||pose==null){close();return;}
++        var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();var bridge=BridgeMod.server;
++        try {
++            long current=GLFW.glfwGetCurrentContext();
++            if(publisher==null||session!=bridge.active()||context!=current){close();session=bridge.active();context=current;publisher=new FramePublisher(bridge.framesDirectory(),session.pair(),session.epoch(),session.transform());}
++            if(width!=target.width||height!=target.height){
++                releaseBuffers();FrameLayout.layerBytes(target.width,target.height);width=target.width;height=target.height;
++                publisher.resize(width,height);generation=publisher.generation();bridge.invalidateStream();int bytes=FrameLayout.layerBytes(width,height);
++                color=MemoryUtil.memAlloc(bytes);depth=MemoryUtil.memAlloc(bytes).order(ByteOrder.LITTLE_ENDIAN);hud=MemoryUtil.memAlloc(bytes);
++            }
++            read(target,true,color,depth);
++            // The clear and normal MC blend state already produce premultiplied color.
++            zeroTransparent(color);publisher.world(generation,pose,color,depth);
++            RenderSystem.getDevice().createCommandEncoder().clearColorTexture(target.getColorTexture(),0);
++        }catch(Exception error){close();throw new IllegalStateException("MC frame capture failed",error);}
++    }
++    public void captureHud(){
++        if(publisher==null)return;
++        if(!BridgeClient.active()||GLFW.glfwGetCurrentContext()!=context||BridgeMod.server.active()!=session){close();return;}
++        var target=Minecraft.getInstance().getMainRenderTarget();
++        if(target.width!=width||target.height!=height){publisher.discardPending();return;}
++        read(target,false,hud,null);zeroTransparent(hud);publisher.hud(generation,hud);
++        publisher.publishCompleted().ifPresent(key->BridgeMod.server.updateStream(session,new BridgeServer.Stream(key,publisher.path().toString(),generation,width,height)));
++    }
++    private static void zeroTransparent(ByteBuffer bytes){for(int i=0;i<bytes.limit();i+=4)if(bytes.get(i+3)==0){bytes.put(i,(byte)0);bytes.put(i+1,(byte)0);bytes.put(i+2,(byte)0);}}
++    private static void read(com.mojang.blaze3d.pipeline.RenderTarget target,boolean withDepth,ByteBuffer rgba,ByteBuffer depth){
++        int oldFbo=GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING),oldPack=GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
++        int align=GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT),row=GL11.glGetInteger(GL11.GL_PACK_ROW_LENGTH),skipRows=GL11.glGetInteger(GL11.GL_PACK_SKIP_ROWS),skipPixels=GL11.glGetInteger(GL11.GL_PACK_SKIP_PIXELS),swap=GL11.glGetInteger(GL11.GL_PACK_SWAP_BYTES);
++        int fbo=GL30.glGenFramebuffers();
++        try {
++            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,fbo);
++            GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT0,GL11.GL_TEXTURE_2D,((GlTexture)target.getColorTexture()).glId(),0);
++            if(withDepth)GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER,GL30.GL_DEPTH_ATTACHMENT,GL11.GL_TEXTURE_2D,((GlTexture)target.getDepthTexture()).glId(),0);
++            if(GL30.glCheckFramebufferStatus(GL30.GL_READ_FRAMEBUFFER)!=GL30.GL_FRAMEBUFFER_COMPLETE)throw new IllegalStateException("incomplete read FBO");
++            GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER,0);
++            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT,1);GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH,0);GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS,0);GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS,0);GL11.glPixelStorei(GL11.GL_PACK_SWAP_BYTES,0);
++            GL11.glReadPixels(0,0,target.width,target.height,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,rgba);
++            if(withDepth)GL11.glReadPixels(0,0,target.width,target.height,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depth);
++        }finally{
++            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER,oldPack);GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT,align);GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH,row);GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS,skipRows);GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS,skipPixels);GL11.glPixelStorei(GL11.GL_PACK_SWAP_BYTES,swap);
++            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldFbo);GL30.glDeleteFramebuffers(fbo);
++        }
++    }
++    private void releaseBuffers(){if(color!=null)MemoryUtil.memFree(color);if(depth!=null)MemoryUtil.memFree(depth);if(hud!=null)MemoryUtil.memFree(hud);color=depth=hud=null;width=height=0;}
++    @Override public void close(){try{if(publisher!=null)publisher.close();}catch(java.io.IOException e){throw new java.io.UncheckedIOException(e);}finally{publisher=null;session=null;releaseBuffers();var bridge=BridgeMod.server;if(bridge!=null)bridge.invalidateStream();}}
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/FramePublisher.java b/mc/src/client/java/dev/jay/dstmc/client/FramePublisher.java
+new file mode 100644
+index 0000000..f9ab9d3
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/FramePublisher.java
+@@ -0,0 +1,66 @@
++package dev.jay.dstmc.client;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.file.*;
++import java.util.*;
++import dev.jay.dstmc.protocol.*;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++
++/** Render-thread producer. Only complete, same-generation world + HUD readbacks may commit. */
++public final class FramePublisher implements AutoCloseable {
++    public static final long MAX_EXACT_HTTP_INTEGER=9007199254740991L;
++    private final Path directory;
++    private final PairKey pair;
++    private final UUID epoch;
++    private final WorldTransform transform;
++    private FrameLayout layout;
++    private Path path;
++    private long generation, id;
++    private int width,height;
++    private Pose pose;
++    private ByteBuffer color,depth,hud;
++    private FrameKey latest;
++    public FramePublisher(Path directory,PairKey pair,UUID epoch,WorldTransform transform) throws IOException {
++        this.directory=directory;this.pair=pair;this.epoch=epoch;this.transform=transform;Files.createDirectories(directory);
++    }
++    public long generation(){return generation;}
++    public Path path(){return path;}
++    public FrameKey latest(){return latest;}
++    public int width(){return width;}
++    public int height(){return height;}
++    /** New file even when old readers still hold leases. Old files remain valid for those readers. */
++    public void resize(int w,int h) throws IOException {
++        FrameLayout.layerBytes(w,h);
++        clearPending(); latest=null;
++        if(layout!=null)layout.close();
++        path=directory.resolve("frame-"+epoch+"-"+(++generation)+"-"+UUID.randomUUID()+".bin");
++        layout=FrameLayout.create(path,w,h);width=w;height=h;
++    }
++    public void world(long g,Pose pose,ByteBuffer color,ByteBuffer depth) {
++        if(g!=generation || layout==null)return;
++        clearPending();
++        this.pose=Objects.requireNonNull(pose);this.color=snapshot(color);this.depth=snapshot(depth);
++    }
++    public void hud(long g,ByteBuffer hud) {if(g==generation && pose!=null)this.hud=snapshot(hud);}
++    private ByteBuffer snapshot(ByteBuffer bytes) {
++        if(bytes.remaining()!=FrameLayout.layerBytes(width,height))throw new IllegalArgumentException("incomplete layer");
++        var copy=ByteBuffer.allocate(bytes.remaining());copy.put(bytes.duplicate()).flip();return copy;
++    }
++    public Optional<FrameKey> publishCompleted() {
++        if(pose==null || color==null || depth==null || hud==null)return Optional.empty();
++        if(id>=MAX_EXACT_HTTP_INTEGER)throw new IllegalStateException("HTTP_UINT64_NOT_EXACT");
++        FrameKey key=new FrameKey(pair,epoch,id+1);
++        boolean committed=layout.publish(key,transform,pose,width,height,color,depth,hud);
++        clearPending();
++        if(!committed)return Optional.empty();
++        id++;latest=key;return Optional.of(key);
++    }
++    public void discardPending(){clearPending();}
++    private void clearPending(){pose=null;color=null;depth=null;hud=null;}
++    /** Operate on RGBA byte channels; independent of host integer endianness. */
++    public static void premultiplyRgba(ByteBuffer bytes) {
++        for(int i=bytes.position();i<bytes.limit();i+=4){int a=bytes.get(i+3)&255;for(int c=0;c<3;c++)bytes.put(i+c,(byte)(((bytes.get(i+c)&255)*a+127)/255));}
++    }
++    @Override public void close() throws IOException {clearPending();latest=null;if(layout!=null){layout.close();layout=null;}generation++;}
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/BridgeSceneMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/BridgeSceneMixin.java
+new file mode 100644
+index 0000000..b694815
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/BridgeSceneMixin.java
+@@ -0,0 +1,26 @@
++package dev.jay.dstmc.client.mixin;
++import dev.jay.dstmc.client.BridgeClient;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++import com.mojang.blaze3d.buffers.GpuBufferSlice;
++import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
++import net.minecraft.client.Camera;
++import net.minecraft.client.DeltaTracker;
++import net.minecraft.client.renderer.LevelRenderer;
++import org.joml.*;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++@Mixin(LevelRenderer.class)
++public abstract class BridgeSceneMixin {
++    @Inject(method="renderLevel",at=@At("HEAD"))
++    private void captureMatrices(GraphicsResourceAllocator allocator,DeltaTracker delta,boolean outline,Camera camera,Matrix4f rotation,Matrix4f projection,Matrix4f culling,GpuBufferSlice fog,Vector4f fogColor,boolean sky,CallbackInfo ci){
++        BridgeClient.renderPose=null;
++        if(!BridgeClient.active())return;
++        var eye=camera.position();var forward=new Vector3f(0,0,-1).rotate(camera.rotation());var up=new Vector3f(0,1,0).rotate(camera.rotation());
++        var view=new Matrix4f(rotation).translate((float)-eye.x,(float)-eye.y,(float)-eye.z);
++        BridgeClient.renderPose=new Pose(Space.MC,new Vec3(eye.x,eye.y,eye.z),new Vec3(forward.x,forward.y,forward.z),new Vec3(up.x,up.y,up.z),view.get(new float[16]),projection.get(new float[16]));
++        fogColor.set(0,0,0,0); // Actual world clear is transparent black, preserving premultiplied blending.
++    }
++    @Inject(method={"addSkyPass","addCloudsPass"},at=@At("HEAD"),cancellable=true)
++    private void removeBackground(CallbackInfo ci){if(BridgeClient.active())ci.cancel();}
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/FixtureWorldLoadMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/FixtureWorldLoadMixin.java
+new file mode 100644
+index 0000000..771677e
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/FixtureWorldLoadMixin.java
+@@ -0,0 +1,22 @@
++package dev.jay.dstmc.client.mixin;
++
++import dev.jay.dstmc.client.FixtureStartup;
++import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
++import net.minecraft.world.level.storage.LevelStorageSource;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/** Dev fixture only: take the official backup, then the official world-load continuation. */
++@Mixin(WorldOpenFlows.class)
++public abstract class FixtureWorldLoadMixin {
++    @Inject(method="askForBackup",at=@At("HEAD"),cancellable=true)
++    private void loadPreparedFixture(LevelStorageSource.LevelStorageAccess save,boolean customized,Runnable continuation,Runnable cancel,CallbackInfo ci){
++        if(FixtureStartup.continuePrepared(Boolean.getBoolean("dstmc.frameFixture"),save.getLevelId(),()->{
++            var log=org.slf4j.LoggerFactory.getLogger("dstmc-fixture");
++            log.info("Fixture backup gate: level={}, customized={}",save.getLevelId(),customized);
++            try{log.info("Fixture backup completed: {} bytes",save.makeWorldBackup());}
++            catch(java.io.IOException e){throw new java.io.UncheckedIOException("Fixture backup required before loading",e);}
++        },continuation))ci.cancel();
++    }
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/GuiCaptureMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/GuiCaptureMixin.java
+new file mode 100644
+index 0000000..564d45b
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/GuiCaptureMixin.java
+@@ -0,0 +1,12 @@
++package dev.jay.dstmc.client.mixin;
++import dev.jay.dstmc.client.BridgeClient;
++import net.minecraft.client.DeltaTracker;
++import net.minecraft.client.renderer.GameRenderer;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++@Mixin(GameRenderer.class)
++public abstract class GuiCaptureMixin {
++    @Inject(method="render",at=@At(value="INVOKE",target="Lnet/minecraft/client/gui/render/GuiRenderer;render(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V",shift=At.Shift.AFTER))
++    private void afterGuiDraw(DeltaTracker delta,boolean renderLevel,CallbackInfo ci){BridgeClient.CAPTURE.captureHud();}
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/WorldCaptureMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/WorldCaptureMixin.java
+new file mode 100644
+index 0000000..33d9c0c
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/WorldCaptureMixin.java
+@@ -0,0 +1,15 @@
++package dev.jay.dstmc.client.mixin;
++import dev.jay.dstmc.client.BridgeClient;
++import com.mojang.blaze3d.vertex.PoseStack;
++import net.minecraft.client.DeltaTracker;
++import net.minecraft.client.renderer.GameRenderer;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++@Mixin(GameRenderer.class)
++public abstract class WorldCaptureMixin {
++    @Inject(method="renderLevel",at=@At(value="INVOKE",target="Lcom/mojang/blaze3d/systems/CommandEncoder;clearDepthTexture(Lcom/mojang/blaze3d/textures/GpuTexture;D)V",shift=At.Shift.BEFORE))
++    private void beforeHandDepthClear(DeltaTracker delta,CallbackInfo ci){BridgeClient.CAPTURE.captureWorld(BridgeClient.renderPose);}
++    @Inject(method="bobHurt",at=@At("HEAD"),cancellable=true)
++    private void disableHurtProjection(PoseStack stack,float tick,CallbackInfo ci){if(BridgeClient.active())ci.cancel();}
++}
+diff --git a/mc/src/client/resources/dst_mc_bridge.client.mixins.json b/mc/src/client/resources/dst_mc_bridge.client.mixins.json
+new file mode 100644
+index 0000000..61b5fb1
+--- /dev/null
++++ b/mc/src/client/resources/dst_mc_bridge.client.mixins.json
+@@ -0,0 +1 @@
++{"required":true,"package":"dev.jay.dstmc.client.mixin","compatibilityLevel":"JAVA_21","client":["WorldCaptureMixin","GuiCaptureMixin","BridgeSceneMixin","FixtureWorldLoadMixin"],"injectors":{"defaultRequire":1}}
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/ContractTests.java b/mc/src/contractTest/java/dev/jay/dstmc/ContractTests.java
+index a673dd6..9d76ebf 100644
+--- a/mc/src/contractTest/java/dev/jay/dstmc/ContractTests.java
++++ b/mc/src/contractTest/java/dev/jay/dstmc/ContractTests.java
+@@ -1,5 +1,5 @@
+ package dev.jay.dstmc;
+ import dev.jay.dstmc.protocol.ProtocolContractTest;
+ public final class ContractTests {
+-    public static void main(String[] args) throws Exception { ProtocolContractTest.run(args); }
++    public static void main(String[] args) throws Exception { ProtocolContractTest.run(args); dev.jay.dstmc.client.FramePublisherTest.run(); dev.jay.dstmc.server.WorldExchangeTest.run(); dev.jay.dstmc.client.FixtureStartupTest.run(); }
+ }
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/client/FixtureStartupTest.java b/mc/src/contractTest/java/dev/jay/dstmc/client/FixtureStartupTest.java
+new file mode 100644
+index 0000000..b7bdd32
+--- /dev/null
++++ b/mc/src/contractTest/java/dev/jay/dstmc/client/FixtureStartupTest.java
+@@ -0,0 +1,19 @@
++package dev.jay.dstmc.client;
++import java.util.*;
++public final class FixtureStartupTest {
++    static void check(boolean value,String reason){if(!value)throw new AssertionError(reason);}
++    public static void run(){
++        // Break: property alone continues a real save or continuation runs before its backup succeeds.
++        var calls=new ArrayList<String>();
++        for(boolean enabled:List.of(false,true))for(String id:List.of("DST-MC-FirstPerson-Test","DST-MC-Test","other"))
++            check(!FixtureStartup.continuePrepared(enabled,id,()->calls.add("backup"),()->calls.add("continue")),"unrelated save continued");
++        check(!FixtureStartup.continuePrepared(false,"DST-MC-Frame-Fixture",()->calls.add("backup"),()->calls.add("continue")),"production behavior changed");
++        check(calls.isEmpty(),"guarded actions ran");
++        check(FixtureStartup.continuePrepared(true,"DST-MC-Frame-Fixture",()->calls.add("backup"),()->calls.add("continue")),"fixture not continued");
++        check(calls.equals(List.of("backup","continue")),"backup must finish before continuation");
++        calls.clear();
++        try{FixtureStartup.continuePrepared(true,"DST-MC-Frame-Fixture",()->{throw new IllegalStateException("backup failed");},()->calls.add("continue"));throw new AssertionError("backup failure swallowed");}catch(IllegalStateException expected){}
++        check(calls.isEmpty(),"continued without backup");
++        System.out.println("PASS fixture_startup_dual_guard_and_backup_order");
++    }
++}
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java b/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java
+new file mode 100644
+index 0000000..f6da6b8
+--- /dev/null
++++ b/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java
+@@ -0,0 +1,38 @@
++package dev.jay.dstmc.client;
++import java.nio.*;import java.nio.channels.*;import java.nio.file.*;import java.util.*;
++import dev.jay.dstmc.protocol.*;import static dev.jay.dstmc.protocol.BridgeTypes.*;
++public final class FramePublisherTest {
++ static final PairKey PAIR=new PairKey(new UUID(0,1),"surface",new UUID(0,2),"dst_mc_bridge:stage","ground");
++ static final UUID EPOCH=new UUID(0,3);
++ static final float[] I={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
++ static final Pose POSE=new Pose(Space.MC,new Vec3(0,65.62,0),new Vec3(0,0,1),new Vec3(0,1,0),I,I);
++ static FramePublisher publisher() throws Exception {var p=new FramePublisher(Files.createTempDirectory("publisher"),PAIR,EPOCH,new WorldTransform(new Vec3(0,0,0),new Vec3(0,64,0)));p.resize(1,1);return p;}
++ static ByteBuffer rgba(){return ByteBuffer.wrap(new byte[]{(byte)255,0,0,(byte)128});}
++ static ByteBuffer depth(){return ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0,.5f);}
++ static void completed(FramePublisher p,long g){p.world(g,POSE,rgba(),depth());p.hud(g,rgba());}
++ static void check(boolean b,String s){if(!b)throw new AssertionError(s);}
++ interface Test{void run()throws Exception;}
++ static int failures;
++ static void test(String name,Test test){try{test.run();System.out.println("PASS "+name);}catch(Throwable e){failures++;System.out.println("FAIL "+name+": "+e);}}
++ public static void run() throws Exception {
++  // Break: acknowledge a frame even though every mapped slot is leased.
++  test("leased_slot_not_overwritten",()->{try(var p=publisher()){
++   completed(p,p.generation());check(p.publishCompleted().isPresent(),"first completed frame missing");
++   check(p.path()!=null,"published frame has no mapping");
++   try(var ch=FileChannel.open(p.path(),StandardOpenOption.READ,StandardOpenOption.WRITE)){
++    var m=ch.map(FileChannel.MapMode.READ_WRITE,0,ch.size());m.order(ByteOrder.LITTLE_ENDIAN);int stride=(int)m.getLong(32);
++    for(int s=0;s<3;s++)m.putLong(4096+s*stride+8,99);
++    byte[] before=new byte[m.capacity()];m.duplicate().get(before);completed(p,p.generation());
++    check(p.publishCompleted().isEmpty(),"leased frame acknowledged");byte[] after=new byte[m.capacity()];m.duplicate().get(after);check(Arrays.equals(before,after),"leased bytes changed");
++   }
++  }});
++  // Break: expose world before HUD GPU readback completed.
++  test("partial_readback_not_published",()->{try(var p=publisher()){p.world(p.generation(),POSE,rgba(),depth());check(p.publishCompleted().isEmpty(),"partial GPU readback published");p.hud(p.generation(),rgba());check(p.publishCompleted().isPresent(),"complete readback missing");check(p.publishCompleted().isEmpty(),"same readback replayed");}});
++  // Break: delayed callbacks after resize contaminate next generation.
++  test("resize_discards_pending_readback",()->{try(var p=publisher()){long old=p.generation();p.world(old,POSE,rgba(),depth());p.resize(2,1);p.hud(old,rgba());check(p.publishCompleted().isEmpty(),"stale resize callback published");check(p.generation()!=old,"generation unchanged");}});
++  // Break: native-endian packed integers swap red/blue or leave straight alpha.
++  test("alpha_and_channel_order",()->{var b=ByteBuffer.wrap(new byte[]{(byte)255,0,0,(byte)128,0,0,(byte)255,0});FramePublisher.premultiplyRgba(b);check((b.get(0)&255)==128 && b.get(1)==0 && b.get(2)==0 && (b.get(3)&255)==128,"red premultiplied RGBA mismatch");check(b.get(4)==0&&b.get(5)==0&&b.get(6)==0&&b.get(7)==0,"transparent RGB not zero");});
++  if(failures>0)throw new AssertionError(failures+" publisher assertion(s) failed");
++ }
++ public static void main(String[] args)throws Exception{run();}
++}
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/server/WorldExchangeTest.java b/mc/src/contractTest/java/dev/jay/dstmc/server/WorldExchangeTest.java
+new file mode 100644
+index 0000000..3752ac5
+--- /dev/null
++++ b/mc/src/contractTest/java/dev/jay/dstmc/server/WorldExchangeTest.java
+@@ -0,0 +1,34 @@
++package dev.jay.dstmc.server;
++import java.nio.file.*;import java.util.*;import static dev.jay.dstmc.protocol.BridgeTypes.*;
++public final class WorldExchangeTest {
++ static void check(boolean b,String s){if(!b)throw new AssertionError(s);}
++ public static void main(String[] args)throws Exception{run();}
++ public static void run()throws Exception{
++  int failures=0;
++  // Break: Lua binary64 silently rounds a uint64 above its exact integer range.
++  try{
++   check(HttpIntegers.exact(0)==0 && HttpIntegers.exact(9007199254740991L)==9007199254740991L,"safe integer boundary rejected");
++   for(long value:new long[]{-1,9007199254740992L,Long.MAX_VALUE}){
++    boolean refused=false;try{HttpIntegers.exact(value);}catch(IllegalArgumentException expected){refused=true;}
++    check(refused,"unsafe HTTP integer accepted: "+value);
++   }
++   System.out.println("PASS http_uint64_requires_exact_lua_integer");
++  }catch(AssertionError e){failures++;System.out.println("FAIL http_uint64_requires_exact_lua_integer: "+e);}
++  // Break: a dev VM property alone labels a manually selected final/original save as disposable.
++  try{
++   check(WorldExchange.frameFixture(Path.of("run/saves/DST-MC-Frame-Fixture/."),true),"fixture dual guard rejected");
++   check(!WorldExchange.frameFixture(Path.of("run/saves/DST-MC-Frame-Fixture"),false),"production fixture enabled");
++   check(!WorldExchange.frameFixture(Path.of("run/saves/DST-MC-FirstPerson-Test"),false),"normal final save rejected");
++   for(String name:List.of("DST-MC-FirstPerson-Test","DST-MC-Test","other")){
++    boolean refused=false;try{WorldExchange.frameFixture(Path.of("run/saves",name),true);}catch(IllegalArgumentException expected){refused=true;}
++    check(refused,"fixture property accepted wrong save: "+name);
++   }
++   System.out.println("PASS fixture_requires_property_and_exact_save");
++  }catch(AssertionError e){failures++;System.out.println("FAIL fixture_requires_property_and_exact_save: "+e);}
++  // Break: opening the same copy regenerates identity and allows a different DST world.
++  try{Path path=Files.createTempDirectory("exchange");var first=new WorldExchange(path);var id=first.mcWorld();check(id.equals(new WorldExchange(path).mcWorld()),"world UUID not persistent");System.out.println("PASS world_identity_persisted");}catch(AssertionError e){failures++;System.out.println("FAIL world_identity_persisted: "+e);}
++  try{Path path=Files.createTempDirectory("exchange");var first=new WorldExchange(path);UUID dst=UUID.randomUUID();var a=first.handshake(dst,"surface",new Vec3(10,0,-20));var b=new WorldExchange(path).handshake(dst,"surface",new Vec3(99,0,99));check(a.transform().dstOrigin().equals(b.transform().dstOrigin()),"original anchor replaced");System.out.println("PASS pairing_keeps_original_anchor");}catch(AssertionError e){failures++;System.out.println("FAIL pairing_keeps_original_anchor: "+e);}
++  try{Path path=Files.createTempDirectory("exchange");var first=new WorldExchange(path);first.handshake(UUID.randomUUID(),"surface",new Vec3(0,0,0));var b=new WorldExchange(path).handshake(UUID.randomUUID(),"surface",new Vec3(0,0,0));check("WORLD_MISMATCH".equals(b.reason()),"different DST world accepted");System.out.println("PASS different_dst_world_rejected");}catch(AssertionError e){failures++;System.out.println("FAIL different_dst_world_rejected: "+e);}
++  if(failures>0)throw new AssertionError(failures+" exchange assertion(s) failed");
++ }
++}
+diff --git a/mc/src/main/java/dev/jay/dstmc/BridgeMod.java b/mc/src/main/java/dev/jay/dstmc/BridgeMod.java
+new file mode 100644
+index 0000000..ac25a0f
+--- /dev/null
++++ b/mc/src/main/java/dev/jay/dstmc/BridgeMod.java
+@@ -0,0 +1,13 @@
++package dev.jay.dstmc;
++import dev.jay.dstmc.server.BridgeServer;
++import net.fabricmc.api.ModInitializer;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
++public final class BridgeMod implements ModInitializer {
++    public static volatile BridgeServer server;
++    @Override public void onInitialize(){
++        ServerLifecycleEvents.SERVER_STARTED.register(game->{server=new BridgeServer(game);});
++        ServerTickEvents.END_SERVER_TICK.register(game->{var bridge=server;if(bridge!=null)bridge.tick();});
++        ServerLifecycleEvents.SERVER_STOPPING.register(game->{var bridge=server;server=null;if(bridge!=null)bridge.close();});
++    }
++}
+diff --git a/mc/src/main/java/dev/jay/dstmc/server/BridgeServer.java b/mc/src/main/java/dev/jay/dstmc/server/BridgeServer.java
+new file mode 100644
+index 0000000..683b53f
+--- /dev/null
++++ b/mc/src/main/java/dev/jay/dstmc/server/BridgeServer.java
+@@ -0,0 +1,107 @@
++package dev.jay.dstmc.server;
++
++import com.google.gson.*;
++import com.sun.net.httpserver.*;
++import dev.jay.dstmc.protocol.*;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.registries.Registries;
++import net.minecraft.resources.*;
++import net.minecraft.world.level.Level;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.storage.LevelResource;
++import java.io.*;
++import java.net.*;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.*;
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.function.Supplier;
++
++/** Loopback HTTP adapter. Game API access is confined to the server tick thread. */
++public final class BridgeServer implements AutoCloseable {
++    public static final ResourceKey<Level> STAGE=ResourceKey.create(Registries.DIMENSION,Identifier.fromNamespaceAndPath("dst_mc_bridge","stage"));
++    private static final Gson JSON=new GsonBuilder().serializeNulls().create();
++    private final MinecraftServer game;
++    private final HttpServer http;
++    private final ExecutorService executor=Executors.newFixedThreadPool(2,r->{var t=new Thread(r,"dstmc-http");t.setDaemon(true);return t;});
++    private final WorldExchange exchange;
++    private final String runId=UUID.randomUUID().toString();
++    private final long started=System.currentTimeMillis();
++    private final boolean fixture;
++    private volatile WorldExchange.HandshakeResult active;
++    private volatile Stream stream;
++    private volatile long heartbeat,lastPeerMs;
++    private volatile boolean stageReady;
++    private final Set<UUID> placed=new HashSet<>();
++    public record Stream(FrameKey key,String path,long generation,int width,int height){}
++    public BridgeServer(MinecraftServer game){
++        this.game=game;
++        Path save=game.getWorldPath(LevelResource.ROOT);
++        fixture=WorldExchange.frameFixture(save,Boolean.getBoolean("dstmc.frameFixture"));
++        if(!Files.isRegularFile(save.resolve("dst-mc-copy-source.json")))throw new IllegalStateException("Bridge requires an independent prepared test save");
++        exchange=new WorldExchange(save);
++        try{http=HttpServer.create(new InetSocketAddress("127.0.0.1",39379),8);http.createContext("/",this::handle);http.setExecutor(executor);http.start();}
++        catch(IOException e){executor.shutdownNow();throw new IllegalStateException("Port 39379 conflict; close the other test instance (including protocol=1) yourself",e);}
++    }
++    public WorldExchange.HandshakeResult active(){return active;}
++    public Path framesDirectory(){return Path.of("dst-mc-frames",runId).toAbsolutePath();}
++    public void updateStream(WorldExchange.HandshakeResult session,Stream value){if(active==session)stream=value;}
++    public void invalidateStream(){stream=null;}
++    public void tick(){
++        heartbeat++;
++        ServerLevel level=game.getLevel(STAGE);if(level==null)return;
++        if(!stageReady){for(int x=-16;x<=16;x++)for(int z=-16;z<=16;z++)level.setBlockAndUpdate(new BlockPos(x,63,z),Blocks.BARRIER.defaultBlockState());level.setBlockAndUpdate(new BlockPos(0,64,3),Blocks.STONE.defaultBlockState());stageReady=true;}
++        for(var player:game.getPlayerList().getPlayers())if(placed.add(player.getUUID()))player.teleportTo(level,.5,64,.5,Set.of(),0,12,false);
++    }
++    private <T>T onGame(Supplier<T> action)throws Exception{
++        CompletableFuture<T> future=new CompletableFuture<>();game.execute(()->{if(!future.isCancelled())try{future.complete(action.get());}catch(Throwable e){future.completeExceptionally(e);}});
++        try{return future.get(8,TimeUnit.SECONDS);}catch(TimeoutException e){future.cancel(false);throw e;}
++    }
++    public Map<String,Object> status(){
++        var m=new LinkedHashMap<String,Object>();var a=active;var s=stream;
++        if(a==null || (s!=null && (!s.key().pair().equals(a.pair()) || !s.key().epoch().equals(a.epoch()))))s=null;
++        m.put("protocol",2);m.put("status",a==null?"UNPAIRED":"PAIRED");m.put("pair",a==null?null:pair(a.pair()));m.put("epoch",a==null?null:a.epoch().toString());
++        m.put("mc_world",exchange.mcWorld().toString());m.put("pid",HttpIntegers.exact(ProcessHandle.current().pid()));m.put("run_id",runId);m.put("started_at_ms",HttpIntegers.exact(started));
++        m.put("heartbeat",HttpIntegers.exact(heartbeat));m.put("peer_last_seen_ms",HttpIntegers.exact(lastPeerMs));m.put("fixture",fixture);m.put("stage_ready",stageReady);
++        m.put("frame_path",s==null?null:s.path());m.put("generation",s==null?null:HttpIntegers.exact(s.generation()));m.put("latest_frame",s==null?null:key(s.key()));m.put("width",s==null?null:s.width());m.put("height",s==null?null:s.height());
++        return m;
++    }
++    private void handle(HttpExchange httpExchange)throws IOException{
++        int code=200;Object output;
++        try {
++            String path=httpExchange.getRequestURI().getPath(),method=httpExchange.getRequestMethod();
++            if(path.equals("/v2/status")&&method.equals("GET"))output=status();
++            else if(path.equals("/v2/handshake")&&method.equals("POST")){
++                var input=body(httpExchange);requireKeys(input,"protocol","pair","epoch","dst_origin","mc_origin");protocol(input);
++                PairKey pair=parsePair(input.getAsJsonObject("pair"));UUID epoch=UUID.fromString(input.get("epoch").getAsString());Vec3 dst=vec(input.getAsJsonObject("dst_origin")),mc=vec(input.getAsJsonObject("mc_origin"));
++                var result=onGame(()->{var r=exchange.handshake(pair,epoch,dst,mc);if(r.reason().isEmpty()){active=r;stream=null;lastPeerMs=System.currentTimeMillis();}return r;});
++                if(!result.reason().isEmpty())throw new IllegalArgumentException(result.reason());
++                long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);Stream s;
++                while((s=stream)==null&&System.nanoTime()<until)Thread.sleep(10);
++                if(s==null||!s.key().epoch().equals(epoch))throw new IllegalStateException("FRAME_NOT_READY");
++                output=Map.of("protocol",2,"pair",pair(result.pair()),"epoch",epoch.toString(),"dst_origin",vec(result.transform().dstOrigin()),"mc_origin",vec(result.transform().mcOrigin()),"axes",result.transform().axes(),"frame_path",s.path());
++            } else if(path.equals("/v2/exchange")&&method.equals("POST")){
++                var input=body(httpExchange);requireKeys(input,"protocol","pair","epoch","commands","damage_events");protocol(input);
++                output=onGame(()->{var a=active;if(a==null||!a.pair().equals(parsePair(input.getAsJsonObject("pair")))||!a.epoch().equals(UUID.fromString(input.get("epoch").getAsString())))throw new IllegalArgumentException("SESSION_MISMATCH");
++                    if(!input.getAsJsonArray("commands").isEmpty()||!input.getAsJsonArray("damage_events").isEmpty())throw new IllegalArgumentException("COMMANDS_NOT_IMPLEMENTED");lastPeerMs=System.currentTimeMillis();
++                    return Map.of("protocol",2,"pair",pair(a.pair()),"epoch",a.epoch().toString(),"results",List.of(),"actors",Map.of("revision",0,"bodies",List.of()),"block_changes",List.of(),"terrain",List.of());});
++            } else if(path.equals("/test/scene")&&method.equals("POST")&&fixture){
++                var input=body(httpExchange);boolean stone=input.get("stone").getAsBoolean();
++                output=onGame(()->{game.getLevel(STAGE).setBlockAndUpdate(new BlockPos(0,64,3),(stone?Blocks.STONE:Blocks.AIR).defaultBlockState());return Map.of("stone",stone);});
++            } else {code=404;output=Map.of("protocol",2,"error","NOT_FOUND","reason","unknown endpoint or method");}
++        }catch(Exception e){code=400;Throwable cause=e instanceof ExecutionException?e.getCause():e;output=Map.of("protocol",2,"error","REQUEST_REJECTED","reason",String.valueOf(cause.getMessage()));}
++        byte[] bytes=JSON.toJson(output).getBytes(StandardCharsets.UTF_8);httpExchange.getResponseHeaders().set("Content-Type","application/json");httpExchange.sendResponseHeaders(code,bytes.length);try(var out=httpExchange.getResponseBody()){out.write(bytes);}
++    }
++    private static JsonObject body(HttpExchange ex)throws IOException{byte[] b=ex.getRequestBody().readNBytes(65537);if(b.length>65536)throw new IllegalArgumentException("body too large");return JsonParser.parseString(new String(b,StandardCharsets.UTF_8)).getAsJsonObject();}
++    private static void requireKeys(JsonObject o,String... keys){if(!o.keySet().equals(Set.of(keys)))throw new IllegalArgumentException("unexpected request fields");}
++    private static void protocol(JsonObject o){if(o.get("protocol").getAsBigDecimal().compareTo(java.math.BigDecimal.valueOf(2))!=0)throw new IllegalArgumentException("protocol must be 2");}
++    private static Vec3 vec(JsonObject o){requireKeys(o,"x","y","z");return new Vec3(o.get("x").getAsDouble(),o.get("y").getAsDouble(),o.get("z").getAsDouble());}
++    private static PairKey parsePair(JsonObject o){requireKeys(o,"dst_world","dst_shard","mc_world","mc_dimension","region");return new PairKey(UUID.fromString(o.get("dst_world").getAsString()),o.get("dst_shard").getAsString(),UUID.fromString(o.get("mc_world").getAsString()),o.get("mc_dimension").getAsString(),o.get("region").getAsString());}
++    private static Object pair(PairKey p){return JsonParser.parseString(canonicalPair(p));}
++    private static Object key(FrameKey k){return Map.of("pair",pair(k.pair()),"epoch",k.epoch().toString(),"id",HttpIntegers.exact(k.id()));}
++    private static Object vec(Vec3 v){return Map.of("x",v.x(),"y",v.y(),"z",v.z());}
++    @Override public void close(){http.stop(0);executor.shutdownNow();stream=null;active=null;}
++}
+diff --git a/mc/src/main/java/dev/jay/dstmc/server/HttpIntegers.java b/mc/src/main/java/dev/jay/dstmc/server/HttpIntegers.java
+new file mode 100644
+index 0000000..418d876
+--- /dev/null
++++ b/mc/src/main/java/dev/jay/dstmc/server/HttpIntegers.java
+@@ -0,0 +1,9 @@
++package dev.jay.dstmc.server;
++
++/** JSON adapters consumed by Lua support only exactly representable unsigned integers. */
++public final class HttpIntegers {
++    public static long exact(long value){
++        if(value<0 || value>9007199254740991L)throw new IllegalArgumentException("HTTP_UINT64_NOT_EXACT");
++        return value;
++    }
++}
+diff --git a/mc/src/main/java/dev/jay/dstmc/server/WorldExchange.java b/mc/src/main/java/dev/jay/dstmc/server/WorldExchange.java
+new file mode 100644
+index 0000000..6572f59
+--- /dev/null
++++ b/mc/src/main/java/dev/jay/dstmc/server/WorldExchange.java
+@@ -0,0 +1,59 @@
++package dev.jay.dstmc.server;
++
++import java.io.*;
++import java.nio.channels.FileChannel;
++import java.nio.file.*;
++import java.util.*;
++import dev.jay.dstmc.protocol.*;
++import static dev.jay.dstmc.protocol.BridgeTypes.*;
++
++/** One persistent binding per copied save. All calls are made on the server thread. */
++public final class WorldExchange {
++    public record HandshakeResult(PairKey pair,UUID epoch,WorldTransform transform,String reason) {}
++    private final Path directory;
++    private final UUID mcWorld;
++    private PairKey bound;
++    private WorldTransform transform;
++    private HandshakeResult active;
++    public WorldExchange(Path save) {
++        directory=save.resolve("dst-mc-bridge");
++        try {
++            Files.createDirectories(directory);
++            Path id=directory.resolve("world.uuid");
++            if(!Files.exists(id))writeAtomic(id,UUID.randomUUID().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
++            mcWorld=UUID.fromString(Files.readString(id).trim());
++            Path binding=directory.resolve("binding.bin");
++            if(Files.exists(binding))try(var in=new DataInputStream(Files.newInputStream(binding))){
++                if(in.readInt()!=0x444D4232)throw new IOException("invalid binding");
++                bound=new PairKey(UUID.fromString(in.readUTF()),in.readUTF(),mcWorld,"dst_mc_bridge:stage","ground");
++                transform=new WorldTransform(new Vec3(in.readDouble(),in.readDouble(),in.readDouble()),new Vec3(0,64,0));
++                if(in.read()!=-1)throw new IOException("trailing binding data");
++            }
++        } catch(IOException e){throw new UncheckedIOException(e);}
++    }
++    public UUID mcWorld(){return mcWorld;}
++    /** A launch property cannot turn an arbitrary manually selected save into a fixture. */
++    public static boolean frameFixture(Path save, boolean requested){
++        if(requested && !save.toAbsolutePath().normalize().getFileName().toString().equals("DST-MC-Frame-Fixture"))
++            throw new IllegalArgumentException("FIXTURE_SAVE_MISMATCH");
++        return requested;
++    }
++    public HandshakeResult active(){return active;}
++    public HandshakeResult handshake(UUID dstWorld,String shard,Vec3 dstOrigin){return handshake(new PairKey(dstWorld,shard,mcWorld,"dst_mc_bridge:stage","ground"),UUID.randomUUID(),dstOrigin,new Vec3(0,64,0));}
++    public HandshakeResult handshake(PairKey pair,UUID epoch,Vec3 dstOrigin,Vec3 mcOrigin) {
++        if(!pair.mc_world().equals(mcWorld)||!pair.mc_dimension().equals("dst_mc_bridge:stage")||!pair.region().equals("ground")||!mcOrigin.equals(new Vec3(0,64,0))||(bound!=null&&!bound.equals(pair)))
++            return new HandshakeResult(null,null,null,"WORLD_MISMATCH");
++        if(bound==null){
++            try {
++                var bytes=new ByteArrayOutputStream();try(var out=new DataOutputStream(bytes)){out.writeInt(0x444D4232);out.writeUTF(pair.dst_world().toString());out.writeUTF(pair.dst_shard());out.writeDouble(dstOrigin.x());out.writeDouble(dstOrigin.y());out.writeDouble(dstOrigin.z());}
++                writeAtomic(directory.resolve("binding.bin"),bytes.toByteArray());
++                bound=pair;transform=new WorldTransform(dstOrigin,mcOrigin);
++            }catch(IOException e){throw new UncheckedIOException(e);}
++        }
++        active=new HandshakeResult(bound,epoch,transform,"");return active;
++    }
++    private static void writeAtomic(Path path,byte[] data)throws IOException{
++        Path tmp=Files.createTempFile(path.getParent(),".pending-",".tmp");
++        try{try(var ch=FileChannel.open(tmp,StandardOpenOption.WRITE)){var b=java.nio.ByteBuffer.wrap(data);while(b.hasRemaining())ch.write(b);ch.force(true);}Files.move(tmp,path,StandardCopyOption.ATOMIC_MOVE);try(var dir=FileChannel.open(path.getParent(),StandardOpenOption.READ)){dir.force(true);}}finally{Files.deleteIfExists(tmp);}
++    }
++}
+diff --git a/mc/src/main/resources/data/dst_mc_bridge/dimension/stage.json b/mc/src/main/resources/data/dst_mc_bridge/dimension/stage.json
+new file mode 100644
+index 0000000..b8894bd
+--- /dev/null
++++ b/mc/src/main/resources/data/dst_mc_bridge/dimension/stage.json
+@@ -0,0 +1 @@
++{"type":"minecraft:overworld","generator":{"type":"minecraft:flat","settings":{"biome":"minecraft:plains","layers":[],"lakes":false,"features":false,"structure_overrides":[]}}}
+diff --git a/mc/src/main/resources/fabric.mod.json b/mc/src/main/resources/fabric.mod.json
+new file mode 100644
+index 0000000..0be8228
+--- /dev/null
++++ b/mc/src/main/resources/fabric.mod.json
+@@ -0,0 +1 @@
++{"schemaVersion":1,"id":"dst_mc_bridge","version":"0.1.0","name":"DST MC First Person Bridge","environment":"*","entrypoints":{"main":["dev.jay.dstmc.BridgeMod"],"client":["dev.jay.dstmc.client.BridgeClient"]},"mixins":[{"config":"dst_mc_bridge.client.mixins.json","environment":"client"}],"depends":{"fabricloader":">=0.19.5","minecraft":"1.21.11","java":">=21","fabric-api":"*"}}
+diff --git a/protocol/frame-v2.md b/protocol/frame-v2.md
+index 586ac82..91383a2 100644
+--- a/protocol/frame-v2.md
++++ b/protocol/frame-v2.md
+@@ -107,10 +107,68 @@ Readers check capacity before multiplying and validate the exact calculated stri
+ Both services bind loopback only. A legacy protocol=1 owner of 39379 is a visible conflict requiring that test instance to be closed; never kill an unrelated process. Network callbacks queue work for game/render threads and do not invoke game APIs. Receipt PENDING is never displayed as application. HTTP implementations and game APIs belong to subsequent tasks.
+ 
+ ## Verification
+ 
+ ```
+ cd mc && ./gradlew coreTest --console plain
+ cd .. && make -C native contract-test
+ ```
+ 
+ `ContractTests.main(String[])` is the common Java test entry point; subsequent tasks add their suites there. Java tests regenerate the deterministic golden binary. Native tests compile explicitly for x86_64 and execute against that Java ARM64 file. The two-process test launches Java explicitly with `arch -arm64`, maps the same runtime file, pins all three slots, proves backpressure and safe reuse, then verifies 200 concurrent frame publications. No game launch, mod install or original save is involved.
++
++## Task 3 runtime discovery and capture
++
++`GET 127.0.0.1:39379/v2/status` is the strict `StatusResponse` in the HTTP schema.
++Before handshake it reports `status: UNPAIRED`, the copy's persistent `mc_world`,
++`pid`, random process `run_id`, `started_at_ms`, server tick `heartbeat`,
++`peer_last_seen_ms` (0 before heartbeat exchange), `fixture` and `stage_ready`.
++`pair`, `epoch`, `frame_path`, `generation`, `latest_frame`, `width`, `height` are null.
++After handshake status is `PAIRED` and pair/epoch identify the active session.
++Until a complete current-generation frame commits, stream fields remain null.
++Then `latest_frame` is the exact committed FrameKey and MUST match active pair/epoch;
++`frame_path` is an absolute mmap path, `generation` is positive, width/height are
++physical pixels. Fetch status and use the native leased exact-key reader; retry
++status if the advertised frame has already rotated out. Never inspect mutable
++slot headers as an unleased selector. A resize or handshake creates a distinct
++mapping; old files remain for outstanding readers. Generation is scoped to a
++publisher epoch; path is globally unique even if an epoch is explicitly reused.
++
++All JSON integers emitted to Lua are in `[0, 9007199254740991]`; frame IDs fail
++with `HTTP_UINT64_NOT_EXACT` at exhaustion. Binary frame fields remain uint64.
++Existing handshake input remains unchanged. The MC origin must be `(0,64,0)`;
++only `dst_mc_bridge:stage` / `ground` is supported. Each independent copied save
++stores one MC UUID and at most one DST pair; a different DST world/shard is rejected
++with `WORLD_MISMATCH`, including after restart. Re-handshake retains the first origin.
++The final intended copy is reserved for the real DST world. Mock pairing tests
++run in `DST-MC-Frame-Fixture`, selected explicitly by `-PtestSave=...` at launch.
++Its `/test/scene` endpoint is available only under the fixture VM property AND
++the exact current save directory `DST-MC-Frame-Fixture`. A fixture launch that
++manually selects any other save fails with `FIXTURE_SAVE_MISMATCH` before creating
++bridge identity or serving HTTP. The dev-only fixture loader continues the
++experimental-world backup gate only for that same dual guard, after the official
++`makeWorldBackup()` succeeds. Other saves keep Minecraft's ordinary prompt;
++backup failure never runs the world-load continuation.
++
++World capture occurs before GameRenderer's hand depth clear. It uses current
++RenderTarget GlTexture IDs and synchronous `glReadPixels`, so publication can
++only follow completed GPU readback of world RGBA/depth and subsequent hand/HUD.
++Images use OpenGL bottom-left row origin. Color buffers are already premultiplied
++by MC blending over transparent black; zero-alpha RGB is normalized to zero.
++No second premultiplication is applied to already blended HUD pixels. The shared
++view is `rotation * translate(-eye)` (full MC world view), using the actual world
++projection passed to LevelRenderer. Hurt/bob/nausea cosmetic transforms are disabled
++while bridging. Sky/cloud backgrounds are excluded in the stage; genuine blocks,
++entities and particles use the regular MC renderer. The initial plane consists
++of invisible vanilla barriers; the one visible stone is the graphics fixture.
++
++Local verification uses JDK21 and `./gradlew build coreTest --console plain`
++with no dev client running. Launch the fixture using
++`./gradlew runClient -PtestSave=DST-MC-Frame-Fixture -x downloadAssets --console plain`;
++the installed assets directory and index29 are used without redistributing game assets.
++For a fresh development run directory, complete accessibility onboarding, or set
++only that development directory's `options.txt` `onboardAccessibility:false`
++while its client is stopped. The live Python test requires `jsonschema` and
++`DSTMC_EXPECT_PID` / `DSTMC_LAUNCH_AFTER_MS`, rejects any other process/run, and
++compiles its native leased reader explicitly for x86_64. It captures real stone,
++removes that block via the fixture-only server-thread API, verifies the pixels
++disappear, checks matched camera pose/depth/premultiplied alpha, then samples
++continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowed.
+diff --git a/protocol/http-v2.schema.json b/protocol/http-v2.schema.json
+index d856f4f..4096fb5 100644
+--- a/protocol/http-v2.schema.json
++++ b/protocol/http-v2.schema.json
+@@ -536,37 +536,234 @@
+       ],
+       "additionalProperties": false
+     },
+     "StatusResponse": {
+       "type": "object",
+       "properties": {
+         "protocol": {
+           "const": 2
+         },
+         "pair": {
+-          "$ref": "#/$defs/PairKey"
++          "anyOf": [
++            {
++              "$ref": "#/$defs/PairKey"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         },
+         "epoch": {
+-          "$ref": "#/$defs/UUID"
++          "anyOf": [
++            {
++              "$ref": "#/$defs/UUID"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         },
+         "status": {
+-          "type": "string",
++          "enum": [
++            "UNPAIRED",
++            "PAIRED"
++          ]
++        },
++        "mc_world": {
++          "$ref": "#/$defs/UUID"
++        },
++        "run_id": {
++          "$ref": "#/$defs/UUID"
++        },
++        "pid": {
++          "type": "integer",
++          "minimum": 1,
++          "maximum": 9007199254740991
++        },
++        "started_at_ms": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 9007199254740991
++        },
++        "heartbeat": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 9007199254740991
++        },
++        "peer_last_seen_ms": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 9007199254740991
++        },
++        "fixture": {
++          "type": "boolean"
++        },
++        "stage_ready": {
++          "type": "boolean"
++        },
++        "frame_path": {
++          "type": [
++            "string",
++            "null"
++          ],
+           "minLength": 1
++        },
++        "generation": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 1,
++          "maximum": 9007199254740991
++        },
++        "width": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 1,
++          "maximum": 1920
++        },
++        "height": {
++          "type": [
++            "integer",
++            "null"
++          ],
++          "minimum": 1,
++          "maximum": 1080
++        },
++        "latest_frame": {
++          "anyOf": [
++            {
++              "$ref": "#/$defs/FrameKey"
++            },
++            {
++              "type": "null"
++            }
++          ]
+         }
+       },
+       "required": [
+         "protocol",
+         "pair",
+         "epoch",
+-        "status"
++        "status",
++        "mc_world",
++        "run_id",
++        "pid",
++        "started_at_ms",
++        "heartbeat",
++        "peer_last_seen_ms",
++        "fixture",
++        "stage_ready",
++        "frame_path",
++        "generation",
++        "width",
++        "height",
++        "latest_frame"
+       ],
+-      "additionalProperties": false
++      "additionalProperties": false,
++      "allOf": [
++        {
++          "if": {
++            "properties": {
++              "status": {
++                "const": "UNPAIRED"
++              }
++            }
++          },
++          "then": {
++            "properties": {
++              "pair": {
++                "type": "null"
++              },
++              "epoch": {
++                "type": "null"
++              },
++              "frame_path": {
++                "type": "null"
++              },
++              "generation": {
++                "type": "null"
++              },
++              "latest_frame": {
++                "type": "null"
++              },
++              "width": {
++                "type": "null"
++              },
++              "height": {
++                "type": "null"
++              }
++            }
++          },
++          "else": {
++            "properties": {
++              "pair": {
++                "$ref": "#/$defs/PairKey"
++              },
++              "epoch": {
++                "$ref": "#/$defs/UUID"
++              }
++            }
++          }
++        },
++        {
++          "if": {
++            "properties": {
++              "latest_frame": {
++                "type": "null"
++              }
++            }
++          },
++          "then": {
++            "properties": {
++              "frame_path": {
++                "type": "null"
++              },
++              "generation": {
++                "type": "null"
++              },
++              "width": {
++                "type": "null"
++              },
++              "height": {
++                "type": "null"
++              }
++            }
++          },
++          "else": {
++            "properties": {
++              "frame_path": {
++                "type": "string",
++                "minLength": 1
++              },
++              "generation": {
++                "type": "integer",
++                "minimum": 1,
++                "maximum": 9007199254740991
++              },
++              "width": {
++                "type": "integer",
++                "minimum": 1,
++                "maximum": 1920
++              },
++              "height": {
++                "type": "integer",
++                "minimum": 1,
++                "maximum": 1080
++              }
++            }
++          }
++        }
++      ],
++      "description": "Task3 exact-key discovery. latest_frame pair and epoch must equal active pair and epoch (semantic validation). Every stream change invalidates latest_frame until a complete new-generation frame commits. HTTP integers are limited to 2^53-1, while the binary ABI remains uint64."
+     },
+     "CameraLeaseRequest": {
+       "type": "object",
+       "properties": {
+         "protocol": {
+           "const": 2
+         },
+         "pair": {
+           "$ref": "#/$defs/PairKey"
+         },
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_live_frames.py b/tests/test_live_frames.py
+new file mode 100644
+index 0000000..fa9fd5f
+--- /dev/null
++++ b/tests/test_live_frames.py
+@@ -0,0 +1,119 @@
++"""Live tests: require the newly launched, dedicated DST-MC-Frame-Fixture client.
++No disk fallback. Every sample is selected by an HTTP FrameKey and read under a
++native slot lease. A fixture-only scene change proves pixels came from this run.
++"""
++import hashlib
++import json
++import os
++from pathlib import Path
++import struct
++import subprocess
++import tempfile
++import time
++import unittest
++import urllib.request
++import uuid
++import zlib
++
++ROOT=Path(__file__).resolve().parents[1]
++
++def request(path, data=None):
++    body=None if data is None else json.dumps(data).encode()
++    with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:39379'+path,body,{'Content-Type':'application/json'}),timeout=8) as r:return json.load(r)
++
++def png(path,w,h,rgba):
++    def chunk(k,v):return struct.pack('>I',len(v))+k+v+struct.pack('>I',zlib.crc32(k+v)&0xffffffff)
++    rows=b''.join(b'\0'+rgba[y*w*4:(y+1)*w*4] for y in range(h-1,-1,-1))
++    path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(rows))+chunk(b'IEND',b''))
++
++class LiveFrames(unittest.TestCase):
++    def test_fresh_game_frames(self):
++        try:status=request('/v2/status')
++        except Exception as e:self.fail('new live MC v2 server unavailable: '+str(e))
++        self.assertTrue(status['fixture'], 'refuse to bind the final intended save to a mock DST world')
++        self.assertEqual(int(os.environ['DSTMC_EXPECT_PID']),status['pid'],'wrong game process')
++        self.assertGreaterEqual(status['started_at_ms'],int(os.environ['DSTMC_LAUNCH_AFTER_MS']))
++        os.kill(status['pid'],0)
++        from jsonschema import Draft202012Validator
++        schema=json.loads((ROOT/'protocol/http-v2.schema.json').read_text())
++        validator=Draft202012Validator({'$ref':'#/$defs/StatusResponse', '$defs':schema['$defs']})
++        validator.validate(status)
++        pair={'dst_world':'15fdff60-cf13-4198-bc7e-d7bb9ed3af77','dst_shard':'surface','mc_world':status['mc_world'],'mc_dimension':'dst_mc_bridge:stage','region':'ground'}
++        response=request('/v2/handshake',{'protocol':2,'pair':pair,'epoch':str(uuid.uuid4()),'dst_origin':{'x':10,'y':0,'z':20},'mc_origin':{'x':0,'y':64,'z':0}})
++        self.assertEqual(pair,response['pair'])
++        deadline=time.monotonic()+30
++        while time.monotonic()<deadline:
++            status=request('/v2/status')
++            if status.get('latest_frame'):break
++            time.sleep(.2)
++        self.assertIsNotNone(status.get('latest_frame'),'no complete world+HUD frame')
++        validator.validate(status)
++        self.assertEqual(pair,status['latest_frame']['pair'])
++        self.assertEqual(response['epoch'],status['latest_frame']['epoch'])
++        evidence=ROOT/'evidence'/('task3-live-'+status['run_id']);evidence.mkdir(parents=True,exist_ok=True)
++        helper=evidence/'read-frame'
++        # Real native reader used from test utility, with exact key and RAII lease.
++        source=evidence/'read-frame.cpp'
++        source.write_text(r'''
++#include "frame_protocol.h"
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <fstream>
++#include <iostream>
++#include <string>
++int main(int n,char** a){if(n!=6)return 2;int fd=open(a[1],O_RDWR);struct stat st{};if(fd<0||fstat(fd,&st))return 3;void* m=mmap(nullptr,st.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);dstmc::FrameKey k{};
++for(int i=0;i<32;i++)k.pair_hash[i]=std::stoi(std::string(a[2]+i*2,2),nullptr,16);
++for(int i=0;i<16;i++)k.epoch[i]=std::stoi(std::string(a[3]+i*2,2),nullptr,16);k.id=std::stoull(a[4]);
++{auto frame=dstmc::read_frame(m,st.st_size,k);if(!frame)return 4;std::cout<<frame->pose.position.x<<" "<<frame->pose.position.y<<" "<<frame->pose.position.z<<" "<<frame->pose.forward.x<<" "<<frame->pose.forward.y<<" "<<frame->pose.forward.z;
++std::ofstream out(a[5],std::ios::binary);uint32_t w=frame->width,h=frame->height;out.write((char*)&w,4);out.write((char*)&h,4);out.write((char*)frame->color,w*h*4);out.write((char*)frame->depth,w*h*4);out.write((char*)frame->hud,w*h*4);}munmap(m,st.st_size);close(fd);}
++''')
++        subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O2','-I'+str(ROOT/'native/include'),str(source),'-o',str(helper)],check=True)
++        canonical=json.dumps(pair,separators=(',',':'))
++        pairhash=hashlib.sha256(canonical.encode()).hexdigest()
++        def sample(name):
++            for _ in range(50):
++                s=request('/v2/status');validator.validate(s);key=s.get('latest_frame')
++                if key:
++                    out=evidence/(name+'.raw')
++                    result=subprocess.run([str(helper),s['frame_path'],pairhash,key['epoch'].replace('-',''),str(key['id']),str(out)],capture_output=True,text=True)
++                    if result.returncode==0:
++                        b=out.read_bytes();w,h=struct.unpack_from('<II',b);size=w*h*4
++                        color=b[8:8+size];depth=struct.unpack('<'+'f'*(w*h),b[8+size:8+2*size]);hud=b[8+2*size:]
++                        png(evidence/(name+'-world.png'),w,h,color);png(evidence/(name+'-hud.png'),w,h,hud)
++                        pose=list(map(float,result.stdout.split()));(evidence/(name+'-pose.json')).write_text(json.dumps({'position':pose[:3],'forward':pose[3:]}))
++                        for actual,expected in zip(pose[:3],[.5,65.62,.5]):self.assertAlmostEqual(actual,expected,delta=.1,msg='fixture camera moved unexpectedly')
++                        self.assertLess(pose[4],-.1);self.assertGreater(pose[5],.9)
++                        return s,w,h,color,depth,hud
++                time.sleep(.02)
++            self.fail('could not lease a current exact frame')
++        request('/test/scene',{'stone':True})
++        time.sleep(2)
++        s,w,h,color,depth,hud=sample('stone')
++        self.assertLessEqual(w,1920);self.assertLessEqual(h,1080)
++        opaque=sum(a>240 for a in color[3::4]);clear=sum(a==0 for a in color[3::4])
++        self.assertGreater(opaque,500,'no real block pixels');self.assertGreater(clear,w*h*.5,'background not transparent')
++        self.assertTrue(all(color[i]==color[i+1]==color[i+2]==0 for i in range(0,len(color),4) if color[i+3]==0),'transparent background RGB dirty')
++        self.assertGreater(sum(0<d<.99999 for d in depth),500,'world depth lost before capture')
++        greys={tuple(color[i:i+3]) for i in range(0,len(color),4) if color[i+3]>240}
++        self.assertGreater(len(greys),16,'missing actual stone texture variation')
++        self.assertGreater(sum(a>0 for a in hud[3::4]),100,'hand/HUD absent')
++        # Break: a straight-alpha layer leaks RGB brighter than its alpha into DST.
++        for layer in (color,hud):
++            self.assertTrue(all(max(layer[i:i+3])<=layer[i+3]+1 for i in range(0,len(layer),4)),
++                            'layer is not premultiplied RGBA')
++        request('/test/scene',{'stone':False});time.sleep(2)
++        empty=sample('removed-stone');self.assertGreater(empty[0]['latest_frame']['id'],s['latest_frame']['id'])
++        self.assertLess(sum(a>240 for a in empty[3][3::4]),opaque*.25,'removing actual stone did not remove pixels')
++        request('/test/scene',{'stone':True})
++        samples=[];start=time.monotonic();lastid=empty[0]['latest_frame']['id']
++        while time.monotonic()-start<60:
++            state=request('/v2/status');validator.validate(state)
++            self.assertEqual(status['run_id'],state['run_id']);self.assertEqual(status['pid'],state['pid'])
++            samples.append({'elapsed':time.monotonic()-start,'frame':state['latest_frame']['id'],'heartbeat':state['heartbeat'],'width':state['width'],'height':state['height']})
++            time.sleep(.5)
++        fps=(samples[-1]['frame']-samples[0]['frame'])/(samples[-1]['elapsed']-samples[0]['elapsed'])
++        self.assertGreater(samples[-1]['frame'],lastid+100,'no continuous new frames')
++        (evidence/'result.json').write_text(json.dumps({'status':s,'opaque_pixels':opaque,'clear_pixels':clear,'texture_colors':len(greys),'fps':fps,'samples':samples},indent=2))
++        print('LIVE EVIDENCE',evidence,'FPS',fps,flush=True)
+diff --git a/tests/test_test_copy.py b/tests/test_test_copy.py
+new file mode 100644
+index 0000000..d8942f1
+--- /dev/null
++++ b/tests/test_test_copy.py
+@@ -0,0 +1,50 @@
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++from tools.prepare_test_copy import prepare
++
++JAVA = '/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home/bin/java'
++
++class TestCopy(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = Path(self.tmp.name)
++        self.source = self.root / 'source'
++        self.source.mkdir()
++        (self.source / 'level.dat').write_bytes(b'test level')
++        (self.source / 'session.lock').write_bytes(b'original lock bytes')
++        self.dest = self.root / 'dest'
++    def tearDown(self):
++        self.tmp.cleanup()
++    # Break: ignoring Minecraft's POSIX FileChannel lock allows an incoherent save copy.
++    def test_active_save_copy_refused(self):
++        java = self.root / 'LockHolder.java'
++        java.write_text('''import java.nio.channels.*;import java.nio.file.*;
++class LockHolder {public static void main(String[] a)throws Exception{
++try(var c=FileChannel.open(Path.of(a[0]),StandardOpenOption.WRITE);var l=c.lock()){
++System.out.println("LOCKED");System.out.flush();System.in.read();}}}''')
++        with subprocess.Popen([JAVA,str(java),str(self.source/'session.lock')],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True) as holder:
++            self.assertEqual('LOCKED',holder.stdout.readline().strip())
++            try:
++                with self.assertRaisesRegex(RuntimeError,'active|locked'):
++                    prepare(self.source,self.dest)
++                self.assertFalse(self.dest.exists())
++            finally:
++                holder.stdin.write('\n');holder.stdin.flush();holder.wait(timeout=5)
++    # Break: treating a stale lock file as an active session, or mutating source metadata.
++    def test_unlocked_copy_provenance_and_source_unchanged(self):
++        before={p.name:p.read_bytes() for p in self.source.iterdir()}
++        prepare(self.source,self.dest)
++        self.assertEqual(before,{p.name:p.read_bytes() for p in self.source.iterdir()})
++        self.assertEqual(b'test level',(self.dest/'level.dat').read_bytes())
++        self.assertTrue((self.dest/'dst-mc-copy-source.json').exists(), 'missing copy provenance')
++        provenance=json.loads((self.dest/'dst-mc-copy-source.json').read_text())
++        self.assertEqual(str(self.source.resolve()),provenance['source'])
++        self.assertFalse((self.dest/'session.lock').exists())
++    def test_existing_destination_refused(self):
++        self.dest.mkdir();(self.dest/'keep').write_text('mine')
++        with self.assertRaises(FileExistsError):prepare(self.source,self.dest)
++        self.assertEqual('mine',(self.dest/'keep').read_text())
+diff --git a/tools/prepare_test_copy.py b/tools/prepare_test_copy.py
+new file mode 100644
+index 0000000..166a150
+--- /dev/null
++++ b/tools/prepare_test_copy.py
+@@ -0,0 +1,49 @@
++"""Copy an inactive Minecraft save while holding its actual POSIX session lock.
++
++Minecraft FileChannel locks use POSIX fcntl record locks on macOS/Linux. lockf
++uses the same lock family (flock does not). Existing lock bytes are never changed.
++"""
++import argparse
++import errno
++import fcntl
++import json
++import os
++from pathlib import Path
++import shutil
++from datetime import datetime, timezone
++
++def prepare(source, dest):
++    source, dest = Path(source).resolve(), Path(dest).absolute()
++    if dest.exists():
++        raise FileExistsError(dest)
++    if source == dest or source in dest.parents:
++        raise ValueError('destination must be outside source save')
++    if not (source / 'level.dat').is_file():
++        raise ValueError('source is not a Minecraft save')
++    # Refuse an unknown locking state instead of creating/modifying source files.
++    with (source / 'session.lock').open('r+b') as lock:
++        try:
++            fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB, 0)
++        except OSError as error:
++            if error.errno in (errno.EACCES, errno.EAGAIN):
++                raise RuntimeError('source save is active / locked') from error
++            raise
++        try:
++            # Do not follow links outside the save or reproduce bridge identity.
++            if any(p.is_symlink() for p in source.rglob('*')):
++                raise ValueError('source save contains symlinks')
++            shutil.copytree(source, dest, ignore=shutil.ignore_patterns('session.lock', 'dst-mc-bridge', 'dst-mc-copy-source.json'))
++            (dest / 'dst-mc-copy-source.json').write_text(json.dumps({
++                'source': str(source), 'copied_at': datetime.now(timezone.utc).isoformat(),
++                'source_lock': 'POSIX record lock held throughout copy',
++            }, indent=2) + '\n')
++        finally:
++            fcntl.lockf(lock, fcntl.LOCK_UN)
++    return dest
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--source', required=True, type=Path)
++    parser.add_argument('--dest', required=True, type=Path)
++    args = parser.parse_args()
++    print(prepare(args.source, args.dest))

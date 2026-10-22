@@ -1,0 +1,49 @@
+plugins {
+    id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+}
+
+loom {
+    runs {
+        client {
+            runDir 'run'
+            programArg '--username'
+            programArg 'DSTBridgeProbe'
+            vmArg '-Xmx2G'
+            programArgs '--quickPlaySingleplayer', 'DST-MC-Probe-Copy', '--width', '960', '--height', '540'
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach { options.release = 21 }
+
+sourceSets {
+    contractTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+tasks.register('coreTest', JavaExec) {
+    dependsOn contractTestClasses
+    classpath = sourceSets.contractTest.runtimeClasspath
+    mainClass = 'dev.jay.dstmc.BridgeCoreTest'
+}
+check.dependsOn coreTest
+
+// Reuse the assets of the installed game. The development launcher otherwise
+// expects a renamed asset index which is absent from a normal HMCL installation.
+tasks.named('runClient') {
+    doFirst {
+        def launch = file('.gradle/loom-cache/launch.cfg')
+        def installed = '/Users/jay/Downloads/.minecraft/assets'
+        launch.text = launch.text.replace("${gradle.gradleUserHomeDir}/caches/fabric-loom/assets", installed)
+                                .replace('\t1.21.11-29', '\t29')
+    }
+}

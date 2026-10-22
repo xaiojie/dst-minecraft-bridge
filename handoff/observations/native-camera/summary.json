@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "requested_at": 1792676561.195839,
+  "seconds": 2.0,
+  "pid": 22823,
+  "draw_count": 2838,
+  "capture_count": 2,
+  "captures": [
+    {
+      "metadata": "ctx1-f8947-d1408.json",
+      "context_id": 1,
+      "frame_no": 8947,
+      "draw_no": 1408,
+      "stage": "before-present",
+      "viewport": [
+        0,
+        0,
+        960,
+        540
+      ],
+      "target_id": 0,
+      "program": 1,
+      "error": "",
+      "color_sha256": "244651d0a875eb8d4cc60b7d3932a4615dbc28d4b169f44a44d13b40001c0a4b",
+      "depth_sha256": "ea8b8fe1902f6cd7bca422db7ece5ed14db202aa6dbaca01db68821a6266122f",
+      "depth_stats": {
+        "finite": 518400,
+        "total": 518400,
+        "min": 1.0,
+        "max": 1.0,
+        "below_clear_one": 0,
+        "distinct_values": 1
+      }
+    },
+    {
+      "metadata": "ctx1-f8948-d1430.json",
+      "context_id": 1,
+      "frame_no": 8948,
+      "draw_no": 1430,
+      "stage": "before-present",
+      "viewport": [
+        0,
+        0,
+        960,
+        540
+      ],
+      "target_id": 0,
+      "program": 1,
+      "error": "",
+      "color_sha256": "e324c4d3bc0a1b391b07f5e683094acff9c8b541e85bb794298ec2c54193c1a9",
+      "depth_sha256": "ea8b8fe1902f6cd7bca422db7ece5ed14db202aa6dbaca01db68821a6266122f",
+      "depth_stats": {
+        "finite": 518400,
+        "total": 518400,
+        "min": 1.0,
+        "max": 1.0,
+        "below_clear_one": 0,
+        "distinct_values": 1
+      }
+    }
+  ],
+  "errors": [],
+  "requested_draws": null,
+  "runtime_acceptance": "pending_manual_scene_and_alpha_review"
+}

@@ -1,0 +1,65 @@
+{
+  "task": 4,
+  "status": "NOT_VERIFIED",
+  "task_complete": false,
+  "allow_task_5": false,
+  "checked_at": "2026-10-22T13:48:54.656956+00:00",
+  "base_commit": "b8b82820017427c6069c058d194e5fb007700264",
+  "gates": {
+    "camera": {
+      "status": "NOT_VERIFIED",
+      "reason": "Steam native process and bounded first-person camera motion observed in two real frames; reflected X axes confirmed. Matching an actual MC frame/camera is pending persistent-axis fix and dual-game validation."
+    },
+    "same_frame": {
+      "status": "NOT_VERIFIED",
+      "reason": "No real MC client is paired in this run; no combined same-FrameKey presentation observed."
+    },
+    "transparency": {
+      "status": "NOT_VERIFIED",
+      "reason": "No real dual-game transparent MC input window/composite observed in this run."
+    },
+    "depth_occlusion": {
+      "status": "NOT_VERIFIED",
+      "reason": "Native metadata-only calibration sampled shoreline/water; final presentation depth is cleared. Real MC/DST foreground/background and alpha-edge occlusion remain untested."
+    },
+    "ui": {
+      "status": "NOT_VERIFIED",
+      "reason": "Native UI visible in calibration images, but paired MC HUD/native UI/input ownership acceptance remains untested."
+    }
+  },
+  "additional_checks": {
+    "transparent_window_keyboard_mouse_and_block_placement": "NOT_VERIFIED",
+    "sixty_second_performance": "NOT_VERIFIED"
+  },
+  "local_checks": {
+    "native_gpu_compositor_and_alpha_replay": "PASSED",
+    "native_http_resize_ack_expiry": "PASSED",
+    "lua_camera_and_connection": "PASSED",
+    "mc_compile_and_publisher": "PASSED"
+  },
+  "runtime_evidence": [
+    "evidence/first-person-calibration-1/",
+    "evidence/first-person-calibration-2/",
+    "evidence/first-person-calibration-3/",
+    "evidence/steam-launches/22817-041x8qcv/calibration-forward-negz-1/"
+  ],
+  "next_step": "Complete/review persistent X reflection across stores, frames and native camera; safely refresh via Steam after user save/exit, then validate actual dual-game graphics gate. Final MC test copy remains unpaired.",
+  "checkpoint_commit": "2ea975d63592f11a263462550a7a5da5fbf41419",
+  "review_fix_1_commit": "7c7804808187c6a7cec6ea35cf7e0b1016c47b35",
+  "review_fix_1_candidate": "/tmp/dstmc-task4-review1/libdstmc_probe.dylib",
+  "review_fix_1_scope": "code only; nullable discovery and make deps approved; window proof completed by reviewed fix2; no actual dual-game acceptance",
+  "review_fix_2_commit": "60c5591b80c6ba2455026b359e508c0121f77c6f",
+  "review_fix_2_candidate": "/tmp/dstmc-task4-review2/libdstmc_probe.dylib",
+  "review_fix_2_scope": "code only; identity-bound actual composite proof independently approved; no actual dual-game acceptance",
+  "runtime_milestones": {
+    "steam_start": "OBSERVED",
+    "native_extension_load": "OBSERVED",
+    "native_advancing_present_callback": "OBSERVED",
+    "bounded_native_first_person_camera": "OBSERVED",
+    "fixed_axes_mismatch": "CONFIRMED_X_REFLECTION",
+    "mc_pair_or_composite": "NOT_OBSERVED",
+    "native_pid": 22823,
+    "native_loaded_sha256": "8079000eb6e56fa915e91fe1d5c6ae465e5eeaf494b1efced3480f0c2737a77d"
+  },
+  "local_checks_scope": "historical reviewed Task4 WIP and fixes; new persistent-axis code not covered by these historical passes"
+}

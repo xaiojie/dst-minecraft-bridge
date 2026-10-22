@@ -1,0 +1,423 @@
+# Review package: 2ea975d63592f11a263462550a7a5da5fbf41419..7c7804808187c6a7cec6ea35cf7e0b1016c47b35
+
+## Commits
+7c78048 fix: reject incomplete streams and stale window activation responses
+
+## Files changed
+ .../dev/jay/dstmc/client/PassthroughWindow.java    | 34 ++++++++---
+ .../dev/jay/dstmc/client/WindowActivation.java     | 24 ++++++++
+ native/Makefile                                    |  2 +-
+ native/src/camera_http.mm                          | 35 ++++++++---
+ tests/test_first_person_gate.py                    | 68 +++++++++++++++++++---
+ 5 files changed, 138 insertions(+), 25 deletions(-)
+
+## Diff
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+index 7013ea6..854c8f9 100644
+--- a/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
++++ b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+@@ -1,13 +1,14 @@
+ package dev.jay.dstmc.client;
+ 
+ import com.google.gson.JsonParser;
++import dev.jay.dstmc.BridgeMod;
+ import net.minecraft.client.Minecraft;
+ import org.lwjgl.glfw.*;
+ import org.lwjgl.opengl.*;
+ import org.lwjgl.system.MemoryStack;
+ import org.lwjgl.system.JNI;
+ import org.lwjgl.system.macosx.ObjCRuntime;
+ import java.net.URI;
+ import java.net.http.*;
+ import java.time.Duration;
+ import java.util.concurrent.CompletableFuture;
+@@ -15,67 +16,82 @@ import java.util.concurrent.CompletableFuture;
+ /** GLFW/Cocoa operations are confined to the Minecraft client/render thread. */
+ public final class PassthroughWindow {
+     public record WindowBounds(int x,int y,int logicalWidth,int logicalHeight,int physicalWidth,int physicalHeight,double scale) {
+         public WindowBounds {
+             if(logicalWidth<=0||logicalHeight<=0||physicalWidth<=0||physicalHeight<=0||physicalWidth>1920||physicalHeight>1080||!Double.isFinite(scale)||scale<=0
+                 ||Math.abs(physicalWidth-logicalWidth*scale)>.5||Math.abs(physicalHeight-logicalHeight*scale)>.5)throw new IllegalArgumentException("inconsistent native render size");
+         }
+     }
+     private static final boolean CONFIGURED=Boolean.getBoolean("dstmc.firstPerson")&&System.getProperty("os.name").startsWith("Mac");
+     private static final HttpClient HTTP=HttpClient.newBuilder().connectTimeout(Duration.ofMillis(150)).build();
+-    private static CompletableFuture<WindowBounds> pending;
++    private record Pending(WindowActivation.Ticket ticket, CompletableFuture<WindowBounds> response) {}
++    private static final WindowActivation ACTIVATION = new WindowActivation();
++    private static Pending pending;
+     private static boolean active;
+-    private static long validUntil,lastPoll,cocoa;
++    private static long lastPoll,cocoa;
+     private static int x,y,width,height,decorated,floating;
+     private static boolean ignoresMouse,shadow;
+     private static WindowBounds bounds;
+     private static long msgSend(){return ObjCRuntime.getLibrary().getFunctionAddress("objc_msgSend");}
+     private static boolean getBool(long target,String selector){return JNI.invokePPZ(target,ObjCRuntime.sel_registerName(selector),msgSend());}
+     private static void setBool(long target,String selector,boolean value){JNI.invokePPV(target,ObjCRuntime.sel_registerName(selector),value,msgSend());}
+     public static boolean configured(){return CONFIGURED;}
+-    public static boolean active(){return active&&System.nanoTime()<validUntil;}
++    public static boolean active(){return active&&BridgeClient.active()&&ACTIVATION.active(BridgeMod.server.active(),System.nanoTime());}
+     public static void creationHints(){if(CONFIGURED){GLFW.glfwWindowHint(GLFW.GLFW_TRANSPARENT_FRAMEBUFFER,GLFW.GLFW_TRUE);GLFW.glfwWindowHint(GLFW.GLFW_COCOA_RETINA_FRAMEBUFFER,GLFW.GLFW_FALSE);}}
+     public static void tick(){
+         if(!CONFIGURED)return;
+-        if(!BridgeClient.active()){if(pending!=null){pending.cancel(false);pending=null;}restore();return;}
++        // Capture session identity only on the client thread. Re-pairing may keep
++        // BridgeClient.active() true, so a boolean is not an activation proof.
++        Object session=BridgeClient.active()?BridgeMod.server.active():null;
++        if(ACTIVATION.session(session)){
++            if(pending!=null){pending.response().cancel(false);pending=null;}
++            restore();
++        }
++        if(session==null){restore();return;}
+         long now=System.nanoTime();
+-        if(pending!=null&&pending.isDone()){
++        if(pending!=null&&pending.response().isDone()){
+             var result=pending;pending=null;
+-            try{WindowBounds value=result.join();validUntil=now+200_000_000L;enable(value);}catch(Exception e){restore();}
++            try{
++                WindowBounds value=result.response().join();
++                if(ACTIVATION.accept(result.ticket(),now))enable(value);else restore();
++            }catch(Exception e){restore();}
+         }
+-        if(active&&now>=validUntil)restore();
++        if(active&&!ACTIVATION.active(session,now))restore();
+         if(pending==null&&now-lastPoll>=50_000_000L){
+             lastPoll=now;
+             var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window")).timeout(Duration.ofMillis(150)).GET().build();
+-            pending=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
++            var ticket=ACTIVATION.dispatch(now);
++            var responseFuture=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
+                 if(response.statusCode()!=200||response.body().length()>4096)throw new IllegalStateException("native fusion inactive");
+                 var j=JsonParser.parseString(response.body()).getAsJsonObject();if(j.get("protocol").getAsInt()!=2)throw new IllegalStateException("native protocol mismatch");
+                 return new WindowBounds((int)Math.round(j.get("screen_x").getAsDouble()),(int)Math.round(j.get("screen_y").getAsDouble()),(int)Math.round(j.get("logical_width").getAsDouble()),(int)Math.round(j.get("logical_height").getAsDouble()),j.get("physical_width").getAsInt(),j.get("physical_height").getAsInt(),j.get("scale").getAsDouble());
+             });
++            pending=new Pending(ticket,responseFuture);
+         }
+     }
+     public static void enable(WindowBounds value){
+         var window=Minecraft.getInstance().getWindow();long handle=window.handle();
+         if(window.isFullscreen()||GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_TRANSPARENT_FRAMEBUFFER)!=GLFW.GLFW_TRUE){restore();return;}
+         if(value.physicalWidth()!=value.logicalWidth()||value.physicalHeight()!=value.logicalHeight()){restore();return;}
+         if(!active){
+             int[] a=new int[1],b=new int[1];GLFW.glfwGetWindowPos(handle,a,b);x=a[0];y=b[0];GLFW.glfwGetWindowSize(handle,a,b);width=a[0];height=b[0];
+             decorated=GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_DECORATED);floating=GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_FLOATING);
+             cocoa=GLFWNativeCocoa.glfwGetCocoaWindow(handle);ignoresMouse=getBool(cocoa,"ignoresMouseEvents");shadow=getBool(cocoa,"hasShadow");
+             active=true;GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,GLFW.GLFW_FALSE);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_FLOATING,GLFW.GLFW_TRUE);setBool(cocoa,"setIgnoresMouseEvents:",false);setBool(cocoa,"setHasShadow:",false);
+         }
+         if(!value.equals(bounds)){bounds=value;GLFW.glfwSetWindowPos(handle,value.x(),value.y());GLFW.glfwSetWindowSize(handle,value.logicalWidth(),value.logicalHeight());}
+         int[] w=new int[1],h=new int[1];GLFW.glfwGetFramebufferSize(handle,w,h);if(w[0]!=value.physicalWidth()||h[0]!=value.physicalHeight())restore();
+     }
+     public static void restore(){
++        ACTIVATION.invalidate();
+         if(!active)return;
+-        long handle=Minecraft.getInstance().getWindow().handle();active=false;bounds=null;validUntil=0;
++        long handle=Minecraft.getInstance().getWindow().handle();active=false;bounds=null;
+         GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,decorated);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_FLOATING,floating);GLFW.glfwSetWindowSize(handle,width,height);GLFW.glfwSetWindowPos(handle,x,y);
+         setBool(cocoa,"setIgnoresMouseEvents:",ignoresMouse);setBool(cocoa,"setHasShadow:",shadow);
+         net.minecraft.client.KeyMapping.releaseAll();Minecraft.getInstance().mouseHandler.releaseMouse();
+     }
+     /** Suppress only the duplicate final blit; capture still reads the main target. */
+     public static void clearWindow(){
+         int fbo=GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);boolean scissor=GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+         try(MemoryStack stack=MemoryStack.stackPush()){
+             var color=stack.mallocFloat(4);var mask=stack.malloc(4);GL11.glGetFloatv(GL11.GL_COLOR_CLEAR_VALUE,color);GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK,mask);
+             try{GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,0);GL11.glDisable(GL11.GL_SCISSOR_TEST);GL11.glColorMask(true,true,true,true);GL11.glClearColor(0,0,0,0);GL11.glClear(GL11.GL_COLOR_BUFFER_BIT);}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java b/mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java
+new file mode 100644
+index 0000000..cf07493
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java
+@@ -0,0 +1,24 @@
++package dev.jay.dstmc.client;
++
++/** Client-thread activation proof; no game or window calls. */
++final class WindowActivation {
++    record Ticket(Object session, long generation, long deadline) {}
++    private Object session;
++    private long generation, validUntil;
++    boolean session(Object value) {
++        if (session == value) return false;
++        session = value;
++        generation++;
++        validUntil = 0;
++        return true;
++    }
++    Ticket dispatch(long now) { return new Ticket(session, generation, now + 200_000_000L); }
++    boolean accept(Ticket ticket, long now) {
++        if (session == null || ticket.session() != session || ticket.generation() != generation
++                || now >= ticket.deadline()) return false;
++        validUntil = ticket.deadline();
++        return true;
++    }
++    boolean active(Object current, long now) { return current != null && current == session && now < validUntil; }
++    void invalidate() { validUntil = 0; }
++}
+diff --git a/native/Makefile b/native/Makefile
+index af8958a..0b77b7e 100644
+--- a/native/Makefile
++++ b/native/Makefile
+@@ -37,17 +37,17 @@ $(BUILD)/libdstmc_probe.dylib: src/entry.mm src/camera_http.mm src/gl_observer.m
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm -o $@
+ 
+ $(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) tests/lease_test.cpp src/camera_service.cpp -o $@
+ .PHONY: lease-test
+ lease-test: $(BUILD)/lease_test
+ 	./$(BUILD)/lease_test
+ 
+-$(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h
++$(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h include/camera_service.h include/frame_protocol.h include/gl_observer.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp -o $@
+ gl-test: compositor-test
+ .PHONY: compositor-test
+ compositor-test: $(BUILD)/compositor_test
+ 	./$(BUILD)/compositor_test
+diff --git a/native/src/camera_http.mm b/native/src/camera_http.mm
+index 166cc17..b13ed17 100644
+--- a/native/src/camera_http.mm
++++ b/native/src/camera_http.mm
+@@ -138,54 +138,75 @@ void fields(NSDictionary *o, NSArray *keys) {
+   size_t length = 0;
+   ~Mapping() {
+     if (base != MAP_FAILED)
+       munmap(base, length);
+   }
+ };
+ void discover(dstmc::FrameKey expected) {
+   NSDictionary *s = get_status();
+   if (![s[@"protocol"] isEqual:@2] || ![s[@"status"] isEqual:@"PAIRED"])
+     throw std::runtime_error("MC not paired");
+-  // Refresh physical size even while an exact frame is pinned. A new mapping
+-  // announced after resize must invalidate the old camera acknowledgment.
+-  state().service.resize([s[@"width"] unsignedIntValue],
+-                         [s[@"height"] unsignedIntValue]);
++  // A paired session normally has no stream during handshake/resize. Reject
++  // nulls and wrong types before sending any Foundation numeric selectors.
++  auto integer = [](id value, uint64_t maximum) -> uint64_t {
++    if (![value isKindOfClass:[NSNumber class]] ||
++        CFGetTypeID((CFTypeRef)value) == CFBooleanGetTypeID())
++      throw std::runtime_error("incomplete stream number");
++    double n = [value doubleValue];
++    if (!std::isfinite(n) || n < 1 || n > maximum || n != std::floor(n))
++      throw std::runtime_error("invalid stream number");
++    return [value unsignedLongLongValue];
++  };
++  uint32_t width, height;
++  NSString *path;
++  try {
++    width = integer(s[@"width"], 1920);
++    height = integer(s[@"height"], 1080);
++    integer(s[@"generation"], 9007199254740991ULL);
++    path = string(s[@"frame_path"]);
++    if (!path.length)
++      throw std::runtime_error("empty stream path");
++    object(s[@"latest_frame"]);
++  } catch (const std::exception &) {
++    state().service.release();
++    throw;
++  }
++  // Refresh physical size even while an exact frame is pinned.
++  state().service.resize(width, height);
+   auto latest = parse_key(object(s[@"latest_frame"]));
+   if (!dstmc::same_key(latest, expected))
+     throw std::runtime_error("exact frame changed; retry");
+   if (![s[@"pair"] isEqual:object(s[@"latest_frame"])[@"pair"]] ||
+       ![s[@"epoch"] isEqual:object(s[@"latest_frame"])[@"epoch"]])
+     throw std::runtime_error("status session mismatch");
+   if (state().service.lease_latest(expected.pair_hash, expected.epoch))
+     return; // Keep the existing slot; never attempt a second reader lease.
+-  NSString *path = string(s[@"frame_path"]);
+   int fd = open(path.fileSystemRepresentation, O_RDWR | O_NOFOLLOW);
+   if (fd < 0)
+     throw std::runtime_error("frame open failed");
+   struct stat st{};
+   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+       st.st_size < 4096 || st.st_size > 80 * 1024 * 1024) {
+     close(fd);
+     throw std::runtime_error("invalid mapping");
+   }
+   auto mapping = std::make_shared<Mapping>();
+   mapping->length = st.st_size;
+   mapping->base =
+       mmap(nullptr, mapping->length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   close(fd);
+   if (mapping->base == MAP_FAILED)
+     throw std::runtime_error("mapping failed");
+   auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
+   if (!frame)
+     throw std::runtime_error("exact complete frame unavailable");
+-  if (frame->width != [s[@"width"] unsignedIntValue] ||
+-      frame->height != [s[@"height"] unsignedIntValue])
++  if (frame->width != width || frame->height != height)
+     throw std::runtime_error("stream resize");
+   state().service.offer(std::make_shared<dstmc::FrameView>(std::move(*frame)),
+                         mapping);
+ }
+ NSArray *matrix(const std::array<float, 16> &m) {
+   NSMutableArray *a = [NSMutableArray arrayWithCapacity:16];
+   for (float x : m)
+     [a addObject:@(x)];
+   return a;
+ }
+diff --git a/tests/test_first_person_gate.py b/tests/test_first_person_gate.py
+index 811c2d8..04f60c0 100644
+--- a/tests/test_first_person_gate.py
++++ b/tests/test_first_person_gate.py
+@@ -7,69 +7,85 @@ import struct
+ import tempfile
+ import threading
+ import time
+ import urllib.request
+ import urllib.error
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ import pathlib
+ import subprocess
+ import unittest
+ ROOT=pathlib.Path(__file__).resolve().parents[1]
++NATIVE_BUILD=pathlib.Path(os.environ.get('DSTMC_TEST_NATIVE_BUILD',ROOT/'native/build'))
+ try:
+     from lupa import LuaRuntime
+ except ImportError:
+     LuaRuntime=None
+ 
+ class NativeGateTests(unittest.TestCase):
+     def test_lease_lifecycle(self):
+-        result=subprocess.run([str(ROOT/'native/build/lease_test')],capture_output=True,text=True,check=True)
++        result=subprocess.run([str(NATIVE_BUILD/'lease_test')],capture_output=True,text=True,check=True)
+         self.assertIn('late_camera_ack_rejected',result.stdout)
+     def test_real_offscreen_depth_and_state(self):
+-        result=subprocess.run([str(ROOT/'native/build/compositor_test')],capture_output=True,text=True,check=True)
++        result=subprocess.run([str(NATIVE_BUILD/'compositor_test')],capture_output=True,text=True,check=True)
+         self.assertIn('transparent_pixel_preserves_host',result.stdout)
+         self.assertIn('closer_surface_wins',result.stdout)
+ 
+ class NativeHttpTests(unittest.TestCase):
+     def test_exact_frame_ack_expiry_and_malformed_http(self):
+         for port in (39379,39380):
+             with socket.socket() as sock:
+                 sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+                 try:sock.bind(('127.0.0.1',port))
+                 except OSError:self.skipTest('test port unavailable; confirm game exit or TCP reuse delay')
+         fixture=json.loads((ROOT/'protocol/fixtures/frame-v2.json').read_text())
+         key={k:fixture[k] for k in ('pair','epoch','id')}
+         with tempfile.TemporaryDirectory(prefix='dstmc-http-fixture-') as temp:
+             temp=pathlib.Path(temp);frame=temp/'frame.bin'
+             shutil.copyfile(ROOT/'protocol/fixtures/frame-v2.bin',frame)
+-            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'])
++            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'],generation=1)
+             class Status(BaseHTTPRequestHandler):
+                 def do_GET(self):
+                     data=json.dumps(status).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+                 def log_message(self,*args):pass
+             server=HTTPServer(('127.0.0.1',39379),Status)
+             thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True);thread.start()
+-            env=os.environ|{'DSTMC_PROBE_DIR':str(temp),'DSTMC_FIRST_PERSON':'1','DYLD_INSERT_LIBRARIES':str(ROOT/'native/build/libdstmc_probe.dylib')}
+-            proc=subprocess.Popen([str(ROOT/'native/build/lease_test'),'--http-fixture'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
++            env=os.environ|{'DSTMC_PROBE_DIR':str(temp),'DSTMC_FIRST_PERSON':'1','DYLD_INSERT_LIBRARIES':str(NATIVE_BUILD/'libdstmc_probe.dylib')}
++            proc=subprocess.Popen([str(NATIVE_BUILD/'lease_test'),'--http-fixture'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+             def post(path,body):
+                 data=body if isinstance(body,bytes) else json.dumps(body).encode()
+                 request=urllib.request.Request('http://127.0.0.1:39380'+path,data=data,headers={'Content-Type':'application/json'})
+                 try:response=urllib.request.urlopen(request,timeout=2)
+                 except urllib.error.HTTPError as error:response=error
+                 return response.status,json.loads(response.read())
+             try:
+-                for _ in range(100):
+-                    if (temp/'camera-gate.jsonl').exists():break
++                for _ in range(500):
++                    ready=temp/'camera-gate.jsonl'
++                    if ready.exists():
++                        events=ready.read_text()
++                        self.assertNotIn('camera_service_failed',events)
++                        if 'camera_service_started' in events:break
+                     if proc.poll() is not None:self.fail('HTTP fixture process exited before listening')
+                     time.sleep(.01)
++                else:self.fail('HTTP fixture did not become ready within 5 seconds')
+                 request=dict(protocol=2,pair=key['pair'],epoch=key['epoch'],key=key)
+                 for invalid in (b'',b'null',b'[]',b'{',b'{}'):
+                     code,response=post('/v2/camera/lease',invalid);self.assertEqual(code,409);self.assertEqual(response['error'],'GATE_NOT_READY')
++                complete=status.copy()
++                status.update({field:None for field in ('frame_path','generation','latest_frame','width','height')})
++                code,response=post('/v2/camera/lease',request);self.assertEqual(code,409)
++                self.assertIsNone(proc.poll(),'PAIRED null stream must not crash native HTTP')
++                status.update(complete)
++                for field,value in [('width','2'),('height',True),('generation',None),('generation',1.5),('width',1921)]:
++                    status[field]=value
++                    code,response=post('/v2/camera/lease',request);self.assertEqual(code,409,(field,value))
++                    self.assertIsNone(proc.poll())
++                    status.update(complete)
+                 code,response=post('/v2/camera/lease',request);self.assertEqual(code,200,response);self.assertEqual(response['lease']['key'],key);self.assertEqual(response['lease']['pose']['space'],'DST')
+                 self.assertTrue(any(struct.unpack_from('<Q',frame.read_bytes(),4096+i*struct.unpack_from('<Q',frame.read_bytes(),32)[0]+8)[0] for i in range(3)))
+                 code,response=post('/v2/camera/applied',request|{'applied':True});self.assertEqual(code,200);self.assertTrue(response['accepted'])
+                 code,response=post('/v2/camera/applied',request|{'applied':1});self.assertEqual(code,409)
+                 time.sleep(.26)
+                 code,response=post('/v2/camera/applied',request|{'applied':True});self.assertEqual(code,200);self.assertFalse(response['accepted'])
+                 code,response=post('/v2/camera/lease',request);self.assertEqual(code,409)
+                 # With the expired slot released, publish a fresh fixture ID.
+                 data=bytearray(frame.read_bytes());stride=struct.unpack_from('<Q',data,32)[0]
+                 for i in range(3):
+@@ -77,23 +93,59 @@ class NativeHttpTests(unittest.TestCase):
+                     self.assertEqual(struct.unpack_from('<Q',data,offset+8)[0],0)
+                     if struct.unpack_from('<Q',data,offset)[0]:struct.pack_into('<Q',data,offset+64,43)
+                 frame.write_bytes(data);key['id']=43
+                 code,response=post('/v2/camera/lease',request);self.assertEqual(code,200,response)
+                 # Discovery has resized while the old exact frame is still pinned.
+                 status['width']=fixture['width']+1
+                 code,response=post('/v2/camera/lease',request);self.assertEqual(code,409,'resize must invalidate a pinned lease')
+                 code,response=post('/v2/camera/applied',request|{'applied':True});self.assertFalse(response['accepted'])
+                 self.assertIsNone(proc.poll())
+             finally:
+-                if proc.poll() is None:proc.communicate('stop\n',timeout=3)
++                _,stderr=proc.communicate('stop\n' if proc.poll() is None else None,timeout=3)
++                if proc.returncode:self.fail('native HTTP fixture exited: '+stderr[-2500:])
+                 server.shutdown();server.server_close();thread.join(timeout=1)
+ 
++class WindowActivationTests(unittest.TestCase):
++    def test_session_and_dispatch_deadline(self):
++        java_home=pathlib.Path('/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home')
++        source=ROOT/'mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java'
++        harness="""
++package dev.jay.dstmc.client;
++public class WindowActivationCheck {
++    public static void main(String[] args) {
++        WindowActivation proof = new WindowActivation();
++        Object first = new Object(), second = new Object();
++        proof.session(first);
++        var stale = proof.dispatch(1_000_000_000L);
++        proof.session(second);
++        boolean oldAccepted = proof.accept(stale, 1_010_000_000L);
++        var late = proof.dispatch(2_000_000_000L);
++        boolean lateAccepted = proof.accept(late, 2_201_000_000L);
++        if (oldAccepted || lateAccepted)
++            throw new AssertionError("old_response_after_repair="+oldAccepted+", completed_response_after_deadline="+lateAccepted);
++        var current = proof.dispatch(3_000_000_000L);
++        if (!proof.accept(current, 3_100_000_000L) || !proof.active(second, 3_199_000_000L))
++            throw new AssertionError("current response must activate");
++        if (proof.active(second, 3_200_000_000L) || proof.active(first, 3_110_000_000L))
++            throw new AssertionError("proof must expire at dispatch deadline and reject changed session before next tick");
++        proof.session(first);
++        if (proof.active(first, 3_110_000_000L)) throw new AssertionError("session change must clear cached proof");
++        System.out.println("PASS old_response_after_repair completed_response_after_deadline current_response_activates");
++    }
++}
++"""
++        with tempfile.TemporaryDirectory(prefix='dstmc-window-policy-') as temp:
++            check=pathlib.Path(temp)/'WindowActivationCheck.java';check.write_text(harness)
++            subprocess.run([str(java_home/'bin/javac'),'-d',temp,str(source),str(check)],check=True,capture_output=True,text=True)
++            result=subprocess.run([str(java_home/'bin/java'),'-cp',temp,'dev.jay.dstmc.client.WindowActivationCheck'],capture_output=True,text=True)
++            self.assertEqual(result.returncode,0,result.stderr)
++
+ @unittest.skipUnless(LuaRuntime,'Lua behavioral checks require lupa (isolated test environment)')
+ class LuaCameraTests(unittest.TestCase):
+     def setUp(self):
+         self.lua=LuaRuntime(unpack_returned_tuples=True)
+         self.lua.execute('''
+             clock=0; calls={}; updates=0
+             function GetTimeRealSeconds() return clock end
+             TheSim={}
+             for _,name in ipairs({'SetCameraPos','SetCameraDir','SetCameraUp','SetCameraFOV'}) do
+                 TheSim[name]=function(self,...) table.insert(calls,{name,...}) end

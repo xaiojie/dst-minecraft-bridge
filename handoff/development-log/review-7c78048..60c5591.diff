@@ -1,0 +1,386 @@
+# Review package: 7c7804808187c6a7cec6ea35cf7e0b1016c47b35..60c5591b80c6ba2455026b359e508c0121f77c6f
+
+## Commits
+60c5591 fix: bind native window activation proof to composited session
+
+## Files changed
+ .../dev/jay/dstmc/client/PassthroughWindow.java    |  5 +--
+ native/Makefile                                    |  2 +-
+ native/include/camera_http.h                       | 38 +++++++++++++++++++++-
+ native/src/camera_http.mm                          | 17 ++++++----
+ native/src/entry.mm                                |  3 +-
+ native/tests/lease_test.cpp                        | 25 ++++++++++++++
+ protocol/frame-v2.md                               |  6 +++-
+ tests/test_first_person_gate.py                    |  1 +
+ 8 files changed, 84 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+index 854c8f9..f8b32b5 100644
+--- a/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
++++ b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+@@ -34,38 +34,39 @@ public final class PassthroughWindow {
+     private static long msgSend(){return ObjCRuntime.getLibrary().getFunctionAddress("objc_msgSend");}
+     private static boolean getBool(long target,String selector){return JNI.invokePPZ(target,ObjCRuntime.sel_registerName(selector),msgSend());}
+     private static void setBool(long target,String selector,boolean value){JNI.invokePPV(target,ObjCRuntime.sel_registerName(selector),value,msgSend());}
+     public static boolean configured(){return CONFIGURED;}
+     public static boolean active(){return active&&BridgeClient.active()&&ACTIVATION.active(BridgeMod.server.active(),System.nanoTime());}
+     public static void creationHints(){if(CONFIGURED){GLFW.glfwWindowHint(GLFW.GLFW_TRANSPARENT_FRAMEBUFFER,GLFW.GLFW_TRUE);GLFW.glfwWindowHint(GLFW.GLFW_COCOA_RETINA_FRAMEBUFFER,GLFW.GLFW_FALSE);}}
+     public static void tick(){
+         if(!CONFIGURED)return;
+         // Capture session identity only on the client thread. Re-pairing may keep
+         // BridgeClient.active() true, so a boolean is not an activation proof.
+-        Object session=BridgeClient.active()?BridgeMod.server.active():null;
++        var session=BridgeClient.active()?BridgeMod.server.active():null;
+         if(ACTIVATION.session(session)){
+             if(pending!=null){pending.response().cancel(false);pending=null;}
+             restore();
+         }
+         if(session==null){restore();return;}
+         long now=System.nanoTime();
+         if(pending!=null&&pending.response().isDone()){
+             var result=pending;pending=null;
+             try{
+                 WindowBounds value=result.response().join();
+                 if(ACTIVATION.accept(result.ticket(),now))enable(value);else restore();
+             }catch(Exception e){restore();}
+         }
+         if(active&&!ACTIVATION.active(session,now))restore();
+         if(pending==null&&now-lastPoll>=50_000_000L){
+             lastPoll=now;
+-            var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window")).timeout(Duration.ofMillis(150)).GET().build();
++            String identity="?pair_hash="+java.util.HexFormat.of().formatHex(dev.jay.dstmc.protocol.BridgeTypes.pairHash(session.pair()))+"&epoch="+session.epoch();
++            var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window"+identity)).timeout(Duration.ofMillis(150)).GET().build();
+             var ticket=ACTIVATION.dispatch(now);
+             var responseFuture=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
+                 if(response.statusCode()!=200||response.body().length()>4096)throw new IllegalStateException("native fusion inactive");
+                 var j=JsonParser.parseString(response.body()).getAsJsonObject();if(j.get("protocol").getAsInt()!=2)throw new IllegalStateException("native protocol mismatch");
+                 return new WindowBounds((int)Math.round(j.get("screen_x").getAsDouble()),(int)Math.round(j.get("screen_y").getAsDouble()),(int)Math.round(j.get("logical_width").getAsDouble()),(int)Math.round(j.get("logical_height").getAsDouble()),j.get("physical_width").getAsInt(),j.get("physical_height").getAsInt(),j.get("scale").getAsDouble());
+             });
+             pending=new Pending(ticket,responseFuture);
+         }
+     }
+     public static void enable(WindowBounds value){
+diff --git a/native/Makefile b/native/Makefile
+index 0b77b7e..a784d45 100644
+--- a/native/Makefile
++++ b/native/Makefile
+@@ -30,21 +30,21 @@ reader-test: $(BUILD)/frame_reader_test
+ $(BUILD)/loader_test: tests/loader_test.mm
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) $< -o $@
+ .PHONY: loader-test
+ loader-test: $(BUILD)/loader_test all
+ 	@d=$$(mktemp -d); DSTMC_PROBE_DIR="$$d" DYLD_INSERT_LIBRARIES="$(CURDIR)/$(BUILD)/libdstmc_probe.dylib" ./$(BUILD)/loader_test; result=$$?; rm -rf "$$d"; exit $$result
+ $(BUILD)/libdstmc_probe.dylib: src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm include/compositor.h include/camera_http.h include/camera_service.h include/gl_observer.h include/frame_protocol.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm -o $@
+ 
+-$(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h
++$(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h include/camera_http.h include/compositor.h include/gl_observer.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) tests/lease_test.cpp src/camera_service.cpp -o $@
+ .PHONY: lease-test
+ lease-test: $(BUILD)/lease_test
+ 	./$(BUILD)/lease_test
+ 
+ $(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h include/camera_service.h include/frame_protocol.h include/gl_observer.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp -o $@
+ gl-test: compositor-test
+diff --git a/native/include/camera_http.h b/native/include/camera_http.h
+index 0d42ccd..78c654d 100644
+--- a/native/include/camera_http.h
++++ b/native/include/camera_http.h
+@@ -1,11 +1,47 @@
+ #pragma once
+ #include "compositor.h"
++#include <string>
+ namespace bridge {
++// Render-side proof, independent of offered/acknowledged camera leases. Callers
++// serialize access with the window mutex. Query spelling is canonical and
++// exact.
++class WindowProof {
++  std::optional<dstmc::FrameKey> frame_;
++  uint64_t completed_at_ = 0;
++
++public:
++  static std::string request(const dstmc::FrameKey &key) {
++    static const char hex[] = "0123456789abcdef";
++    std::string path = "/v2/window?pair_hash=";
++    for (uint8_t b : key.pair_hash) {
++      path += hex[b >> 4];
++      path += hex[b & 15];
++    }
++    path += "&epoch=";
++    for (size_t i = 0; i < key.epoch.size(); ++i) {
++      if (i == 4 || i == 6 || i == 8 || i == 10)
++        path += '-';
++      uint8_t b = key.epoch[i];
++      path += hex[b >> 4];
++      path += hex[b & 15];
++    }
++    return path;
++  }
++  void recorded(const dstmc::FrameKey &frame, uint64_t now) {
++    frame_ = frame;
++    completed_at_ = now;
++  }
++  bool accepts(const std::string &path, uint64_t now) const {
++    return frame_ && path == request(*frame_) && now >= completed_at_ &&
++           now - completed_at_ < 250;
++  }
++};
+ dstmc::CameraService &camera_service();
+ bool enabled();
+ dstmc::FrameKey key();
+ void start(const char *directory);
+ void report_compose(const dstmc::RenderProbe &, dstmc::FrameKey,
+                     const dstmc::ComposeResult &);
+-void present_window(int render_width, int render_height, bool composited);
++void present_window(int render_width, int render_height,
++                    std::optional<dstmc::FrameKey> composited_frame);
+ } // namespace bridge
+diff --git a/native/src/camera_http.mm b/native/src/camera_http.mm
+index b13ed17..f85f403 100644
+--- a/native/src/camera_http.mm
++++ b/native/src/camera_http.mm
+@@ -12,21 +12,21 @@
+ #include <sys/stat.h>
+ #include <thread>
+ #include <unistd.h>
+ namespace bridge {
+ namespace {
+ struct State {
+   dstmc::CameraService service;
+   std::mutex key_mutex, window_mutex;
+   dstmc::FrameKey current_key{};
+   NSDictionary *window_info = nil;
+-  uint64_t last_composite = 0;
++  WindowProof window_proof;
+   bool enabled = false;
+   std::string directory;
+ };
+ State &state() {
+   static auto *value = new State;
+   return *value;
+ }
+ uint64_t milliseconds() {
+   return std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+@@ -207,24 +207,26 @@ void discover(dstmc::FrameKey expected) {
+ NSArray *matrix(const std::array<float, 16> &m) {
+   NSMutableArray *a = [NSMutableArray arrayWithCapacity:16];
+   for (float x : m)
+     [a addObject:@(x)];
+   return a;
+ }
+ NSDictionary *vec(dstmc::Vec3 v) {
+   return @{@"x" : @(v.x), @"y" : @(v.y), @"z" : @(v.z)};
+ }
+ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
+-  if ([path isEqual:@"/v2/window"] && [method isEqual:@"GET"]) {
++  if ([path hasPrefix:@"/v2/window"] && [method isEqual:@"GET"]) {
+     std::lock_guard<std::mutex> lock(state().window_mutex);
+-    if (!state().window_info || milliseconds() - state().last_composite >= 250)
+-      throw std::runtime_error("no recently composited frame");
++    if (!state().window_info ||
++        !state().window_proof.accepts(path.UTF8String, milliseconds()))
++      throw std::runtime_error(
++          "no recently composited frame for requested identity");
+     return [[state().window_info retain] autorelease];
+   }
+   if (![method isEqual:@"POST"])
+     throw std::runtime_error("method not supported");
+   bool lease = [path isEqual:@"/v2/camera/lease"],
+        applied = [path isEqual:@"/v2/camera/applied"];
+   if (!lease && !applied)
+     throw std::runtime_error("unknown endpoint");
+   fields(body, lease ? @[ @"protocol", @"pair", @"epoch", @"key" ]
+                      : @[ @"protocol", @"pair", @"epoch", @"key", @"applied" ]);
+@@ -419,24 +421,25 @@ void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
+       @"event" : @"compose",
+       @"frame" : @(key.id),
+       @"status" : @(int(result.status)),
+       @"reason" : [NSString stringWithUTF8String:result.reason.c_str()],
+       @"matrices" : matrices,
+       @"width" : @(camera.viewport[2]),
+       @"height" : @(camera.viewport[3])
+     });
+   }
+ }
+-void present_window(int pw, int ph, bool composited) {
+-  if (composited) {
++void present_window(int pw, int ph,
++                    std::optional<dstmc::FrameKey> composited_frame) {
++  if (composited_frame) {
+     std::lock_guard<std::mutex> lock(state().window_mutex);
+-    state().last_composite = milliseconds();
++    state().window_proof.recorded(*composited_frame, milliseconds());
+   }
+   // Cocoa view geometry is captured only on the native UI thread. Render pixels
+   // come from the profiled scene.
+   if ([NSThread isMainThread]) {
+     NSWindow *w = [[[NSOpenGLContext currentContext] view] window];
+     NSView *v = w.contentView;
+     if (w && v) {
+       NSRect r = [w convertRectToScreen:[v convertRect:v.bounds toView:nil]];
+       double top = NSMaxY([NSScreen screens][0].frame) - NSMaxY(r);
+       if (pw > 0 && ph > 0) {
+diff --git a/native/src/entry.mm b/native/src/entry.mm
+index 98fce28..8e8fb4b 100644
+--- a/native/src/entry.mm
++++ b/native/src/entry.mm
+@@ -67,21 +67,22 @@ void present() {
+     return;
+   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
+   auto &c = context();
+   bool presented =
+       c.composited && c.displayed && camera_service().ready(c.displayed->key);
+   if (presented) {
+     c.compositor.hud(*c.displayed);
+     camera_service().release();
+   }
+   present_window(c.depth.camera().viewport[2], c.depth.camera().viewport[3],
+-                 presented);
++                 presented ? std::optional<dstmc::FrameKey>(c.displayed->key)
++                           : std::nullopt);
+   c.composited = false;
+   c.displayed.reset();
+   c.depth.reset();
+ }
+ void forget(CGLContextObj c) {
+   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
+   contexts.erase(c);
+   camera_service().release();
+ }
+ } // namespace bridge
+diff --git a/native/tests/lease_test.cpp b/native/tests/lease_test.cpp
+index cd852c2..c95f0cd 100644
+--- a/native/tests/lease_test.cpp
++++ b/native/tests/lease_test.cpp
+@@ -1,10 +1,11 @@
++#include "camera_http.h"
+ #include "camera_service.h"
+ #include <cassert>
+ #include <iostream>
+ using namespace dstmc;
+ static std::shared_ptr<FrameView> frame(uint64_t id = 1) {
+   auto f = std::make_shared<FrameView>();
+   f->key.id = id;
+   f->key.epoch[0] = 1;
+   f->width = 960;
+   f->height = 540;
+@@ -14,20 +15,44 @@ static std::shared_ptr<FrameView> frame(uint64_t id = 1) {
+   f->pose.view = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1, -2, -3, 1};
+   f->axes = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+   return f;
+ }
+ int main(int argc, char **argv) {
+   if (argc == 2 && std::string(argv[1]) == "--http-fixture") {
+     std::string stop;
+     std::getline(std::cin, stop);
+     return 0;
+   }
++  {
++    bridge::WindowProof proof;
++    FrameKey a{}, b{};
++    a.pair_hash[0] = 1;
++    a.epoch[0] = 1;
++    b = a;
++    b.epoch[0] = 2;
++    assert(!proof.accepts(bridge::WindowProof::request(a), 1000));
++    proof.recorded(a, 1000);
++    assert(proof.accepts(bridge::WindowProof::request(a), 1010));
++    assert(!proof.accepts(bridge::WindowProof::request(b), 1010) &&
++           "fresh_B_request_must_reject_A_composite");
++    b = a;
++    b.pair_hash[0] = 2;
++    assert(!proof.accepts(bridge::WindowProof::request(b), 1010));
++    assert(!proof.accepts("/v2/window", 1010));
++    assert(!proof.accepts(bridge::WindowProof::request(a) + "&extra=1", 1010));
++    assert(!proof.accepts(bridge::WindowProof::request(a), 1250));
++    proof.recorded(b, 1260);
++    assert(proof.accepts(bridge::WindowProof::request(b), 1261));
++    assert(!proof.accepts(bridge::WindowProof::request(a), 1261));
++    std::cout << "PASS window_proof_current_identity_only "
++                 "missing_and_expired_proof_rejected\n";
++  }
+   uint64_t now = 1000;
+   CameraService s([&] { return now; });
+   auto f = frame();
+   s.offer(f, {});
+   auto l = s.lease_latest(f->key.pair_hash, f->key.epoch);
+   assert(l && l->pose.position.x == 11 && l->pose.position.z == 23);
+   auto next = frame(2);
+   s.offer(next, {});
+   assert(s.lease_latest(f->key.pair_hash, f->key.epoch)->key.id == 1 &&
+          "lease_pins_matching_pose");
+diff --git a/protocol/frame-v2.md b/protocol/frame-v2.md
+index 91383a2..f3636b9 100644
+--- a/protocol/frame-v2.md
++++ b/protocol/frame-v2.md
+@@ -95,21 +95,21 @@ Readers check capacity before multiplying and validate the exact calculated stri
+ 
+ `http-v2.schema.json` is JSON Schema 2020-12. Its `$defs` describe common values and endpoint envelopes; `x-endpoints` associates each local route with request/response definitions. Root `anyOf` accepts the supported complete envelopes. Validate a common value such as CommandResult through its `$defs` reference. Finite float32 conversion, matching live identities, valid vectors, AABB ordering and health bounds require semantic checks as well as JSON Schema validation.
+ 
+ | Bind address | Method / route | Purpose |
+ |---|---|---|
+ | 127.0.0.1:39379 | POST /v2/handshake | Pair/epoch, fixed origins, identity axes and new mapping path |
+ | 127.0.0.1:39379 | POST /v2/exchange | Commands/events and confirmed authoritative state/results |
+ | 127.0.0.1:39379 | GET /v2/status | Protocol and live identity/status |
+ | 127.0.0.1:39380 | POST /v2/camera/lease | Frame-keyed camera lease in DST space |
+ | 127.0.0.1:39380 | POST /v2/camera/applied | Confirm/reject that specific camera frame |
+-| 127.0.0.1:39380 | GET /v2/window | DST content screen origin, logical points, physical pixels, scale |
++| 127.0.0.1:39380 | GET /v2/window?pair_hash=<hash>&epoch=<uuid> | DST content screen origin, logical points, physical pixels, scale; identity-bound composition proof |
+ 
+ Both services bind loopback only. A legacy protocol=1 owner of 39379 is a visible conflict requiring that test instance to be closed; never kill an unrelated process. Network callbacks queue work for game/render threads and do not invoke game APIs. Receipt PENDING is never displayed as application. HTTP implementations and game APIs belong to subsequent tasks.
+ 
+ ## Verification
+ 
+ ```
+ cd mc && ./gradlew coreTest --console plain
+ cd .. && make -C native contract-test
+ ```
+ 
+@@ -165,10 +165,14 @@ with no dev client running. Launch the fixture using
+ `./gradlew runClient -PtestSave=DST-MC-Frame-Fixture -x downloadAssets --console plain`;
+ the installed assets directory and index29 are used without redistributing game assets.
+ For a fresh development run directory, complete accessibility onboarding, or set
+ only that development directory's `options.txt` `onboardAccessibility:false`
+ while its client is stopped. The live Python test requires `jsonschema` and
+ `DSTMC_EXPECT_PID` / `DSTMC_LAUNCH_AFTER_MS`, rejects any other process/run, and
+ compiles its native leased reader explicitly for x86_64. It captures real stone,
+ removes that block via the fixture-only server-thread API, verifies the pixels
+ disappear, checks matched camera pose/depth/premultiplied alpha, then samples
+ continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowed.
++
++### Window activation identity
++
++`GET /v2/window?pair_hash=<hash>&epoch=<uuid>` requires the expected session identity. `hash` is the 64 lowercase hexadecimal characters of SHA-256 of canonical PairKey JSON; `uuid` is the lowercase hyphenated Epoch UUID. Query order is exactly `pair_hash` then `epoch`, with no extra fields or alternate encoding. The native service compares both values against the actual last successfully composited and presented FrameKey, and requires that proof to be younger than 250 ms. Offered or acknowledged camera leases do not create window activation proof. Missing, different or expired identity returns `409 GATE_NOT_READY`. The strict WindowResponse JSON shape is unchanged. MC also binds each request to its local session generation and a 200 ms deadline measured from dispatch, and clears pending/cached activation on session change.
+diff --git a/tests/test_first_person_gate.py b/tests/test_first_person_gate.py
+index 04f60c0..6711608 100644
+--- a/tests/test_first_person_gate.py
++++ b/tests/test_first_person_gate.py
+@@ -17,20 +17,21 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
+ NATIVE_BUILD=pathlib.Path(os.environ.get('DSTMC_TEST_NATIVE_BUILD',ROOT/'native/build'))
+ try:
+     from lupa import LuaRuntime
+ except ImportError:
+     LuaRuntime=None
+ 
+ class NativeGateTests(unittest.TestCase):
+     def test_lease_lifecycle(self):
+         result=subprocess.run([str(NATIVE_BUILD/'lease_test')],capture_output=True,text=True,check=True)
+         self.assertIn('late_camera_ack_rejected',result.stdout)
++        self.assertIn('window_proof_current_identity_only',result.stdout)
+     def test_real_offscreen_depth_and_state(self):
+         result=subprocess.run([str(NATIVE_BUILD/'compositor_test')],capture_output=True,text=True,check=True)
+         self.assertIn('transparent_pixel_preserves_host',result.stdout)
+         self.assertIn('closer_surface_wins',result.stdout)
+ 
+ class NativeHttpTests(unittest.TestCase):
+     def test_exact_frame_ack_expiry_and_malformed_http(self):
+         for port in (39379,39380):
+             with socket.socket() as sock:
+                 sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)

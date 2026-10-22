@@ -1,0 +1,21 @@
+{
+  "committed_fixture_sha256": "54b0d06af56abd1d06962e0afc8d944f57c5d6b80fcbafe73e914eb22c3e7205",
+  "byte_length": 5824,
+  "pair_hash_matches_canonical_json": true,
+  "frame_id": 42,
+  "pose": [
+    6.5,
+    66.0,
+    3.0
+  ],
+  "baseline_ignore_verified": [
+    ".superpowers/sdd/a",
+    "mc/.gradle/a",
+    "mc/build/a",
+    "native/build/a",
+    "mc/run/a",
+    "evidence/a",
+    "native/a.dylib"
+  ],
+  "native_binary": "native/build/frame_contract_test: Mach-O 64-bit executable x86_64"
+}

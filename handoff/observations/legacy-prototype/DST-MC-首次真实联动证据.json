@@ -1,0 +1,53 @@
+{
+  "captured_at": "2026-10-21T00:59:00.569938+08:00",
+  "scope": "Temporary two-game feasibility probe. No combined rendering.",
+  "live_state": {
+    "protocol": 1,
+    "session": "9e03f1d7-0e00-47f0-bfc2-947016620ed5",
+    "world_loaded": true,
+    "players": 1,
+    "mc_x": -294.9664024869532,
+    "mc_y": -38.46739864137942,
+    "mc_z": 65.41422916365633,
+    "dst_origin_x": -273.42401123047,
+    "dst_origin_z": 378.98098754883,
+    "mc_origin_x": -294.9664024869532,
+    "mc_origin_z": 65.41422916365633,
+    "tnt_spawn_count": 1,
+    "movement_samples": 3562,
+    "anchored": true,
+    "dst_age_ms": 115,
+    "dst": {
+      "x": -273.42401123047,
+      "z": 378.98098754883,
+      "damage_reports": [
+        {
+          "before": 1000,
+          "event_id": "9e03f1d7-0e00-47f0-bfc2-947016620ed5:5a9f494b-eb62-4545-a4de-e73f49225540",
+          "after": 900
+        }
+      ],
+      "target_health": 860,
+      "session": "dst-probe-77231796",
+      "commands": [
+        {
+          "id": "dst-probe-77231796:1",
+          "type": "tnt",
+          "x": -275.81167602539,
+          "z": 376.69400024414
+        }
+      ]
+    },
+    "explosions": [
+      {
+        "id": "9e03f1d7-0e00-47f0-bfc2-947016620ed5:5a9f494b-eb62-4545-a4de-e73f49225540",
+        "type": "tnt_exploded",
+        "mc_x": -297.3540672818732,
+        "mc_z": 63.12724185896633,
+        "dst_x": -275.81167602539,
+        "dst_z": 376.69400024414,
+        "time_ms": 1792515367040
+      }
+    ]
+  }
+}

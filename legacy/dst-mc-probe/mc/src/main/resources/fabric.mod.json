@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "dst_mc_probe",
+  "version": "0.0.1-probe",
+  "name": "DST MC Temporary Bridge Probe",
+  "description": "Temporary two-game feasibility experiment. No combined rendering yet.",
+  "environment": "*",
+  "entrypoints": { "main": ["dev.jay.dstmc.DstMcProbe"] },
+  "mixins": ["dst_mc_probe.mixins.json"],
+  "depends": { "fabricloader": ">=0.19.5", "minecraft": "1.21.11", "java": ">=21", "fabric-api": "*" }
+}

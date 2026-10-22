@@ -1,0 +1,12 @@
+按同一事件编号关联两款游戏的实际日志。日志时间格式不同，以事件编号为准。
+
+Minecraft / 2026-10-21-2.log.gz
+[00:56:04] [Server thread/INFO] (dst_mc_probe) DST_MC_PROBE real TNT spawned id="dst-probe-77231796:1" entity=5a9f494b-eb62-4545-a4de-e73f49225540 at=(-297.3540672818732, -38.46739864137942, 63.12724185896633)
+[00:56:07] [Server thread/INFO] (dst_mc_probe) DST_MC_PROBE real vanilla TNT explosion completed {"id":"9e03f1d7-0e00-47f0-bfc2-947016620ed5:5a9f494b-eb62-4545-a4de-e73f49225540","type":"tnt_exploded","mc_x":-297.3540672818732,"mc_z":63.12724185896633,"dst_x":-275.81167602539,"dst_z":376.69400024414,"time_ms":1792515367040}
+
+Minecraft / debug-1.log.gz
+[00:56:04] [Server thread/INFO] (dst_mc_probe) DST_MC_PROBE real TNT spawned id="dst-probe-77231796:1" entity=5a9f494b-eb62-4545-a4de-e73f49225540 at=(-297.3540672818732, -38.46739864137942, 63.12724185896633)
+[00:56:07] [Server thread/INFO] (dst_mc_probe) DST_MC_PROBE real vanilla TNT explosion completed {"id":"9e03f1d7-0e00-47f0-bfc2-947016620ed5:5a9f494b-eb62-4545-a4de-e73f49225540","type":"tnt_exploded","mc_x":-297.3540672818732,"mc_z":63.12724185896633,"dst_x":-275.81167602539,"dst_z":376.69400024414,"time_ms":1792515367040}
+
+饥荒 / client_log.txt
+[00:29:23]: DST_MC_PROBE REAL_MC_EXPLOSION_APPLIED {"before":1000,"event_id":"9e03f1d7-0e00-47f0-bfc2-947016620ed5:5a9f494b-eb62-4545-a4de-e73f49225540","after":900}	

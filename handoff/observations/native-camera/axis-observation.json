@@ -1,0 +1,138 @@
+{
+  "runtime_pid": 22823,
+  "steam_wrapper_pid": 22817,
+  "native_module_sha256": "8079000eb6e56fa915e91fe1d5c6ae465e5eeaf494b1efced3480f0c2737a77d",
+  "source": "live two-frame metadata-only capture from Steam process",
+  "viewport": [
+    0,
+    0,
+    960,
+    540
+  ],
+  "perspective_samples": [
+    {
+      "frame": 8947,
+      "draw": 3,
+      "target": 11,
+      "program": 49,
+      "view": [
+        -1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        -179.505829,
+        -2,
+        -440.201263,
+        1
+      ],
+      "projection": [
+        0.5625,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        -1.0100503,
+        -1,
+        0,
+        0,
+        -2.0100503,
+        0
+      ],
+      "view_basis_determinant": -1
+    },
+    {
+      "frame": 8948,
+      "draw": 3,
+      "target": 11,
+      "program": 49,
+      "view": [
+        -1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        -179.505829,
+        -2,
+        -440.201263,
+        1
+      ],
+      "projection": [
+        0.5625,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        -1.0100503,
+        -1,
+        0,
+        0,
+        -2.0100503,
+        0
+      ],
+      "view_basis_determinant": -1
+    }
+  ],
+  "temporary_landmarks": {
+    "camera_position": [
+      -179.50582885742,
+      1.9999999566645,
+      440.20126342773
+    ],
+    "forward": [
+      0,
+      0,
+      -1
+    ],
+    "up": [
+      0,
+      1,
+      0
+    ],
+    "red_world_offset": [
+      -2,
+      0,
+      -5
+    ],
+    "blue_world_offset": [
+      2,
+      0,
+      -5
+    ],
+    "observed_screen_order": "blue left, red right in both images",
+    "persist": false,
+    "scheduled_cleanup_game_seconds": 15
+  },
+  "conclusion": "DST view reflects X for fixed forward -Z. Conventional MC view is right handed. Shared mapping must include persistent X reflection.",
+  "runtime_acceptance": "camera movement observed, axis mismatch confirmed; not a composition/depth/input gate PASS",
+  "limits": [
+    "before-present depth is all1 after presentation pass, expected diagnostic limitation",
+    "scene is shoreline/water; ground/alpha-depth acceptance not established",
+    "MC client not running, no combined-frame proof",
+    "normal third-person camera observed after bounded calibration expiry; cleanup of each temporary entity not directly counted"
+  ]
+}

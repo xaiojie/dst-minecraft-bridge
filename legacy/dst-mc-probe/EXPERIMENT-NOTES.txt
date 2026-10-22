@@ -1,0 +1,21 @@
+DST + Minecraft temporary feasibility probe
+This is throwaway experimental code, not a finished crossover mod.
+
+Approved scope: two actual running games, ground-position synchronization, and real Minecraft TNT events applied to a marked DST test target.
+No shared picture, depth compositing, generic voxel collision, redstone transfer, or production multiplayer support has been implemented.
+
+Minecraft: 1.21.11. Fabric Loader: 0.19.5. Fabric API: 0.141.6+1.21.11. Java: 21.
+Loopback protocol: HTTP POST /exchange, local port 39379. Minecraft simulation work is performed on its server thread.
+TNT events are recorded after vanilla PrimedTnt.explode returns. DST maps one nearby event to 100 native health points of damage.
+
+The independent MC instance uses a copy of DST-MC-Test under mc/run/saves. The initial failed experiment is preserved separately.
+The local DST mod was enabled by the user in a newly created test world.
+
+Known validation findings: remote TNT regions need an entity-ticking ticket; the local MC server must keep simulating while DST is connected, including while its own pause menu is open.
+The HTTP listener is bound to 127.0.0.1 only.
+
+Written: 2026-10-21T00:54:54.642345+08:00
+
+Verified first cross-game event at 2026-10-21 00:56:07 +08:00: vanilla MC TNT entity 5a9f494b-eb62-4545-a4de-e73f49225540 exploded; DST reported native health 1000 -> 900 with the same event ID.
+Resource startup now uses the original installed asset directory and its canonical index ID 29.
+Accepted request IDs and the latest real explosion events are retained in the independent test instance config to prevent replay when this test instance restarts. This is at-most-once acceptance, not guaranteed delivery across crashes.

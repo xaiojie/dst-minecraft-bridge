@@ -1,0 +1,17 @@
+{
+  "extension_sha256": "08a352b01722235fae4560ca9cc231002336b5f0d1bf9307d7bb28ed98d5a92d",
+  "matches_preflight": true,
+  "loaded_pid": 20074,
+  "heartbeat_pid": 20074,
+  "same_pid": true,
+  "executable_sha256": "771f9cf6d743152432e9991129cb932107409b5c90c1b76d833af0b957fcaf67",
+  "manual_pngs_reviewed": [
+    "ctx1-f18586-d286.png",
+    "ctx1-f18586-d566.png",
+    "ctx1-f18586-d566-depth.png"
+  ],
+  "native_gl_size": [
+    960,
+    540
+  ]
+}

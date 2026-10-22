@@ -1,0 +1,184 @@
+# Review package: 1900a29ed25231c61dcc701ed654d3eb220d160d..1369dd1e46f332451ad1ac550d11fc3d2fd35647
+
+## Commits
+1369dd1 test: verify cross-architecture RGBA publication and capture cadence
+
+## Files changed
+ mc/src/contractTest/cpp/publisher_rgba_reader.cpp  | 39 ++++++++++++++++++++++
+ .../dev/jay/dstmc/client/FramePublisherTest.java   | 22 +++++++++++-
+ tests/test_live_frames.py                          | 29 ++++++++++++++--
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/mc/src/contractTest/cpp/publisher_rgba_reader.cpp b/mc/src/contractTest/cpp/publisher_rgba_reader.cpp
+new file mode 100644
+index 0000000..2f20755
+--- /dev/null
++++ b/mc/src/contractTest/cpp/publisher_rgba_reader.cpp
+@@ -0,0 +1,39 @@
++#include "frame_protocol.h"
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <cstring>
++#include <iostream>
++#include <string>
++#if !defined(__x86_64__)
++#error This contract must read the ARM64 Java publication from x86_64.
++#endif
++
++int main(int argc,char** argv) {
++    if(argc!=5)return 2;
++    int fd=open(argv[1],O_RDWR);struct stat st{};
++    if(fd<0 || fstat(fd,&st))return 3;
++    void* memory=mmap(nullptr,st.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
++    if(memory==MAP_FAILED){close(fd);return 4;}
++    dstmc::FrameKey key{};
++    for(size_t i=0;i<32;i++)key.pair_hash[i]=std::stoul(std::string(argv[2]+i*2,2),nullptr,16);
++    for(size_t i=0;i<16;i++)key.epoch[i]=std::stoul(std::string(argv[3]+i*2,2),nullptr,16);
++    key.id=std::stoull(argv[4]);
++    int result=0;
++    {
++        // Real exact-key reader and RAII lease, not a second test-only ABI parser.
++        auto frame=dstmc::read_frame(memory,st.st_size,key);
++        if(!frame)result=5;
++        else {
++            const uint8_t world[]={128,0,0,128},hud[]={0,0,64,64};
++            float depth;std::memcpy(&depth,frame->depth,sizeof(depth));
++            if(frame->width!=1 || frame->height!=1 || frame->layer_bytes!=4)result=6;
++            else if(std::memcmp(frame->color,world,4) || depth!=0.25f || std::memcmp(frame->hud,hud,4))result=7;
++        }
++    } // Release lease before unmapping.
++    munmap(memory,st.st_size);close(fd);
++    if(result)std::cerr<<"x86_64 published RGBA/depth/HUD contract rejected: "<<result<<'\n';
++    else std::cout<<"x86_64 published RGBA/depth/HUD channels verified\n";
++    return result;
++}
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java b/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java
+index f6da6b8..bb4468e 100644
+--- a/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java
++++ b/mc/src/contractTest/java/dev/jay/dstmc/client/FramePublisherTest.java
+@@ -4,35 +4,55 @@ import dev.jay.dstmc.protocol.*;import static dev.jay.dstmc.protocol.BridgeTypes
+ public final class FramePublisherTest {
+  static final PairKey PAIR=new PairKey(new UUID(0,1),"surface",new UUID(0,2),"dst_mc_bridge:stage","ground");
+  static final UUID EPOCH=new UUID(0,3);
+  static final float[] I={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+  static final Pose POSE=new Pose(Space.MC,new Vec3(0,65.62,0),new Vec3(0,0,1),new Vec3(0,1,0),I,I);
+  static FramePublisher publisher() throws Exception {var p=new FramePublisher(Files.createTempDirectory("publisher"),PAIR,EPOCH,new WorldTransform(new Vec3(0,0,0),new Vec3(0,64,0)));p.resize(1,1);return p;}
+  static ByteBuffer rgba(){return ByteBuffer.wrap(new byte[]{(byte)255,0,0,(byte)128});}
+  static ByteBuffer depth(){return ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0,.5f);}
+  static void completed(FramePublisher p,long g){p.world(g,POSE,rgba(),depth());p.hud(g,rgba());}
+  static void check(boolean b,String s){if(!b)throw new AssertionError(s);}
++ static int readNative(Path helper,FramePublisher p,FrameKey key)throws Exception{
++  return new ProcessBuilder("/usr/bin/arch","-x86_64",helper.toString(),p.path().toString(),HexFormat.of().formatHex(pairHash(key.pair())),key.epoch().toString().replace("-",""),Long.toUnsignedString(key.id())).inheritIO().start().waitFor();
++ }
+  interface Test{void run()throws Exception;}
+  static int failures;
+  static void test(String name,Test test){try{test.run();System.out.println("PASS "+name);}catch(Throwable e){failures++;System.out.println("FAIL "+name+": "+e);}}
+  public static void run() throws Exception {
+   // Break: acknowledge a frame even though every mapped slot is leased.
+   test("leased_slot_not_overwritten",()->{try(var p=publisher()){
+    completed(p,p.generation());check(p.publishCompleted().isPresent(),"first completed frame missing");
+    check(p.path()!=null,"published frame has no mapping");
+    try(var ch=FileChannel.open(p.path(),StandardOpenOption.READ,StandardOpenOption.WRITE)){
+     var m=ch.map(FileChannel.MapMode.READ_WRITE,0,ch.size());m.order(ByteOrder.LITTLE_ENDIAN);int stride=(int)m.getLong(32);
+     for(int s=0;s<3;s++)m.putLong(4096+s*stride+8,99);
+     byte[] before=new byte[m.capacity()];m.duplicate().get(before);completed(p,p.generation());
+     check(p.publishCompleted().isEmpty(),"leased frame acknowledged");byte[] after=new byte[m.capacity()];m.duplicate().get(after);check(Arrays.equals(before,after),"leased bytes changed");
+    }
+   }});
+   // Break: expose world before HUD GPU readback completed.
+   test("partial_readback_not_published",()->{try(var p=publisher()){p.world(p.generation(),POSE,rgba(),depth());check(p.publishCompleted().isEmpty(),"partial GPU readback published");p.hud(p.generation(),rgba());check(p.publishCompleted().isPresent(),"complete readback missing");check(p.publishCompleted().isEmpty(),"same readback replayed");}});
+   // Break: delayed callbacks after resize contaminate next generation.
+   test("resize_discards_pending_readback",()->{try(var p=publisher()){long old=p.generation();p.world(old,POSE,rgba(),depth());p.resize(2,1);p.hud(old,rgba());check(p.publishCompleted().isEmpty(),"stale resize callback published");check(p.generation()!=old,"generation unchanged");}});
+   // Break: native-endian packed integers swap red/blue or leave straight alpha.
+-  test("alpha_and_channel_order",()->{var b=ByteBuffer.wrap(new byte[]{(byte)255,0,0,(byte)128,0,0,(byte)255,0});FramePublisher.premultiplyRgba(b);check((b.get(0)&255)==128 && b.get(1)==0 && b.get(2)==0 && (b.get(3)&255)==128,"red premultiplied RGBA mismatch");check(b.get(4)==0&&b.get(5)==0&&b.get(6)==0&&b.get(7)==0,"transparent RGB not zero");});
++  test("alpha_and_channel_order",()->{
++   check(System.getProperty("os.arch").equals("aarch64"),"test requires actual ARM64 Java producer");
++   var helper=Files.createTempDirectory("publisher-native").resolve("rgba-reader");
++   check(new ProcessBuilder("clang++","-arch","x86_64","-std=c++17","-Wall","-Wextra","-Werror","-O2","-I../native/include","src/contractTest/cpp/publisher_rgba_reader.cpp","-o",helper.toString()).inheritIO().start().waitFor()==0,"native reader compile failed");
++   try(var p=publisher()){
++    // Input is already premultiplied, as real GL blend output is. Do not call
++    // the conversion helper here: the producer must preserve these exact bytes.
++    var world=ByteBuffer.wrap(new byte[]{(byte)128,0,0,(byte)128});
++    var depth=ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0,.25f);
++    var hud=ByteBuffer.wrap(new byte[]{0,0,64,64});
++    p.world(p.generation(),POSE,world,depth);p.hud(p.generation(),hud);
++    var key=p.publishCompleted().orElseThrow();
++    check(readNative(helper,p,key)==0,"native published channels/depth/HUD mismatch");
++    // Negative control: prove the real reader's assertions catch red/blue swaps.
++    p.world(p.generation(),POSE,ByteBuffer.wrap(new byte[]{0,0,(byte)128,(byte)128}),depth);p.hud(p.generation(),hud);
++    check(readNative(helper,p,p.publishCompleted().orElseThrow())==7,"swapped world RGBA escaped native assertions");
++   }
++  });
+   if(failures>0)throw new AssertionError(failures+" publisher assertion(s) failed");
+  }
+  public static void main(String[] args)throws Exception{run();}
+ }
+diff --git a/tests/test_live_frames.py b/tests/test_live_frames.py
+index fa9fd5f..645ab4d 100644
+--- a/tests/test_live_frames.py
++++ b/tests/test_live_frames.py
+@@ -10,20 +10,43 @@ import struct
+ import subprocess
+ import tempfile
+ import time
+ import unittest
+ import urllib.request
+ import uuid
+ import zlib
+ 
+ ROOT=Path(__file__).resolve().parents[1]
+ 
++def evaluate_samples(samples):
++    """Capture target is30FPS; allow server tick jitter within19–21Hz."""
++    duration=samples[-1]['elapsed']-samples[0]['elapsed']
++    if duration<=0:raise AssertionError('sample interval must advance')
++    fps=(samples[-1]['frame']-samples[0]['frame'])/duration
++    heartbeat_hz=(samples[-1]['heartbeat']-samples[0]['heartbeat'])/duration
++    if fps<30:raise AssertionError(f'capture below30FPS target: {fps:.3f}FPS')
++    if not 19<=heartbeat_hz<=21:raise AssertionError(f'heartbeat outside19–21Hz: {heartbeat_hz:.3f}Hz')
++    return fps,heartbeat_hz
++
++class LiveSampleEvaluation(unittest.TestCase):
++    def samples(self,fps,heartbeat_hz):
++        return [{'elapsed':0,'frame':10,'heartbeat':20},
++                {'elapsed':60,'frame':10+60*fps,'heartbeat':20+60*heartbeat_hz}]
++    # Break: merely requiring100new frames permits unusably low capture rates.
++    def test_targets_and_jitter(self):
++        for heartbeat_hz in (19,20,21):self.assertEqual((30,heartbeat_hz),evaluate_samples(self.samples(30,heartbeat_hz)))
++    def test_slow_capture_rejected(self):
++        with self.assertRaisesRegex(AssertionError,'30FPS'):evaluate_samples(self.samples(29,20))
++    def test_wrong_tick_rates_rejected(self):
++        for heartbeat_hz in (18,22):
++            with self.assertRaisesRegex(AssertionError,'19–21Hz'):evaluate_samples(self.samples(30,heartbeat_hz))
++
+ def request(path, data=None):
+     body=None if data is None else json.dumps(data).encode()
+     with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:39379'+path,body,{'Content-Type':'application/json'}),timeout=8) as r:return json.load(r)
+ 
+ def png(path,w,h,rgba):
+     def chunk(k,v):return struct.pack('>I',len(v))+k+v+struct.pack('>I',zlib.crc32(k+v)&0xffffffff)
+     rows=b''.join(b'\0'+rgba[y*w*4:(y+1)*w*4] for y in range(h-1,-1,-1))
+     path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(rows))+chunk(b'IEND',b''))
+ 
+ class LiveFrames(unittest.TestCase):
+@@ -106,14 +129,14 @@ std::ofstream out(a[5],std::ios::binary);uint32_t w=frame->width,h=frame->height
+         request('/test/scene',{'stone':False});time.sleep(2)
+         empty=sample('removed-stone');self.assertGreater(empty[0]['latest_frame']['id'],s['latest_frame']['id'])
+         self.assertLess(sum(a>240 for a in empty[3][3::4]),opaque*.25,'removing actual stone did not remove pixels')
+         request('/test/scene',{'stone':True})
+         samples=[];start=time.monotonic();lastid=empty[0]['latest_frame']['id']
+         while time.monotonic()-start<60:
+             state=request('/v2/status');validator.validate(state)
+             self.assertEqual(status['run_id'],state['run_id']);self.assertEqual(status['pid'],state['pid'])
+             samples.append({'elapsed':time.monotonic()-start,'frame':state['latest_frame']['id'],'heartbeat':state['heartbeat'],'width':state['width'],'height':state['height']})
+             time.sleep(.5)
+-        fps=(samples[-1]['frame']-samples[0]['frame'])/(samples[-1]['elapsed']-samples[0]['elapsed'])
+-        self.assertGreater(samples[-1]['frame'],lastid+100,'no continuous new frames')
+-        (evidence/'result.json').write_text(json.dumps({'status':s,'opaque_pixels':opaque,'clear_pixels':clear,'texture_colors':len(greys),'fps':fps,'samples':samples},indent=2))
++        fps,heartbeat_hz=evaluate_samples(samples)
++        self.assertGreater(samples[0]['frame'],lastid,'no fresh frames after scene update')
++        (evidence/'result.json').write_text(json.dumps({'status':s,'opaque_pixels':opaque,'clear_pixels':clear,'texture_colors':len(greys),'fps':fps,'heartbeat_hz':heartbeat_hz,'samples':samples},indent=2))
+         print('LIVE EVIDENCE',evidence,'FPS',fps,flush=True)

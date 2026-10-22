@@ -1,0 +1,79 @@
+# Review package: 27a486bca91b2e7585fc69d17a92b4170d31c834..b9279dfcde6b06cee4313c5da69942f97ca7b443
+
+## Commits
+b9279df fix: require Steam for actual DST startup
+
+## Files changed
+ native/tests/tools_test.py | 16 +++++++++++++++-
+ tools/preflight.py         | 12 ++++--------
+ 2 files changed, 19 insertions(+), 9 deletions(-)
+
+## Diff
+diff --git a/native/tests/tools_test.py b/native/tests/tools_test.py
+index 98150b8..f8ec9e3 100644
+--- a/native/tests/tools_test.py
++++ b/native/tests/tools_test.py
+@@ -1,18 +1,32 @@
+-import importlib.util, json, os, pathlib, struct, subprocess, sys, tempfile, unittest
++import contextlib, importlib.util, io, json, os, pathlib, struct, subprocess, sys, tempfile, unittest
+ from unittest.mock import patch
+ ROOT=pathlib.Path(__file__).resolve().parents[2]
+ spec=importlib.util.spec_from_file_location('preflight',ROOT/'tools/preflight.py')
+ preflight=importlib.util.module_from_spec(spec);spec.loader.exec_module(preflight)
+ capture_spec=importlib.util.spec_from_file_location('capture',ROOT/'tools/capture_render_probe.py')
+ capture=importlib.util.module_from_spec(capture_spec);capture_spec.loader.exec_module(capture)
+ class ToolsTest(unittest.TestCase):
++ def test_cli_launch_requires_steam_before_spawn_or_hint(self):
++  # Trap the old launch boundary: even a ready preflight must not reach it.
++  for flags in (['--launch'],['--launch','--json']):
++   with self.subTest(flags=flags), tempfile.TemporaryDirectory() as d:
++    out=pathlib.Path(d)/'evidence';output=io.StringIO()
++    ready={'ready':True,'executable':{'path':str(pathlib.Path(d)/'MacOS/dst')},'extension':{'path':'probe.dylib'}}
++    with patch.object(sys,'argv',['preflight.py',*flags,'--out',str(out)]), patch.object(preflight,'preflight',return_value=ready), patch.object(preflight,'run_game',return_value=0) as run, patch.object(preflight,'steam_app_id_hint') as hint, patch.object(preflight.subprocess,'run') as spawn, contextlib.redirect_stdout(output):
++     status=preflight.main()
++    self.assertEqual(run.call_count,0,'CLI must not call run_game')
++    hint.assert_not_called();spawn.assert_not_called()
++    self.assertNotEqual(status,0)
++    self.assertEqual(json.loads(output.getvalue())['error'],'STEAM_START_REQUIRED')
++    self.assertFalse(out.exists())
++
+  def test_request_remains_old_until_complete_publication(self):
+   # A renderer may read at any write boundary. It must see old or complete-new,
+   # never a public partial request. The adapter still writes real files.
+   with tempfile.TemporaryDirectory() as d:
+    directory=pathlib.Path(d);public=directory/'capture.request'
+    public.write_text('default\n');observed=[];real_open=pathlib.Path.open
+    class ObservedWriter:
+     def __init__(self, stream):self.stream=stream
+     def __enter__(self):return self
+     def __exit__(self,*args):return self.stream.__exit__(*args)
+diff --git a/tools/preflight.py b/tools/preflight.py
+index 82f9005..8a9cd28 100644
+--- a/tools/preflight.py
++++ b/tools/preflight.py
+@@ -66,21 +66,17 @@ def steam_app_id_hint(cwd):
+     current=path.lstat()
+     if (current.st_dev,current.st_ino)==(owned.st_dev,owned.st_ino) and path.read_bytes()==content:path.unlink()
+    except FileNotFoundError:pass
+ 
+ def run_game(argv,cwd,environment,log_path):
+  with steam_app_id_hint(cwd):
+   with open(log_path,'ab') as log:return subprocess.run(argv,cwd=cwd,env=environment,stdout=log,stderr=log).returncode
+ 
+ def main():
+  p=argparse.ArgumentParser();p.add_argument('--json',action='store_true');p.add_argument('--executable',type=pathlib.Path,default=DEFAULT_EXE);p.add_argument('--cluster',type=pathlib.Path,default=DEFAULT_CLUSTER);p.add_argument('--launch',action='store_true');p.add_argument('--dry-run',action='store_true');p.add_argument('--out',type=pathlib.Path,default=ROOT/'evidence/render-probe');a=p.parse_args()
++ # Actual starts belong to Steam or the user; --dry-run remains diagnostic only.
++ if a.launch and not a.dry_run:
++  print(json.dumps({'error':'STEAM_START_REQUIRED','message':'Start DST through Steam, or ask the user to start it. Direct executable launch is disabled.'}));return 2
+  result=preflight(a.executable,a.cluster);exe=result['executable']['path'];out=a.out.resolve();environment={'DYLD_INSERT_LIBRARIES':result['extension']['path'],'DSTMC_PROBE_DIR':str(out)};cwd=str(pathlib.Path(exe).parent.parent/'data')
+  if a.dry_run:print(json.dumps({'executable':exe,'working_directory':cwd,'environment':environment,'preflight':result},indent=2));return 0 if result['ready'] else 1
+- if not a.launch or not result['ready']:print(json.dumps(result,indent=2));return 0 if result['ready'] else 1
+- out.mkdir(parents=True,exist_ok=True)
+- # Each launch must use a new evidence directory, preserving earlier samples.
+- if (out/'loaded.json').exists():print(json.dumps({'error':'choose_fresh_evidence_directory'}));return 1
+- (out/'preflight.json').write_text(json.dumps(result,indent=2));env=os.environ.copy();env.update(environment)
+- # Wait for this child so the documented Steam app-id hint can be cleaned safely.
+- try:return run_game([exe],cwd,env,out/'launch.log')
+- except (OSError,ValueError) as error:print(json.dumps({'error':str(error)}));return 1
++ print(json.dumps(result,indent=2));return 0 if result['ready'] else 1
+ if __name__=='__main__':sys.exit(main())

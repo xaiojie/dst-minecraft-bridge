@@ -1,0 +1,278 @@
+# Review package: 0e8ac4b9d7aaa10ac84e15517b8de83b47426612..1e3df9629e91a1cf81feda37c2d909e34afc26fa
+
+## Commits
+1e3df96 fix: snapshot numeric command payloads before journaling
+
+## Files changed
+ .../jay/dstmc/protocol/ProtocolContractTest.java   | 40 +++++++++++++++++++++-
+ .../java/dev/jay/dstmc/protocol/BridgeTypes.java   | 15 ++++++--
+ .../java/dev/jay/dstmc/protocol/RequestLedger.java | 40 ++++++++++++++++------
+ protocol/frame-v2.md                               |  2 +-
+ 4 files changed, 82 insertions(+), 15 deletions(-)
+
+## Diff
+diff --git a/mc/src/contractTest/java/dev/jay/dstmc/protocol/ProtocolContractTest.java b/mc/src/contractTest/java/dev/jay/dstmc/protocol/ProtocolContractTest.java
+index c9c1196..c08608a 100644
+--- a/mc/src/contractTest/java/dev/jay/dstmc/protocol/ProtocolContractTest.java
++++ b/mc/src/contractTest/java/dev/jay/dstmc/protocol/ProtocolContractTest.java
+@@ -1,14 +1,17 @@
+ package dev.jay.dstmc.protocol;
+ import java.nio.file.*;
+ import java.nio.*;
+ import java.util.*;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import static dev.jay.dstmc.protocol.BridgeTypes.*;
+ public final class ProtocolContractTest {
+     public static final PairKey PAIR = new PairKey(UUID.fromString("11111111-1111-1111-1111-111111111111"), "Master", UUID.fromString("22222222-2222-2222-2222-222222222222"), "minecraft:overworld", "ground");
+     public static final UUID EPOCH = UUID.fromString("33333333-3333-3333-3333-333333333333");
+     private static int failures;
+     public static void check(boolean b, String message) { if (!b) throw new AssertionError(message); }
+     private static void test(String name, Throwing body) {
+         try { body.run(); System.out.println("PASS " + name); }
+         catch (Exception | AssertionError e) { failures++; System.out.println("FAIL " + name + ": " + e); }
+     }
+@@ -112,27 +115,62 @@ public final class ProtocolContractTest {
+             try(var reopened=new RequestLedger(dir,PAIR,EPOCH)) {
+                 check(reopened.pollPending().isEmpty(),"empty reopened journal scheduled work");
+             }
+         });
+         test("reused_id_and_terminal_mutation_rejected", () -> {
+             Path dir=Files.createTempDirectory("ledger-id");
+             var id=UUID.randomUUID();var original=new Command(id,PAIR,EPOCH,"damage",Map.of("amount",5));
+             try(var ledger=new RequestLedger(dir,PAIR,EPOCH)) {
+                 ledger.receive(original);
+                 check(ledger.receive(new Command(id,PAIR,EPOCH,"damage",Map.of("amount",6))).status()==Status.REJECTED,"reused id changed parameters");
+-                check(ledger.pollPending().orElseThrow().payload().get("amount").equals(5),"changed payload entered queue");
++                check(BridgeTypes.json(ledger.pollPending().orElseThrow().payload().get("amount")).equals("5"),"changed payload entered queue");
+                 var applied=new CommandResult(id,Status.APPLIED,"confirmed");ledger.finish(id,applied);ledger.finish(id,applied);
+                 boolean rejected=false;try { ledger.finish(id,new CommandResult(id,Status.REJECTED,"rewrite")); } catch(IllegalStateException expected) { rejected=true; }
+                 check(rejected,"terminal state was overwritten");
+             }
+             try(var nextEpoch=new RequestLedger(dir,PAIR,UUID.randomUUID())) {
+                 check(nextEpoch.receive(original).status()==Status.REJECTED,"old epoch command accepted after restart");
+                 check(nextEpoch.pollPending().isEmpty(),"old epoch work replayed");
+             }
+         });
++        // Break caught: caller mutation changes a queued effect after its fingerprint was persisted.
++        test("mutable_number_snapshot_matches_receipt", () -> {
++            Path dir=Files.createTempDirectory("ledger-number-snapshot");
++            var id=UUID.randomUUID();
++            var amount=new AtomicInteger(5);
++            var nestedAmount=new AtomicInteger(7);
++            var command=new Command(id,PAIR,EPOCH,"damage",Map.of("amount",amount,"nested",List.of(Map.of("amount",nestedAmount))));
++            try(var ledger=new RequestLedger(dir,PAIR,EPOCH)) {
++                check(ledger.receive(command).status()==Status.PENDING,"initial command was not received");
++                amount.set(99);
++                nestedAmount.set(101);
++                var queued=ledger.pollPending().orElseThrow();
++                check(BridgeTypes.json(queued.payload()).equals("{\"amount\":5,\"nested\":[{\"amount\":7}]}"),"queued command changed after receipt: "+BridgeTypes.json(queued.payload()));
++                var duplicate=new Command(id,PAIR,EPOCH,"damage",Map.of("amount",5,"nested",List.of(Map.of("amount",7))));
++                check(ledger.receive(duplicate).status()==Status.PENDING,"persisted identity no longer matches queued effect");
++                check(ledger.pollPending().isEmpty(),"equivalent numeric retry queued twice");
++            }
++        });
++        // Break caught: passing exact decimal/integer values through double loses range or precision.
++        test("exact_finite_json_numbers_preserved", () -> {
++            var huge=new BigInteger("9007199254740993123456789012345678901234567890");
++            var exact=new BigDecimal("0.123456789012345678901234567890123456789");
++            var outOfDoubleRange=new BigDecimal("1e309");
++            var command=new Command(UUID.randomUUID(),PAIR,EPOCH,"numbers",Map.of("huge",huge,"exact",exact,"large",outOfDoubleRange));
++            String payload=BridgeTypes.json(command.payload());
++            check(payload.contains("\"huge\":9007199254740993123456789012345678901234567890"),"integer precision changed");
++            check(payload.contains("\"exact\":0.123456789012345678901234567890123456789"),"decimal precision changed");
++            check(new BigDecimal(BridgeTypes.json(command.payload().get("large"))).compareTo(outOfDoubleRange)==0,"finite large decimal changed");
++            for(Number invalid:List.of(Double.NaN,Double.POSITIVE_INFINITY,Double.NEGATIVE_INFINITY,Float.NaN,Float.POSITIVE_INFINITY)) {
++                boolean rejected=false;
++                try { new Command(UUID.randomUUID(),PAIR,EPOCH,"invalid",Map.of("amount",invalid)); }
++                catch(IllegalArgumentException expected) { rejected=true; }
++                check(rejected,"non-finite floating-point value accepted");
++            }
++        });
+         // Break caught: publication acknowledged without writing a complete mapped frame.
+         test("java_exports_binary_frame", () -> { Path p=Files.createTempDirectory("frame-export").resolve("frame.bin"); exportFrame(p); check(Files.size(p)>4096, "missing fixed header and slots"); });
+         if (failures != 0) throw new AssertionError(failures + " contract assertion(s) failed");
+         Path fixtures=Path.of("../protocol/fixtures"); Files.createDirectories(fixtures); exportFrame(fixtures.resolve("frame-v2.bin"));
+         System.out.println("Java " + System.getProperty("os.arch") + " exported frame-v2.bin");
+     }
+ }
+diff --git a/mc/src/main/java/dev/jay/dstmc/protocol/BridgeTypes.java b/mc/src/main/java/dev/jay/dstmc/protocol/BridgeTypes.java
+index 3f94ec7..e1c90e1 100644
+--- a/mc/src/main/java/dev/jay/dstmc/protocol/BridgeTypes.java
++++ b/mc/src/main/java/dev/jay/dstmc/protocol/BridgeTypes.java
+@@ -1,14 +1,15 @@
+ package dev.jay.dstmc.protocol;
+ import java.util.*;
+ import java.nio.charset.StandardCharsets;
+ import java.security.MessageDigest;
++import java.math.BigDecimal;
+ public final class BridgeTypes {
+     private BridgeTypes() {}
+     public static String canonicalPair(PairKey p) {
+         return "{\"dst_world\":" + json(p.dst_world().toString()) + ",\"dst_shard\":" + json(p.dst_shard())
+             + ",\"mc_world\":" + json(p.mc_world().toString()) + ",\"mc_dimension\":" + json(p.mc_dimension())
+             + ",\"region\":" + json(p.region()) + "}";
+     }
+     public static byte[] pairHash(PairKey p) { return sha256(canonicalPair(p)); }
+     public static byte[] sha256(String text) {
+         try { return MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)); }
+@@ -25,23 +26,22 @@ public final class BridgeTypes {
+                     if (!Character.isHighSurrogate(c) || i+1>=text.length() || !Character.isLowSurrogate(text.charAt(i+1)))
+                         throw new IllegalArgumentException("unpaired JSON surrogate");
+                     b.append(c).append(text.charAt(++i));
+                 } else if (c == '\\' || c == '"') b.append('\\').append(c);
+                 else if (c < 32) b.append(String.format(Locale.ROOT,"\\u%04x",(int)c));
+                 else b.append(c);
+             }
+             return b.append('"').toString();
+         }
+         if (value instanceof Boolean) return value.toString();
+-        if (value instanceof Number n) {
+-            if (!Double.isFinite(n.doubleValue())) throw new IllegalArgumentException("non-finite JSON number");
+-            return new java.math.BigDecimal(n.toString()).stripTrailingZeros().toPlainString();
++        if (value instanceof Number number) {
++            return snapshotNumber(number).stripTrailingZeros().toPlainString();
+         }
+         if (value instanceof Map<?,?> map) {
+             var keys = new TreeMap<String,Object>();
+             map.forEach((k,v) -> { if (!(k instanceof String)) throw new IllegalArgumentException("JSON key must be string"); keys.put((String)k,v); });
+             var entries = new ArrayList<String>(); keys.forEach((k,v)->entries.add(json(k)+":"+json(v)));
+             return "{"+String.join(",",entries)+"}";
+         }
+         if (value instanceof List<?> list) return "["+String.join(",",list.stream().map(BridgeTypes::json).toList())+"]";
+         throw new IllegalArgumentException("unsupported JSON value: " + value.getClass());
+     }
+@@ -65,19 +65,28 @@ public final class BridgeTypes {
+     public record Body(UUID id, Box box, double health, double max_health, long revision) {}
+     public record BlockChange(long revision, Cell cell, String state) {}
+     public record TerrainCell(Cell cell, List<Box> boxes) { public TerrainCell { boxes=List.copyOf(boxes); } }
+     public record ActorSnapshot(long revision, List<Body> bodies) { public ActorSnapshot { bodies=List.copyOf(bodies); } }
+     public record Command(UUID id, PairKey pair, UUID epoch, String kind, Map<String,Object> payload) {
+         public Command { Objects.requireNonNull(id); Objects.requireNonNull(pair); Objects.requireNonNull(epoch); if(kind==null || kind.isEmpty()) throw new IllegalArgumentException("empty command kind"); payload=freezeMap(payload); json(payload); }
+     }
+     private static Map<String,Object> freezeMap(Map<String,Object> map) {
+         var copy=new TreeMap<String,Object>(); map.forEach((k,v)->copy.put(Objects.requireNonNull(k), freeze(v))); return Collections.unmodifiableMap(copy);
+     }
++    /** Capture the decimal representation once; never retain mutable Number subclasses or narrow through double. */
++    private static BigDecimal snapshotNumber(Number number) {
++        try {
++            return new BigDecimal(number.toString());
++        } catch (NumberFormatException e) {
++            throw new IllegalArgumentException("JSON number must be a finite decimal", e);
++        }
++    }
+     private static Object freeze(Object value) {
++        if (value instanceof Number number) return snapshotNumber(number);
+         if(value instanceof Map<?,?> map) { var copy=new TreeMap<String,Object>(); map.forEach((k,v)->{ if(!(k instanceof String)) throw new IllegalArgumentException("JSON key"); copy.put((String)k,freeze(v)); }); return Collections.unmodifiableMap(copy); }
+         if(value instanceof List<?> list) return Collections.unmodifiableList(list.stream().map(BridgeTypes::freeze).toList());
+         return value;
+     }
+     public enum Status { PENDING, APPLIED, REJECTED, UNRESOLVED }
+     public record CommandResult(UUID id, Status status, String reason) { public CommandResult { Objects.requireNonNull(id); Objects.requireNonNull(status); Objects.requireNonNull(reason); } }
+     public record DamageEvent(UUID id, PairKey pair, UUID epoch, Space source, UUID target, Vec3 position, double amount, String kind) {}
+ }
+diff --git a/mc/src/main/java/dev/jay/dstmc/protocol/RequestLedger.java b/mc/src/main/java/dev/jay/dstmc/protocol/RequestLedger.java
+index b33cf7a..7558f9e 100644
+--- a/mc/src/main/java/dev/jay/dstmc/protocol/RequestLedger.java
++++ b/mc/src/main/java/dev/jay/dstmc/protocol/RequestLedger.java
+@@ -36,42 +36,62 @@ public final class RequestLedger implements AutoCloseable {
+                 }
+             }
+         } catch(IOException | RuntimeException e) {
+             if(ownership!=null) try { ownership.close(); } catch(IOException cleanup) { e.addSuppressed(cleanup); }
+             if(e instanceof IOException io) throw new UncheckedIOException(io);
+             throw (RuntimeException)e;
+         }
+     }
+     public synchronized CommandResult receive(Command command) {
+         requireOpen();
+-        if(!pair.equals(command.pair()) || !epoch.equals(command.epoch())) return new CommandResult(command.id(),Status.REJECTED,"foreign pair or epoch");
++        if (!pair.equals(command.pair()) || !epoch.equals(command.epoch())) {
++            return new CommandResult(command.id(), Status.REJECTED, "foreign pair or epoch");
++        }
+         String fingerprint=HexFormat.of().formatHex(sha256(json(command.kind())+":"+json(command.payload())));
+         Entry existing=entries.get(command.id());
+         if(existing!=null) {
+-            if(!existing.epoch.equals(command.epoch()) || !existing.fingerprint.equals(fingerprint)) return new CommandResult(command.id(),Status.REJECTED,"command id reused with different epoch or parameters");
++            if (!existing.epoch.equals(command.epoch()) || !existing.fingerprint.equals(fingerprint)) {
++                return new CommandResult(command.id(), Status.REJECTED, "command id reused with different epoch or parameters");
++            }
+             return existing.result;
+         }
+-        var result=new CommandResult(command.id(),Status.PENDING,"received; awaiting game thread");
+-        var entry=new Entry(epoch,fingerprint,result); persist(command.id(),entry); entries.put(command.id(),entry); pending.add(command); return result;
++        var result = new CommandResult(command.id(), Status.PENDING, "received; awaiting game thread");
++        var entry = new Entry(epoch, fingerprint, result);
++        persist(command.id(), entry);
++        entries.put(command.id(), entry);
++        pending.add(command);
++        return result;
+     }
+     /** Only the game-thread consumer calls this. A duplicate HTTP receipt never requeues. */
+-    public synchronized Optional<Command> pollPending() { requireOpen(); return Optional.ofNullable(pending.poll()); }
++    public synchronized Optional<Command> pollPending() {
++        requireOpen();
++        return Optional.ofNullable(pending.poll());
++    }
+     public synchronized void finish(UUID id,CommandResult result) {
+         requireOpen();
+         Entry old=entries.get(id);
+-        if(old==null || !id.equals(result.id()) || !old.epoch.equals(epoch)) throw new IllegalArgumentException("unknown or foreign command");
+-        if(result.status()==Status.PENDING) throw new IllegalArgumentException("finish requires final result");
+-        if(old.result.status()!=Status.PENDING && old.result.status()!=Status.UNRESOLVED) {
+-            if(!old.result.equals(result)) throw new IllegalStateException("terminal result is immutable");
++        if (old == null || !id.equals(result.id()) || !old.epoch.equals(epoch)) {
++            throw new IllegalArgumentException("unknown or foreign command");
++        }
++        if (result.status() == Status.PENDING) {
++            throw new IllegalArgumentException("finish requires final result");
++        }
++        if (old.result.status() != Status.PENDING && old.result.status() != Status.UNRESOLVED) {
++            if (!old.result.equals(result)) {
++                throw new IllegalStateException("terminal result is immutable");
++            }
+             return;
+         }
+-        var entry=new Entry(old.epoch,old.fingerprint,result); persist(id,entry); entries.put(id,entry); pending.removeIf(c->c.id().equals(id));
++        var entry = new Entry(old.epoch, old.fingerprint, result);
++        persist(id, entry);
++        entries.put(id, entry);
++        pending.removeIf(command -> command.id().equals(id));
+     }
+     private void requireOpen() { if(closed) throw new IllegalStateException("closed ledger"); }
+     @Override public synchronized void close() {
+         if(!closed) {
+             closed=true;pending.clear();
+             try { ownership.close(); } catch(IOException e) { throw new UncheckedIOException(e); }
+         }
+     }
+     private void persist(UUID id,Entry entry) {
+         try {
+diff --git a/protocol/frame-v2.md b/protocol/frame-v2.md
+index cc10508..586ac82 100644
+--- a/protocol/frame-v2.md
++++ b/protocol/frame-v2.md
+@@ -14,21 +14,21 @@ Initial calibration is one DST unit to one MC block, identity axes:
+ 
+ ```
+ MC = DST - dstOrigin + mcOrigin
+ DST = MC - mcOrigin + dstOrigin
+ ```
+ 
+ The golden origins `(100,0,-50)` and `(0,64,0)` map DST `(106.5,2,-47)` to MC `(6.5,66,3)`. `WorldTransform.toMc` / `toDst` never recalibrate in response to movement. `PairingStore(Path)` atomically saves a pair's first origins; `loadOrCreate(pair, dstOrigin, mcOrigin)` returns those saved origins on subsequent calls. Different pairs use different SHA-256 file names. Malformed records fail closed. Creation is protected by a stable lock inode, and each record is forced, atomically renamed, then its parent directory is forced. The current binary store is private to Java; the shared interchange format is this document and HTTP schema.
+ 
+ `RequestLedger(Path, pair, epoch)` owns an exclusive OS file lock for that pair until `close()`. A second live owner is rejected immediately. Use try-with-resources and close before reopening a ledger. `receive(Command)` rejects foreign identity **before** inspecting/mutating command state. The first valid receipt is forced to durable `PENDING` before returning. `pollPending(): Optional<Command>` removes one item from the in-memory game-thread scheduling queue; duplicate receipts return the existing outcome and never enqueue again. Reusing an ID with different parameters or epoch is rejected. A game-thread consumer calls `finish(id, result)` only after actual application/rejection. `APPLIED` and `REJECTED` terminal outcomes cannot be rewritten. `UNRESOLVED` may be reconciled explicitly through `finish`, but is never automatically queued.
+ 
+-Opening a ledger converts persisted `PENDING` records to durable `UNRESOLVED`. It does not replay them, even if the same epoch was reused by a test. Old-epoch records remain evidence and cannot be finished through a new-epoch ledger. There is no claim of crash-safe exactly-once game mutation: a crash after a game effect and before durable APPLIED requires reconciliation. Payload fingerprints use sorted object keys, ordered arrays, exact strings and normalized finite JSON decimal numbers; command payloads are copied recursively on construction.
++Opening a ledger converts persisted `PENDING` records to durable `UNRESOLVED`. It does not replay them, even if the same epoch was reused by a test. Old-epoch records remain evidence and cannot be finished through a new-epoch ledger. There is no claim of crash-safe exactly-once game mutation: a crash after a game effect and before durable APPLIED requires reconciliation. Payload fingerprints use sorted object keys, ordered arrays, exact strings and normalized finite JSON decimal numbers; command payloads are copied recursively on construction. All accepted Number values are snapshotted from their decimal text into immutable BigDecimal values before fingerprinting or scheduling. This preserves arbitrary-precision finite decimal/integer values without narrowing through double; NaN, infinity and nondecimal numeric text are rejected.
+ 
+ ## Mapped file layout
+ 
+ All numeric values are **little-endian**, except UUIDs, which are the 16 RFC 4122 bytes in textual/network order. Floats are IEEE 754. No native struct packing is assumed. The mapping base must be at least 8-byte aligned, writable, and `MAP_SHARED` for the reader's atomic lease words. A `FrameView` exposes only const image pointers and copied validated metadata.
+ 
+ There is a 4096-byte file header and exactly three slots, each with a 512-byte slot header. Production physical capacity is bounded by **1920×1080**. Capacity is chosen when creating a new mapping; the small golden fixture uses 2×2 capacity and is 5824 bytes. Slot stride is `alignUp(512 + capacity_width*capacity_height*12, 64)`. File length is exactly `4096 + 3*stride`. Each frame may be no larger than capacity on either axis. Frame sizes are physical framebuffer pixels, not macOS logical points.
+ 
+ `FrameLayout.create(path, capacityWidth, capacityHeight)` requires a new, nonexistent path. It cannot overwrite/truncate an existing mapping. A resolution change exceeding capacity or a new pair/epoch requires a **fresh mapping generation/path**, published through handshake. A file must never be truncated or replaced in place while a reader may hold a view. Keep each old mapping alive until its leases are released, then retire it. Never unmap while a `FrameView` exists. Closing the Java writer closes its channel; mapped bytes remain subject to the JVM mapping lifetime.
+ 
+ File header:

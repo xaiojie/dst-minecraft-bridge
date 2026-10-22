@@ -1,0 +1,540 @@
+# Review package: 6489744ea03e5603746c7dde7293cd19fc3be21b..d37603262bc36b9ae2d8cb080e654b5d1e26e5e4
+
+## Commits
+d376032 feat: add macOS DST render diagnostics and isolated launcher
+
+## Files changed
+ native/Makefile                    | 24 +++++++++++
+ native/include/gl_observer.h       | 34 +++++++++++++++
+ native/src/entry.mm                | 30 +++++++++++++
+ native/src/frame_reader.cpp        |  6 +++
+ native/src/gl_observer.mm          | 51 ++++++++++++++++++++++
+ native/tests/frame_reader_test.cpp |  7 ++++
+ native/tests/gl_state_test.mm      | 44 +++++++++++++++++++
+ native/tests/loader_test.mm        | 11 +++++
+ native/tests/tools_test.py         | 63 ++++++++++++++++++++++++++++
+ tools/capture_render_probe.py      | 78 ++++++++++++++++++++++++++++++++++
+ tools/launch_dst.command           |  4 ++
+ tools/preflight.py                 | 86 ++++++++++++++++++++++++++++++++++++++
+ 12 files changed, 438 insertions(+)
+
+## Diff
+diff --git a/native/Makefile b/native/Makefile
+index 9e62ad9..be753e6 100644
+--- a/native/Makefile
++++ b/native/Makefile
+@@ -5,10 +5,34 @@ JAVA ?= $(shell /usr/libexec/java_home -v 21)/bin/java
+ .PHONY: contract-test java-contract-classes clean
+ $(BUILD)/frame_contract_test: tests/frame_contract_test.cpp include/frame_protocol.h
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) tests/frame_contract_test.cpp -o $@
+ java-contract-classes:
+ 	cd ../mc && ./gradlew contractTestClasses --console plain
+ contract-test: $(BUILD)/frame_contract_test java-contract-classes
+ 	DSTMC_JAVA="$(JAVA)" ./$(BUILD)/frame_contract_test ../protocol/fixtures/frame-v2.bin
+ clean:
+ 	rm -rf $(BUILD)
++
++GLFLAGS := -Wno-deprecated-declarations -framework OpenGL -framework Cocoa
++.PHONY: all gl-test
++all: $(BUILD)/libdstmc_probe.dylib
++$(BUILD)/gl_state_test: tests/gl_state_test.mm src/gl_observer.mm include/gl_observer.h
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/gl_state_test.mm src/gl_observer.mm -o $@
++gl-test: $(BUILD)/gl_state_test
++	./$(BUILD)/gl_state_test
++$(BUILD)/frame_reader_test: tests/frame_reader_test.cpp src/frame_reader.cpp include/gl_observer.h include/frame_protocol.h
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) tests/frame_reader_test.cpp src/frame_reader.cpp -o $@
++.PHONY: reader-test
++reader-test: $(BUILD)/frame_reader_test
++	./$(BUILD)/frame_reader_test
++$(BUILD)/loader_test: tests/loader_test.mm
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) $(GLFLAGS) $< -o $@
++.PHONY: loader-test
++loader-test: $(BUILD)/loader_test all
++	@d=$$(mktemp -d); DSTMC_PROBE_DIR="$$d" DYLD_INSERT_LIBRARIES="$(CURDIR)/$(BUILD)/libdstmc_probe.dylib" ./$(BUILD)/loader_test; result=$$?; rm -rf "$$d"; exit $$result
++$(BUILD)/libdstmc_probe.dylib: src/entry.mm src/gl_observer.mm src/frame_reader.cpp include/gl_observer.h include/frame_protocol.h
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/gl_observer.mm src/frame_reader.cpp -o $@
+diff --git a/native/include/gl_observer.h b/native/include/gl_observer.h
+new file mode 100644
+index 0000000..31fb275
+--- /dev/null
++++ b/native/include/gl_observer.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include "frame_protocol.h"
++#include <OpenGL/OpenGL.h>
++#include <array>
++#include <functional>
++#include <string>
++#include <vector>
++namespace dstmc {
++struct ShaderMatrix { std::string name; int location{}; std::array<float,16> value{}; };
++struct ShaderSource { int type{}; std::string sha256; bool source_available{},contains_discard{},writes_frag_depth{}; };
++struct RenderProbe {
++    uint64_t frame_no{},context_id{},draw_no{};
++    std::array<int,4> viewport{};
++    std::array<float,16> projection{},modelview{}; // Fixed-function only; shader_matrices carry actual program state.
++    bool depth_enabled{},depth_mask{},blend_enabled{},alpha_test{};
++    std::array<double,2> depth_range{};
++    std::array<int,6> blend_state{};
++    int depth_func{},alpha_func{},target_id{},program{},depth_bits{};
++    float alpha_ref{};
++    std::vector<ShaderMatrix> shader_matrices;
++    std::vector<ShaderSource> shader_sources;
++    std::string program_fingerprint;
++    std::string stage;
++};
++struct ProbeCapture { RenderProbe probe; std::vector<uint8_t> color; std::vector<float> depth; std::string error; };
++RenderProbe inspect_draw(const char* stage);
++void observe_draw(const RenderProbe&);
++ProbeCapture capture_probe_frame();
++void forget_context(CGLContextObj);
++void begin_present();
++void after_draw(const char* kind);
++void configure_probe(const std::string& directory);
++bool consume_frame(const void* mapping,size_t length,FrameKey expected,const std::function<void(const FrameView&)>& consumer);
++}
+diff --git a/native/src/entry.mm b/native/src/entry.mm
+new file mode 100644
+index 0000000..6e31678
+--- /dev/null
++++ b/native/src/entry.mm
+@@ -0,0 +1,30 @@
++#import <Cocoa/Cocoa.h>
++#import <objc/runtime.h>
++#include "gl_observer.h"
++#include <OpenGL/gl.h>
++#include <cstdlib>
++#include <fstream>
++#include <unistd.h>
++namespace {
++thread_local bool observing=false;
++void (*original_flush)(id,SEL)=nullptr;
++void (*original_dealloc)(id,SEL)=nullptr;
++template<class F> void diagnostic(F fn) noexcept {if(observing)return;observing=true;try{fn();}catch(...){/* Diagnostics must never escape into the game's renderer. */}observing=false;}
++void flush(id self,SEL cmd){diagnostic([]{dstmc::begin_present();});original_flush(self,cmd);}
++void dealloc_context(id self,SEL cmd){auto c=[(NSOpenGLContext*)self CGLContextObj];diagnostic([&]{dstmc::forget_context(c);});original_dealloc(self,cmd);}
++void draw_arrays(GLenum mode,GLint first,GLsizei count){glDrawArrays(mode,first,count);diagnostic([]{dstmc::after_draw("glDrawArrays");});}
++void draw_elements(GLenum mode,GLsizei count,GLenum type,const GLvoid* indices){glDrawElements(mode,count,type,indices);diagnostic([]{dstmc::after_draw("glDrawElements");});}
++CGLError destroy_context(CGLContextObj c){diagnostic([&]{dstmc::forget_context(c);});return CGLDestroyContext(c);}
++#define INTERPOSE(replacement,original) __attribute__((used)) static struct {const void* replacement_ptr;const void* original_ptr;} hook_##original __attribute__((section("__DATA,__interpose")))={(const void*)&replacement,(const void*)&original}
++INTERPOSE(draw_arrays,glDrawArrays);
++INTERPOSE(draw_elements,glDrawElements);
++INTERPOSE(destroy_context,CGLDestroyContext);
++__attribute__((constructor)) void loaded(){@autoreleasepool {
++ const char* dir=getenv("DSTMC_PROBE_DIR");if(!dir||!*dir)return;
++ diagnostic([&]{dstmc::configure_probe(dir);Class cls=[NSOpenGLContext class];Method method=class_getInstanceMethod(cls,@selector(flushBuffer));if(!method)return;original_flush=(decltype(original_flush))method_setImplementation(method,(IMP)flush);
++ // Add a class-local dealloc override so inherited NSObject dealloc is never changed.
++ SEL selector=sel_registerName("dealloc");Method d=class_getInstanceMethod(cls,selector);original_dealloc=(decltype(original_dealloc))method_getImplementation(d);if(!class_addMethod(cls,selector,(IMP)dealloc_context,method_getTypeEncoding(d)))method_setImplementation(d,(IMP)dealloc_context);
++ std::ofstream(std::string(dir)+"/loaded.json")<<"{\"schema\":1,\"pid\":"<<getpid()<<",\"architecture\":\"x86_64\",\"present_hook\":\"NSOpenGLContext.flushBuffer\",\"draw_hooks\":[\"glDrawArrays\",\"glDrawElements\"],\"synthetic_draws\":false}\n";
++ });
++}}
++}
+diff --git a/native/src/frame_reader.cpp b/native/src/frame_reader.cpp
+new file mode 100644
+index 0000000..2b8b607
+--- /dev/null
++++ b/native/src/frame_reader.cpp
+@@ -0,0 +1,6 @@
++#include "gl_observer.h"
++namespace dstmc {
++bool consume_frame(const void* mapping,size_t length,FrameKey expected,const std::function<void(const FrameView&)>& consumer){
++ auto frame=read_frame(mapping,length,expected);if(!frame)return false;consumer(*frame);return true;
++}
++}
+diff --git a/native/src/gl_observer.mm b/native/src/gl_observer.mm
+new file mode 100644
+index 0000000..4aba863
+--- /dev/null
++++ b/native/src/gl_observer.mm
+@@ -0,0 +1,51 @@
++#include "gl_observer.h"
++#include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
++#include <CommonCrypto/CommonDigest.h>
++#include <fstream>
++#include <algorithm>
++#include <iomanip>
++#include <map>
++#include <mutex>
++#include <sstream>
++#include <sys/stat.h>
++#include <unistd.h>
++namespace dstmc {
++namespace {
++struct Context {uint64_t id,frame=0,draw=0;bool sample=false;unsigned captures=0;int last_program=-1,last_target=-1,last_depth=-1;};
++struct State {std::mutex mutex;std::map<CGLContextObj,Context> contexts;uint64_t next=1;std::string directory;unsigned selected=0;std::vector<uint64_t> checkpoints;bool explicit_checkpoints=false;};
++State& state(){static auto* s=new State;return *s;}
++Context& ctx(){auto& s=state();auto c=CGLGetCurrentContext();auto it=s.contexts.find(c);if(it==s.contexts.end())it=s.contexts.emplace(c,Context{s.next++}).first;return it->second;}
++std::string quote(const std::string& s){std::ostringstream o;o<<'"';for(unsigned char c:s){if(c=='"'||c=='\\')o<<'\\'<<c;else if(c<32)o<<"\\u"<<std::hex<<std::setw(4)<<std::setfill('0')<<int(c)<<std::dec;else o<<c;}o<<'"';return o.str();}
++std::string sha256(const std::string& text){unsigned char digest[CC_SHA256_DIGEST_LENGTH];CC_SHA256(text.data(),(CC_LONG)text.size(),digest);std::ostringstream o;o<<std::hex<<std::setfill('0');for(auto byte:digest)o<<std::setw(2)<<int(byte);return o.str();}
++template<class T> void number(std::ostream& o,T x){if(std::isfinite(double(x)))o<<x;else o<<"null";}
++template<class T,size_t N> void array(std::ostream& o,const std::array<T,N>& a){o<<'[';for(size_t i=0;i<N;i++){if(i)o<<',';number(o,a[i]);}o<<']';}
++std::string json(const RenderProbe& p){std::ostringstream o;o<<std::setprecision(9)<<"{\"frame_no\":"<<p.frame_no<<",\"context_id\":"<<p.context_id<<",\"draw_no\":"<<p.draw_no<<",\"stage\":"<<quote(p.stage)<<",\"viewport\":";array(o,p.viewport);o<<",\"projection\":";array(o,p.projection);o<<",\"modelview\":";array(o,p.modelview);o<<",\"matrix_source\":\"fixed_function_plus_active_shader_uniforms\",\"depth_enabled\":"<<p.depth_enabled<<",\"depth_mask\":"<<p.depth_mask<<",\"depth_func\":"<<p.depth_func<<",\"depth_bits\":"<<p.depth_bits<<",\"depth_range\":";array(o,p.depth_range);o<<",\"blend_enabled\":"<<p.blend_enabled<<",\"blend_state\":";array(o,p.blend_state);o<<",\"alpha_test\":"<<p.alpha_test<<",\"alpha_func\":"<<p.alpha_func<<",\"alpha_ref\":";number(o,p.alpha_ref);o<<",\"target_id\":"<<p.target_id<<",\"program\":"<<p.program<<",\"shader_matrices\":[";for(size_t i=0;i<p.shader_matrices.size();i++){if(i)o<<',';auto& m=p.shader_matrices[i];o<<"{\"name\":"<<quote(m.name)<<",\"location\":"<<m.location<<",\"value\":";array(o,m.value);o<<'}';}o<<"],\"program_fingerprint\":"<<quote(p.program_fingerprint)<<",\"shader_sources\":[";for(size_t i=0;i<p.shader_sources.size();i++){if(i)o<<',';auto& shader=p.shader_sources[i];o<<"{\"type\":"<<shader.type<<",\"sha256\":"<<quote(shader.sha256)<<",\"source_available\":"<<shader.source_available<<",\"source_contains_discard_token\":"<<shader.contains_discard<<",\"source_contains_gl_FragDepth\":"<<shader.writes_frag_depth<<'}';}o<<"]}";return o.str();}
++RenderProbe inspect(const char* stage){
++ RenderProbe p;if(!CGLGetCurrentContext()){p.stage="no-context";return p;}auto& c=ctx();p.context_id=c.id;p.frame_no=c.frame;p.draw_no=c.draw;p.stage=stage;
++ glGetIntegerv(GL_VIEWPORT,p.viewport.data());glGetFloatv(GL_PROJECTION_MATRIX,p.projection.data());glGetFloatv(GL_MODELVIEW_MATRIX,p.modelview.data());p.depth_enabled=glIsEnabled(GL_DEPTH_TEST);GLboolean mask;glGetBooleanv(GL_DEPTH_WRITEMASK,&mask);p.depth_mask=mask;glGetDoublev(GL_DEPTH_RANGE,p.depth_range.data());glGetIntegerv(GL_DEPTH_FUNC,&p.depth_func);glGetIntegerv(GL_DEPTH_BITS,&p.depth_bits);p.blend_enabled=glIsEnabled(GL_BLEND);GLenum enums[]={GL_BLEND_SRC_RGB,GL_BLEND_DST_RGB,GL_BLEND_SRC_ALPHA,GL_BLEND_DST_ALPHA,GL_BLEND_EQUATION_RGB,GL_BLEND_EQUATION_ALPHA};for(int i=0;i<6;i++)glGetIntegerv(enums[i],&p.blend_state[i]);p.alpha_test=glIsEnabled(GL_ALPHA_TEST);glGetIntegerv(GL_ALPHA_TEST_FUNC,&p.alpha_func);glGetFloatv(GL_ALPHA_TEST_REF,&p.alpha_ref);glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT,&p.target_id);glGetIntegerv(GL_CURRENT_PROGRAM,&p.program);
++ if(p.program){GLint n=0,max=0;glGetProgramiv(p.program,GL_ACTIVE_UNIFORMS,&n);glGetProgramiv(p.program,GL_ACTIVE_UNIFORM_MAX_LENGTH,&max);std::vector<char> name(std::max(1,max));for(GLint i=0;i<n;i++){GLsizei len;GLint size;GLenum type;glGetActiveUniform(p.program,i,name.size(),&len,&size,&type,name.data());if(type!=GL_FLOAT_MAT4)continue;std::string base(name.data(),len);for(int j=0;j<std::min(size,128);j++){std::string key=base;if(size>1){auto pos=key.find("[0]");if(pos!=std::string::npos)key.replace(pos,3,"["+std::to_string(j)+"]");}GLint loc=glGetUniformLocation(p.program,key.c_str());if(loc>=0){ShaderMatrix m;m.name=key;m.location=loc;glGetUniformfv(p.program,loc,m.value.data());p.shader_matrices.push_back(std::move(m));}}}}
++ if(p.program){GLint count=0;glGetProgramiv(p.program,GL_ATTACHED_SHADERS,&count);if(count>0&&count<=64){std::vector<GLuint> shaders(count);GLsizei actual=0;glGetAttachedShaders(p.program,count,&actual,shaders.data());std::vector<std::string> fingerprints;bool complete=true;for(int i=0;i<actual;i++){ShaderSource info;GLint length=0;glGetShaderiv(shaders[i],GL_SHADER_TYPE,&info.type);glGetShaderiv(shaders[i],GL_SHADER_SOURCE_LENGTH,&length);if(length>1&&length<=1024*1024){std::string source(length,'\0');GLsizei written=0;glGetShaderSource(shaders[i],length,&written,source.data());source.resize(written);info.source_available=!source.empty();if(info.source_available){info.sha256=sha256(source);info.contains_discard=source.find("discard")!=std::string::npos;info.writes_frag_depth=source.find("gl_FragDepth")!=std::string::npos;fingerprints.push_back(std::to_string(info.type)+":"+info.sha256+"\n");}}complete=complete&&info.source_available;p.shader_sources.push_back(std::move(info));}if(complete&&!fingerprints.empty()){std::sort(fingerprints.begin(),fingerprints.end());std::string canonical;for(const auto& item:fingerprints)canonical+=item;p.program_fingerprint=sha256(canonical);}}}
++ return p;
++}
++struct PackGuard {GLint buffer,alignment,row,rows,pixels,swap,lsb;PackGuard(){glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&buffer);glGetIntegerv(GL_PACK_ALIGNMENT,&alignment);glGetIntegerv(GL_PACK_ROW_LENGTH,&row);glGetIntegerv(GL_PACK_SKIP_ROWS,&rows);glGetIntegerv(GL_PACK_SKIP_PIXELS,&pixels);glGetIntegerv(GL_PACK_SWAP_BYTES,&swap);glGetIntegerv(GL_PACK_LSB_FIRST,&lsb);glBindBuffer(GL_PIXEL_PACK_BUFFER,0);glPixelStorei(GL_PACK_ALIGNMENT,1);glPixelStorei(GL_PACK_ROW_LENGTH,0);glPixelStorei(GL_PACK_SKIP_ROWS,0);glPixelStorei(GL_PACK_SKIP_PIXELS,0);glPixelStorei(GL_PACK_SWAP_BYTES,0);glPixelStorei(GL_PACK_LSB_FIRST,0);}~PackGuard(){glBindBuffer(GL_PIXEL_PACK_BUFFER,buffer);glPixelStorei(GL_PACK_ALIGNMENT,alignment);glPixelStorei(GL_PACK_ROW_LENGTH,row);glPixelStorei(GL_PACK_SKIP_ROWS,rows);glPixelStorei(GL_PACK_SKIP_PIXELS,pixels);glPixelStorei(GL_PACK_SWAP_BYTES,swap);glPixelStorei(GL_PACK_LSB_FIRST,lsb);}};
++ProbeCapture capture(const char* stage){ProbeCapture c;c.probe=inspect(stage);auto v=c.probe.viewport;if(!c.probe.context_id||v[2]<=0||v[3]<=0||v[2]>1920||v[3]>1080){c.error="unsupported_or_missing_physical_viewport";return c;}if(c.probe.target_id&&glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT)!=GL_FRAMEBUFFER_COMPLETE_EXT){c.error="incomplete_framebuffer";return c;}GLint read_buffer=0;glGetIntegerv(GL_READ_BUFFER,&read_buffer);if(read_buffer==GL_NONE){c.error="disabled_read_buffer";return c;}GLint samples=0;glGetIntegerv(GL_SAMPLES,&samples);if(c.probe.target_id&&samples>0){c.error="multisample_framebuffer_requires_resolve";return c;}PackGuard guard;size_t n=size_t(v[2])*v[3];c.color.resize(n*4);glReadPixels(v[0],v[1],v[2],v[3],GL_RGBA,GL_UNSIGNED_BYTE,c.color.data());if(c.probe.depth_bits>0){c.depth.resize(n);glReadPixels(v[0],v[1],v[2],v[3],GL_DEPTH_COMPONENT,GL_FLOAT,c.depth.data());}else c.error="no_depth_attachment";return c;}
++void save(const char* stage){auto& s=state();auto& c=ctx();if(s.directory.empty()||c.captures>=8)return;c.captures++;auto cap=capture(stage);std::string base="ctx"+std::to_string(c.id)+"-f"+std::to_string(c.frame)+"-d"+std::to_string(c.draw);std::string path=s.directory+"/"+base;std::ofstream(path+".rgba",std::ios::binary).write((char*)cap.color.data(),cap.color.size());std::ofstream(path+".depth.f32",std::ios::binary).write((char*)cap.depth.data(),cap.depth.size()*4);std::ofstream meta(path+".json");meta<<"{\"probe\":"<<json(cap.probe)<<",\"color\":"<<quote(base+".rgba")<<",\"depth\":"<<quote(base+".depth.f32")<<",\"origin\":\"bottom-left\",\"depth_encoding\":\"OpenGL_window_z_float32_little_endian\",\"error\":"<<quote(cap.error)<<"}\n";}
++}
++RenderProbe inspect_draw(const char* stage){std::lock_guard<std::mutex> lock(state().mutex);return inspect(stage);}
++void observe_draw(const RenderProbe& p){std::lock_guard<std::mutex> lock(state().mutex);if(!state().directory.empty())std::ofstream(state().directory+"/draws.jsonl",std::ios::app)<<json(p)<<'\n';}
++ProbeCapture capture_probe_frame(){std::lock_guard<std::mutex> lock(state().mutex);return capture("explicit-capture");}
++void forget_context(CGLContextObj c){std::lock_guard<std::mutex> lock(state().mutex);state().contexts.erase(c);}
++void configure_probe(const std::string& directory){std::lock_guard<std::mutex> lock(state().mutex);state().directory=directory;}
++void after_draw(const char* kind){
++ if(!CGLGetCurrentContext())return;std::lock_guard<std::mutex> lock(state().mutex);auto& s=state();auto& c=ctx();c.draw++;if(!c.sample||s.directory.empty()||c.draw>20000)return;auto p=inspect(kind);std::ofstream(s.directory+"/draws.jsonl",std::ios::app)<<json(p)<<'\n';
++ // Candidates are evidence checkpoints, never accepted world/UI classification.
++ if(c.captures<7){if(s.explicit_checkpoints){if(std::find(s.checkpoints.begin(),s.checkpoints.end(),c.draw)!=s.checkpoints.end())save("after-requested-draw");}else if(p.target_id!=c.last_target||int(p.depth_enabled)!=c.last_depth||c.draw==100||c.draw==300)save("after-draw-state-transition");}c.last_program=p.program;c.last_target=p.target_id;c.last_depth=p.depth_enabled;
++}
++void begin_present(){
++ if(!CGLGetCurrentContext())return;std::lock_guard<std::mutex> lock(state().mutex);auto& s=state();auto& c=ctx();if(c.sample)save("before-present");c.frame++;c.draw=0;c.captures=0;c.sample=false;c.last_program=c.last_target=c.last_depth=-1;
++ if(s.directory.empty())return;std::string request=s.directory+"/capture.request";if(access(request.c_str(),F_OK)==0){std::ifstream input(request);std::string mode;input>>mode;s.checkpoints.clear();s.explicit_checkpoints=mode=="checkpoints"||mode=="metadata";bool valid=true;if(mode=="checkpoints"){uint64_t n;while(input>>n){s.checkpoints.push_back(n);if(n==0||n>20000||s.checkpoints.size()>7){valid=false;break;}}valid=valid&&input.eof()&&!s.checkpoints.empty();std::sort(s.checkpoints.begin(),s.checkpoints.end());valid=valid&&std::adjacent_find(s.checkpoints.begin(),s.checkpoints.end())==s.checkpoints.end();}unlink(request.c_str());s.selected=valid?2:0;if(!valid)std::ofstream(s.directory+"/request-error.json")<<"{\"error\":\"checkpoints_require_1_to_7_unique_draws_in_1_20000\"}\n";else unlink((s.directory+"/request-error.json").c_str());}
++ if(s.selected){c.sample=true;s.selected--;}
++ std::ofstream(s.directory+"/heartbeat.json.tmp")<<"{\"pid\":"<<getpid()<<",\"frame_no\":"<<c.frame<<",\"context_id\":"<<c.id<<"}\n";rename((s.directory+"/heartbeat.json.tmp").c_str(),(s.directory+"/heartbeat.json").c_str());
++}
++}
+diff --git a/native/tests/frame_reader_test.cpp b/native/tests/frame_reader_test.cpp
+new file mode 100644
+index 0000000..c714a01
+--- /dev/null
++++ b/native/tests/frame_reader_test.cpp
+@@ -0,0 +1,7 @@
++#include "gl_observer.h"
++#include <cassert>
++#include <fstream>
++#include <iostream>
++#include <vector>
++using namespace dstmc;
++int main(){std::ifstream f("../protocol/fixtures/frame-v2.bin",std::ios::binary);std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),{});assert(data.size()>4608);FrameKey key;std::memcpy(key.pair_hash.data(),data.data()+4112,32);std::memcpy(key.epoch.data(),data.data()+4144,16);key.id=detail::load<uint64_t>(data.data(),4160);bool called=false;bool ok=consume_frame(data.data(),data.size(),key,[&](const FrameView& view){called=true;assert(view.width==2&&view.height==2);assert(view.color);assert(!read_frame(data.data(),data.size(),key));});assert(ok&&called&&"consumer must receive leased FrameView");assert(read_frame(data.data(),data.size(),key));key.id++;assert(!consume_frame(data.data(),data.size(),key,[&](const FrameView&){assert(false);}));std::cout<<"PASS scoped_frame_consumer rejects_wrong_key releases_lease\n";}
+diff --git a/native/tests/gl_state_test.mm b/native/tests/gl_state_test.mm
+new file mode 100644
+index 0000000..9ecaf2d
+--- /dev/null
++++ b/native/tests/gl_state_test.mm
+@@ -0,0 +1,44 @@
++#include "gl_observer.h"
++#include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
++#include <cassert>
++#include <iostream>
++#include <vector>
++#include <fstream>
++#include <filesystem>
++#include <unistd.h>
++using namespace dstmc;
++static CGLContextObj context() {
++ CGLPixelFormatAttribute attrs[]={kCGLPFAAccelerated,kCGLPFAColorSize,(CGLPixelFormatAttribute)24,kCGLPFADepthSize,(CGLPixelFormatAttribute)24,(CGLPixelFormatAttribute)0};
++ CGLPixelFormatObj pf=nullptr;GLint count=0;assert(CGLChoosePixelFormat(attrs,&pf,&count)==kCGLNoError);
++ CGLContextObj ctx=nullptr;assert(CGLCreateContext(pf,nullptr,&ctx)==kCGLNoError);CGLDestroyPixelFormat(pf);assert(CGLSetCurrentContext(ctx)==kCGLNoError);return ctx;
++}
++static GLuint program() {
++ const char* vs="#version 120\nuniform mat4 MatrixP; void main(){gl_Position=MatrixP*gl_Vertex;}";
++ const char* fs="#version 120\nvoid main(){if(gl_FragCoord.x<0.0)discard;gl_FragColor=vec4(1.0);}\n";
++ GLuint v=glCreateShader(GL_VERTEX_SHADER),f=glCreateShader(GL_FRAGMENT_SHADER);glShaderSource(v,1,&vs,nullptr);glCompileShader(v);glShaderSource(f,1,&fs,nullptr);glCompileShader(f);
++ GLuint p=glCreateProgram();glAttachShader(p,v);glAttachShader(p,f);glLinkProgram(p);GLint linked=0;glGetProgramiv(p,GL_LINK_STATUS,&linked);assert(linked);glDeleteShader(v);glDeleteShader(f);return p;
++}
++static std::vector<GLint> state() {
++ std::vector<GLint> v;GLint a[4];glGetIntegerv(GL_VIEWPORT,a);v.insert(v.end(),a,a+4);
++ for(GLenum e:{GL_ACTIVE_TEXTURE,GL_TEXTURE_BINDING_2D,GL_CURRENT_PROGRAM,GL_FRAMEBUFFER_BINDING_EXT,GL_PIXEL_PACK_BUFFER_BINDING,GL_PACK_ALIGNMENT,GL_PACK_ROW_LENGTH,GL_PACK_SKIP_ROWS,GL_PACK_SKIP_PIXELS,GL_PACK_SWAP_BYTES,GL_READ_BUFFER,GL_DEPTH_FUNC,GL_BLEND_SRC_RGB,GL_BLEND_DST_RGB,GL_BLEND_SRC_ALPHA,GL_BLEND_DST_ALPHA,GL_BLEND_EQUATION_RGB,GL_BLEND_EQUATION_ALPHA}) {glGetIntegerv(e,a);v.push_back(a[0]);}
++ for(GLenum e:{GL_BLEND,GL_DEPTH_TEST,GL_DEPTH_WRITEMASK}) {GLboolean b;glGetBooleanv(e,&b);v.push_back(b);}
++ GLdouble r[2];glGetDoublev(GL_DEPTH_RANGE,r);v.push_back(r[0]*1000);v.push_back(r[1]*1000);return v;
++}
++int main() {
++ auto c=context();GLuint tex,fbo,depth,pack;glGenTextures(1,&tex);glActiveTexture(GL_TEXTURE3);glBindTexture(GL_TEXTURE_2D,tex);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,32,32,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
++ glGenFramebuffersEXT(1,&fbo);glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,fbo);glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT,GL_COLOR_ATTACHMENT0_EXT,GL_TEXTURE_2D,tex,0);
++ glGenRenderbuffersEXT(1,&depth);glBindRenderbufferEXT(GL_RENDERBUFFER_EXT,depth);glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT,GL_DEPTH_COMPONENT24,32,32);glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT,GL_DEPTH_ATTACHMENT_EXT,GL_RENDERBUFFER_EXT,depth);assert(glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT)==GL_FRAMEBUFFER_COMPLETE_EXT);
++ glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);glViewport(3,4,16,12);glEnable(GL_BLEND);glBlendFuncSeparate(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA,GL_ONE,GL_ZERO);glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthRange(.2,.8);
++ glClearColor(.25,.5,.75,1);glClearDepth(.375);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);glDepthMask(GL_FALSE);
++ auto p=program();glUseProgram(p);float matrix[16]={2,0,0,0,0,3,0,0,0,0,4,0,5,6,7,1};glUniformMatrix4fv(glGetUniformLocation(p,"MatrixP"),1,GL_FALSE,matrix);
++ glGenBuffers(1,&pack);glBindBuffer(GL_PIXEL_PACK_BUFFER,pack);glBufferData(GL_PIXEL_PACK_BUFFER,8192,nullptr,GL_STREAM_READ);glPixelStorei(GL_PACK_ALIGNMENT,8);glPixelStorei(GL_PACK_ROW_LENGTH,33);glPixelStorei(GL_PACK_SKIP_ROWS,2);glPixelStorei(GL_PACK_SKIP_PIXELS,1);glPixelStorei(GL_PACK_SWAP_BYTES,GL_TRUE);
++ auto before=state();auto capture=capture_probe_frame();assert(capture.color.size()==16*12*4 && "capture must read actual current FBO viewport");assert(capture.depth.size()==16*12);assert(capture.color[0]>=63&&capture.color[0]<=64);assert(std::abs(capture.depth[0]-.375)<.001);assert(before==state()&&"gl_state_restored");
++ auto probe=inspect_draw("test");assert(probe.context_id!=0);assert(probe.shader_matrices.size()==1);assert(probe.shader_matrices[0].name=="MatrixP");assert(probe.shader_matrices[0].value[0]==2 && probe.shader_matrices[0].value[13]==6);assert(probe.shader_sources.size()==2&&"linked_shader_sources_must_be_fingerprinted");bool fragment=false;for(const auto& shader:probe.shader_sources){if(shader.type==GL_FRAGMENT_SHADER){fragment=true;assert(shader.source_available&&shader.contains_discard);assert(shader.sha256=="cefbc84fea6d2fb8cf35e56cf72316a5a782933e9c2a3fba2d801ec04a82126b");}}assert(fragment&&!probe.program_fingerprint.empty());assert(probe.target_id==(int)fbo);std::cerr<<"observed depth bits="<<probe.depth_bits<<"\n";assert(probe.depth_bits>=24);assert(glGetError()==GL_NO_ERROR);
++ char directory[]="/tmp/dstmc-gl-checkpoints-XXXXXX";assert(mkdtemp(directory));configure_probe(directory);std::ofstream(std::string(directory)+"/capture.request")<<"checkpoints 3 5\n";begin_present();for(int i=0;i<6;i++)after_draw("test-checkpoint");begin_present();std::string capture_prefix=std::string(directory)+"/ctx"+std::to_string(probe.context_id)+"-f1-d";assert(std::filesystem::exists(capture_prefix+"3.json")&&"requested_draw_checkpoint_must_be_captured");assert(std::filesystem::exists(capture_prefix+"5.json"));assert(!std::filesystem::exists(capture_prefix+"1.json")&&"explicit_selection_must_not_spend_budget_on_early_targets");
++ std::ofstream(std::string(directory)+"/capture.request")<<"checkpoints 1 2 3 4 5 6 7 8\n";begin_present();assert(std::filesystem::exists(std::string(directory)+"/request-error.json")&&"unbounded_checkpoint_request_must_be_rejected");std::ofstream(std::string(directory)+"/capture.request")<<"metadata\n";begin_present();after_draw("metadata-1");after_draw("metadata-2");begin_present();std::string metadata_prefix=std::string(directory)+"/ctx"+std::to_string(probe.context_id)+"-f4-d";assert(!std::filesystem::exists(metadata_prefix+"1.json")&&"metadata_request_must_not_capture_early_draws");assert(std::filesystem::exists(metadata_prefix+"2.json"));configure_probe("");std::filesystem::remove_all(directory);
++ glReadBuffer(GL_NONE);auto unreadable=capture_probe_frame();assert(unreadable.color.empty()&&"disabled_read_buffer_must_not_issue_readback");assert(unreadable.error=="disabled_read_buffer");assert(glGetError()==GL_NO_ERROR);glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
++ GLuint multisample,color_ms,depth_ms;glGenFramebuffersEXT(1,&multisample);glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,multisample);glGenRenderbuffersEXT(1,&color_ms);glBindRenderbufferEXT(GL_RENDERBUFFER_EXT,color_ms);glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER_EXT,4,GL_RGBA8,32,32);glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT,GL_COLOR_ATTACHMENT0_EXT,GL_RENDERBUFFER_EXT,color_ms);glGenRenderbuffersEXT(1,&depth_ms);glBindRenderbufferEXT(GL_RENDERBUFFER_EXT,depth_ms);glRenderbufferStorageMultisampleEXT(GL_RENDERBUFFER_EXT,4,GL_DEPTH_COMPONENT24,32,32);glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT,GL_DEPTH_ATTACHMENT_EXT,GL_RENDERBUFFER_EXT,depth_ms);assert(glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT)==GL_FRAMEBUFFER_COMPLETE_EXT);auto multi=capture_probe_frame();assert(multi.color.empty()&&"multisample_FBO_must_not_issue_readback");assert(multi.error=="multisample_framebuffer_requires_resolve");assert(glGetError()==GL_NO_ERROR);
++ auto old=probe.context_id;forget_context(c);CGLSetCurrentContext(nullptr);CGLDestroyContext(c);c=context();auto fresh=inspect_draw("new-context");assert(fresh.context_id!=old&&"context_recreated");assert(fresh.program==0);assert(fresh.target_id==0);forget_context(c);CGLSetCurrentContext(nullptr);CGLDestroyContext(c);
++ std::cout<<"PASS gl_state_restored shader_matrices actual_color_depth context_recreated\n";
++}
+diff --git a/native/tests/loader_test.mm b/native/tests/loader_test.mm
+new file mode 100644
+index 0000000..a87b121
+--- /dev/null
++++ b/native/tests/loader_test.mm
+@@ -0,0 +1,11 @@
++#import <Cocoa/Cocoa.h>
++#include <OpenGL/gl.h>
++#include <cassert>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <string>
++int main(){@autoreleasepool {
++ const char* dir=getenv("DSTMC_PROBE_DIR");assert(dir);std::ifstream loaded(std::string(dir)+"/loaded.json");assert(loaded.good()&&"native extension constructor must record loading");
++ NSOpenGLPixelFormatAttribute attrs[]={NSOpenGLPFAAccelerated,NSOpenGLPFADepthSize,24,0};NSOpenGLPixelFormat* pf=[[NSOpenGLPixelFormat alloc]initWithAttributes:attrs];NSOpenGLContext* c=[[NSOpenGLContext alloc]initWithFormat:pf shareContext:nil];assert(c);[c makeCurrentContext];glViewport(0,0,16,16);std::ofstream(std::string(dir)+"/capture.request")<<"1";[c flushBuffer];GLfloat v[]={0,0,0,1,0,0,0,1,0};glEnableClientState(GL_VERTEX_ARRAY);glVertexPointer(3,GL_FLOAT,0,v);glDrawArrays(GL_TRIANGLES,0,3);[c flushBuffer];std::ifstream draws(std::string(dir)+"/draws.jsonl");std::string line;std::getline(draws,line);assert(line.find("glDrawArrays")!=std::string::npos&&"imported draw hook must record actual draw");[NSOpenGLContext clearCurrentContext];[c release];[pf release];std::cout<<"PASS isolated_loader actual_NSOpenGL_present imported_draw_hook\n";
++}}
+diff --git a/native/tests/tools_test.py b/native/tests/tools_test.py
+new file mode 100644
+index 0000000..b35c3e9
+--- /dev/null
++++ b/native/tests/tools_test.py
+@@ -0,0 +1,63 @@
++import importlib.util, json, os, pathlib, subprocess, sys, tempfile, unittest
++ROOT=pathlib.Path(__file__).resolve().parents[2]
++spec=importlib.util.spec_from_file_location('preflight',ROOT/'tools/preflight.py')
++preflight=importlib.util.module_from_spec(spec);spec.loader.exec_module(preflight)
++capture_spec=importlib.util.spec_from_file_location('capture',ROOT/'tools/capture_render_probe.py')
++capture=importlib.util.module_from_spec(capture_spec);capture_spec.loader.exec_module(capture)
++class ToolsTest(unittest.TestCase):
++ def test_checkpoint_request_is_bounded(self):
++  self.assertEqual(capture.checkpoint_request('109,117,134,260'),'checkpoints 109 117 134 260\n')
++  for invalid in ('0','1,1','1,2,3,4,5,6,7,8','20001','x'):
++   with self.assertRaises(ValueError):capture.checkpoint_request(invalid)
++ def test_batch_preserves_previous_evidence_and_refuses_overwrite(self):
++  with tempfile.TemporaryDirectory() as d:
++   source=pathlib.Path(d);meta=source/'ctx1-f3-d2.json';meta.write_text(json.dumps({'color':'a.rgba','depth':'a.f32'}));(source/'a.rgba').write_bytes(b'color');(source/'a.f32').write_bytes(b'depth');(source/'summary.json').write_text('prior-summary')
++   destination=capture.write_batch(source,'late-scene',[meta],[{'frame_no':3}])
++   self.assertTrue((source/'late-scene'/'a.rgba').exists());self.assertEqual((destination/'a.f32').read_bytes(),b'depth');self.assertEqual((source/'summary.json').read_text(),'prior-summary')
++   with self.assertRaises(FileExistsError):capture.write_batch(source,'late-scene',[meta],[])
++
++ def test_capture_preserves_explicit_unsupported_target_reason(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=pathlib.Path(d);meta=root/'capture.json';(root/'color.rgba').write_bytes(b'');(root/'depth.f32').write_bytes(b'')
++   meta.write_text(json.dumps({'probe':{'viewport':[0,0,2,2]},'color':'color.rgba','depth':'depth.f32','error':'disabled_read_buffer'}))
++   with self.assertRaisesRegex(ValueError,'disabled_read_buffer'):capture.summarize_capture(meta)
++
++ def test_launcher_supplies_hint_and_cleans_owned_file_on_child_failure(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=pathlib.Path(d)
++   child="import pathlib,sys; assert pathlib.Path('steam_appid.txt').read_text().strip()=='322330'; sys.exit(17)"
++   self.assertEqual(preflight.run_game([sys.executable,'-c',child],root,os.environ.copy(),root/'log'),17)
++   self.assertFalse((root/'steam_appid.txt').exists())
++ def test_launcher_preserves_existing_matching_hint(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=pathlib.Path(d);hint=root/'steam_appid.txt';hint.write_text('322330');before=hint.stat()
++   self.assertEqual(preflight.run_game([sys.executable,'-c','raise SystemExit(17)'],root,os.environ.copy(),root/'log'),17)
++   self.assertEqual(hint.read_text(),'322330');self.assertEqual(hint.stat().st_ino,before.st_ino);self.assertEqual(hint.stat().st_mtime_ns,before.st_mtime_ns)
++ def test_launcher_rejects_wrong_existing_hint_before_child(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=pathlib.Path(d);hint=root/'steam_appid.txt';hint.write_text('999')
++   with self.assertRaisesRegex(ValueError,'steam_appid_mismatch'):
++    preflight.run_game([sys.executable,'-c',"open('child-ran','w').close()"],root,os.environ.copy(),root/'log')
++   self.assertEqual(hint.read_text(),'999');self.assertFalse((root/'child-ran').exists())
++ def test_launcher_keeps_hint_if_child_changed_it(self):
++  with tempfile.TemporaryDirectory() as d:
++   root=pathlib.Path(d)
++   child="import pathlib; pathlib.Path('steam_appid.txt').write_text('changed'); raise SystemExit(17)"
++   self.assertEqual(preflight.run_game([sys.executable,'-c',child],root,os.environ.copy(),root/'log'),17)
++   self.assertEqual((root/'steam_appid.txt').read_text(),'changed')
++ def test_preflight_missing_executable_blocks_launch(self):
++  result=subprocess.run([sys.executable,str(ROOT/'tools/preflight.py'),'--json','--executable','/nonexistent/dstmc-test'],capture_output=True,text=True)
++  self.assertNotEqual(result.returncode,0)
++  data=json.loads(result.stdout);self.assertIn('executable',data);self.assertFalse(data['executable']['exists']);self.assertFalse(data['ready']);self.assertIn('missing_executable',data['blockers'])
++ def test_capture_refuses_stale_or_absent_extension(self):
++  with tempfile.TemporaryDirectory() as d:
++   pathlib.Path(d,'loaded.json').write_text('{"pid":99999999}')
++   result=subprocess.run([sys.executable,str(ROOT/'tools/capture_render_probe.py'),'--seconds','0.1','--out',d],capture_output=True,text=True)
++   self.assertNotEqual(result.returncode,0);self.assertIn('extension_not_running',result.stdout);self.assertFalse(pathlib.Path(d,'capture.request').exists())
++ def test_launcher_dry_run_is_scoped_and_writes_no_evidence(self):
++  with tempfile.TemporaryDirectory() as d:
++   result=subprocess.run([str(ROOT/'tools/launch_dst.command'),'--dry-run','--executable',str(ROOT/'native/build/loader_test'),'--out',d],capture_output=True,text=True)
++   self.assertEqual(result.returncode,0,result.stderr+result.stdout);data=json.loads(result.stdout)
++   self.assertEqual(data['environment']['DYLD_INSERT_LIBRARIES'],str(ROOT/'native/build/libdstmc_probe.dylib'))
++   self.assertEqual(data['working_directory'],str(pathlib.Path(data['executable']).parent.parent/'data'));self.assertEqual(list(pathlib.Path(d).iterdir()),[])
++if __name__=='__main__': unittest.main()
+diff --git a/tools/capture_render_probe.py b/tools/capture_render_probe.py
+new file mode 100644
+index 0000000..82b6653
+--- /dev/null
++++ b/tools/capture_render_probe.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""Request two bounded frames from the loaded extension, retaining raw GL evidence."""
++import argparse, hashlib, json, math, os, pathlib, shutil, struct, sys, time, zlib
++
++def png(path,width,height,rgba):
++ def chunk(tag,data):return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
++ rows=b''.join(b'\0'+rgba[y*width*4:(y+1)*width*4] for y in range(height-1,-1,-1))
++ path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(rows))+chunk(b'IEND',b''))
++def summarize_capture(meta_path):
++ meta=json.loads(meta_path.read_text());p=meta['probe'];w,h=p['viewport'][2:];base=meta_path.parent
++ if not (0<w<=1920 and 0<h<=1080):raise ValueError('unsupported viewport')
++ color=(base/meta['color']).read_bytes();depth=(base/meta['depth']).read_bytes()
++ if len(color)!=w*h*4:raise ValueError(meta.get('error') or 'incomplete color capture')
++ png(meta_path.with_suffix('.png'),w,h,color)
++ result={'metadata':meta_path.name,'frame_no':p['frame_no'],'draw_no':p['draw_no'],'stage':p['stage'],'viewport':p['viewport'],'target_id':p['target_id'],'program':p['program'],'error':meta.get('error'),'color_sha256':hashlib.sha256(color).hexdigest(),'depth_sha256':hashlib.sha256(depth).hexdigest()}
++ if depth:
++  if len(depth)!=w*h*4:raise ValueError('incomplete depth capture')
++  values=struct.unpack('<'+'f'*(w*h),depth);finite=sorted(x for x in values if math.isfinite(x));result['depth_stats']={'finite':len(finite),'total':w*h,'min':finite[0] if finite else None,'max':finite[-1] if finite else None,'below_clear_one':sum(x<.999999 for x in finite),'distinct_values':len(set(finite))}
++  view=bytearray()
++  for x in values:
++   level=round(max(0,min(1,x))*255) if math.isfinite(x) else 0;view.extend((level,level,level,255))
++  png(meta_path.with_name(meta_path.stem+'-depth.png'),w,h,view)
++ return result
++
++def checkpoint_request(value):
++ values=[int(x) for x in value.split(',')]
++ if not 1<=len(values)<=7 or len(set(values))!=len(values) or any(x<1 or x>20000 for x in values):raise ValueError('checkpoints require 1 to 7 unique draws in 1..20000')
++ return 'checkpoints '+' '.join(str(x) for x in values)+'\n'
++def write_batch(source,name,metas,draws):
++ if not name or pathlib.Path(name).name!=name or name in ('.','..'):raise ValueError('batch must be one directory name')
++ destination=source/name;destination.mkdir(exist_ok=False)
++ for meta in metas:
++  data=json.loads(meta.read_text())
++  for path in [meta,source/data['color'],source/data['depth'],meta.with_suffix('.png'),meta.with_name(meta.stem+'-depth.png')]:
++   if path.exists():shutil.copy2(path,destination/path.name)
++ for name in ('preflight.json','loaded.json'):
++  if (source/name).exists():shutil.copy2(source/name,destination/name)
++ (destination/'draws.jsonl').write_text(''.join(json.dumps(d)+'\n' for d in draws))
++ return destination
++
++def main():
++ p=argparse.ArgumentParser();p.add_argument('--seconds',type=float,default=10);p.add_argument('--metadata-only',action='store_true',help='record all draw metadata and only two before-present images');p.add_argument('--draws',help='1 to 7 comma-separated draw endpoints from a prior sample');p.add_argument('--batch',help='new evidence subdirectory; never overwritten');p.add_argument('--out',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'evidence/render-probe');a=p.parse_args();out=a.out.resolve()
++ try:
++  loaded=json.loads((out/'loaded.json').read_text());pid=loaded['pid'];os.kill(pid,0)
++ except (OSError,ValueError,KeyError):print(json.dumps({'error':'extension_not_running','out':str(out)}));return 1
++ if not 0<a.seconds<=60:print(json.dumps({'error':'seconds_must_be_in_0_60'}));return 1
++ # Reject stale PID reuse / stalled presentation; process existence alone is insufficient.
++ heartbeat=out/'heartbeat.json'
++ try:
++  beat=json.loads(heartbeat.read_text());assert beat['pid']==pid and time.time()-heartbeat.stat().st_mtime<5
++ except (OSError,ValueError,KeyError,AssertionError):print(json.dumps({'error':'no_fresh_present_heartbeat'}));return 1
++ try:
++  if a.metadata_only and a.draws:raise ValueError('metadata-only and draws are mutually exclusive')
++  request='metadata\n' if a.metadata_only else checkpoint_request(a.draws) if a.draws else 'default\n'
++  if a.batch and (pathlib.Path(a.batch).name!=a.batch or a.batch in ('.','..') or (out/a.batch).exists()):raise ValueError('batch must be a new directory name')
++ except ValueError as error:print(json.dumps({'error':str(error)}));return 1
++ start=time.time();(out/'capture.request').write_text(request);time.sleep(a.seconds)
++ captures=[];errors=[];metas=[]
++ for path in sorted(out.glob('ctx*-f*-d*.json')):
++  if path.stat().st_mtime<start:continue
++  metas.append(path)
++  try:captures.append(summarize_capture(path))
++  except (OSError,ValueError,KeyError) as error:errors.append({'file':path.name,'error':str(error)})
++ frames={(x['frame_no']) for x in captures};draws=[]
++ if (out/'draws.jsonl').exists():
++  for line in (out/'draws.jsonl').read_text().splitlines():
++   try:d=json.loads(line)
++   except ValueError:continue
++   if d['frame_no'] in frames:draws.append(d)
++ groups={}
++ for d in draws:
++  key=(d['context_id'],d['program'],d['target_id'],d['depth_enabled'],d['depth_mask'])
++  g=groups.setdefault(key,{'context_id':key[0],'program':key[1],'target_id':key[2],'depth_enabled':key[3],'depth_mask':key[4],'draw_count':0,'uniform_names':set(),'classification':'unverified','first_draw':d['draw_no'],'last_draw':d['draw_no']});g['draw_count']+=1;g['last_draw']=d['draw_no'];g['uniform_names'].update(m['name'] for m in d['shader_matrices']);g['program_fingerprint']=d.get('program_fingerprint','');g['shader_sources']=d.get('shader_sources',[]);g['classification_evidence']='Observed target/depth state and draw range only; scene/UI requires matching captured images. Source discard token is not proof that its branch executed.';g['sample_matrices']=d['shader_matrices'];g['stage']=d['stage']
++ preflight=json.loads((out/'preflight.json').read_text()) if (out/'preflight.json').exists() else {}
++ destination=write_batch(out,a.batch,metas,draws) if a.batch else out
++ identification={'schema':1,'executable_sha256':preflight.get('executable',{}).get('sha256'),'extension_sha256':preflight.get('extension',{}).get('sha256'),'runtime_pid':pid,'accepted':False,'reason':'Manual ground/tree/creature/UI and alpha-edge review required; depth statistics alone are insufficient.','groups':[{**g,'uniform_names':sorted(g['uniform_names'])} for g in groups.values()]}
++ (destination/'identification.json').write_text(json.dumps(identification,indent=2));summary={'schema':1,'requested_at':start,'seconds':a.seconds,'pid':pid,'draw_count':len(draws),'capture_count':len(captures),'captures':captures,'errors':errors,'requested_draws':a.draws,'runtime_acceptance':'pending_manual_scene_and_alpha_review'};(destination/'summary.json').write_text(json.dumps(summary,indent=2));print(json.dumps({'capture_count':len(captures),'draw_count':len(draws),'errors':errors,'out':str(destination)}));return 0 if captures and draws and not errors else 1
++if __name__=='__main__':sys.exit(main())
+diff --git a/tools/launch_dst.command b/tools/launch_dst.command
+new file mode 100755
+index 0000000..9e904ed
+--- /dev/null
++++ b/tools/launch_dst.command
+@@ -0,0 +1,4 @@
++#!/bin/zsh
++set -eu
++SCRIPT_DIR="${0:A:h}"
++exec /usr/bin/env python3 "$SCRIPT_DIR/preflight.py" --launch "$@"
+diff --git a/tools/preflight.py b/tools/preflight.py
+new file mode 100644
+index 0000000..82f9005
+--- /dev/null
++++ b/tools/preflight.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""Read-only, narrowly scoped DST launch checks. No account config or save content is read."""
++import argparse, contextlib, hashlib, json, os, pathlib, plistlib, socket, subprocess, sys, time
++ROOT=pathlib.Path(__file__).resolve().parents[1]
++DEFAULT_EXE=pathlib.Path.home()/"Library/Application Support/Steam/steamapps/common/Don't Starve Together/dontstarve_steam.app/Contents/MacOS/dontstarve_steam"
++DEFAULT_CLUSTER=pathlib.Path.home()/'Documents/Klei/DoNotStarveTogether/434082735/Cluster_1'
++def command(args):
++ p=subprocess.run(args,capture_output=True,text=True);return p.returncode,p.stdout,p.stderr
++def sha256(path):
++ h=hashlib.sha256()
++ with open(path,'rb') as f:
++  for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
++ return h.hexdigest()
++def processes(executable):
++ code,out,_=command(['/bin/ps','-axo','pid=,comm='])
++ if code:return None
++ result=[]
++ for line in out.splitlines():
++  fields=line.strip().split(None,1)
++  if len(fields)==2 and fields[1]==str(executable):result.append(int(fields[0]))
++ return result
++def preflight(executable,cluster):
++ executable=pathlib.Path(executable).resolve();library=ROOT/'native/build/libdstmc_probe.dylib';exists=executable.is_file();blockers=[]
++ e={'path':str(executable),'exists':exists,'executable_permission':os.access(executable,os.X_OK)}
++ entitlements={}
++ if exists:
++  e['sha256']=sha256(executable);e['architecture']=command(['/usr/bin/lipo','-archs',str(executable)])[1].strip()
++  _,out,err=command(['/usr/bin/codesign','-d','--entitlements',':-',str(executable)])
++  for raw in (out,err):
++   start=raw.find('<?xml');end=raw.find('</plist>')
++   if start>=0 and end>=start:
++    try:entitlements=plistlib.loads(raw[start:end+8].encode())
++    except (ValueError,plistlib.InvalidFileException):pass
++  if 'x86_64' not in e['architecture']:blockers.append('unsupported_architecture')
++  if not e['executable_permission']:blockers.append('not_executable')
++ else:blockers.append('missing_executable')
++ pids=processes(executable)
++ if pids is None:blockers.append('process_status_unknown')
++ elif pids:blockers.append('dst_already_running')
++ ports={}
++ for port in (39379,39380):
++  with socket.socket() as s:
++   try:s.bind(('127.0.0.1',port));ports[str(port)]='available'
++   except OSError:ports[str(port)]='in_use_protocol_not_inferred'
++ # Task 2 opens no HTTP listener; port occupancy is evidence, not a launch blocker.
++ locks=sorted(str(p.relative_to(cluster)) for p in cluster.rglob('*') if p.is_file() and (p.name.endswith('.lock') or p.name.lower()=='lock')) if cluster.is_dir() else []
++ lib={'path':str(library),'exists':library.is_file()}
++ if library.is_file():lib['sha256']=sha256(library);lib['architecture']=command(['/usr/bin/lipo','-archs',str(library)])[1].strip()
++ else:blockers.append('missing_extension')
++ return {'schema':1,'timestamp':time.time(),'ready':not blockers,'blockers':blockers,'executable':e,'extension':lib,'permissions':{'allow_dyld_environment_variables':entitlements.get('com.apple.security.cs.allow-dyld-environment-variables'),'disable_library_validation':entitlements.get('com.apple.security.cs.disable-library-validation')},'process_ids':pids,'ports':ports,'save_lock':{'cluster':str(cluster),'status':'unknown','matching_lock_filenames':locks,'note':'No reliable engine save-lock API; absent lock files do not establish unlocked status.'}}
++@contextlib.contextmanager
++def steam_app_id_hint(cwd):
++ """Steamworks debugger hint; ownership checked before cleanup, never overwritten."""
++ path=pathlib.Path(cwd)/'steam_appid.txt';owned=None;content=b'322330\n'
++ try:
++  fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
++ except FileExistsError:
++  if path.read_text().strip()!='322330':raise ValueError('steam_appid_mismatch')
++ else:
++  owned=os.fstat(fd)
++  with os.fdopen(fd,'wb') as stream:stream.write(content)
++ try:yield
++ finally:
++  if owned is not None:
++   try:
++    current=path.lstat()
++    if (current.st_dev,current.st_ino)==(owned.st_dev,owned.st_ino) and path.read_bytes()==content:path.unlink()
++   except FileNotFoundError:pass
++
++def run_game(argv,cwd,environment,log_path):
++ with steam_app_id_hint(cwd):
++  with open(log_path,'ab') as log:return subprocess.run(argv,cwd=cwd,env=environment,stdout=log,stderr=log).returncode
++
++def main():
++ p=argparse.ArgumentParser();p.add_argument('--json',action='store_true');p.add_argument('--executable',type=pathlib.Path,default=DEFAULT_EXE);p.add_argument('--cluster',type=pathlib.Path,default=DEFAULT_CLUSTER);p.add_argument('--launch',action='store_true');p.add_argument('--dry-run',action='store_true');p.add_argument('--out',type=pathlib.Path,default=ROOT/'evidence/render-probe');a=p.parse_args()
++ result=preflight(a.executable,a.cluster);exe=result['executable']['path'];out=a.out.resolve();environment={'DYLD_INSERT_LIBRARIES':result['extension']['path'],'DSTMC_PROBE_DIR':str(out)};cwd=str(pathlib.Path(exe).parent.parent/'data')
++ if a.dry_run:print(json.dumps({'executable':exe,'working_directory':cwd,'environment':environment,'preflight':result},indent=2));return 0 if result['ready'] else 1
++ if not a.launch or not result['ready']:print(json.dumps(result,indent=2));return 0 if result['ready'] else 1
++ out.mkdir(parents=True,exist_ok=True)
++ # Each launch must use a new evidence directory, preserving earlier samples.
++ if (out/'loaded.json').exists():print(json.dumps({'error':'choose_fresh_evidence_directory'}));return 1
++ (out/'preflight.json').write_text(json.dumps(result,indent=2));env=os.environ.copy();env.update(environment)
++ # Wait for this child so the documented Steam app-id hint can be cleaned safely.
++ try:return run_game([exe],cwd,env,out/'launch.log')
++ except (OSError,ValueError) as error:print(json.dumps({'error':str(error)}));return 1
++if __name__=='__main__':sys.exit(main())

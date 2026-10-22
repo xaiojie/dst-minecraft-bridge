@@ -1,0 +1,9 @@
+name = "DST MC Temporary Bridge Probe"
+description = "Temporary feasibility experiment for a NEW local test world. Runs one real MC TNT test against a marked pig target. No combined rendering yet."
+author = "Jay"
+version = "0.0.1-probe"
+api_version = 10
+dst_compatible = true
+dont_starve_compatible = false
+client_only_mod = false
+all_clients_require_mod = true

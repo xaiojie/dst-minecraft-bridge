@@ -1,0 +1,54 @@
+{
+  "stone": {
+    "width": 1920,
+    "height": 1080,
+    "file_length": 24883208,
+    "expected_length": 24883208,
+    "clear_alpha_pixels": 2001786,
+    "opaque_pixels": 70636,
+    "block_center": {
+      "rgba": [
+        32,
+        32,
+        56,
+        255
+      ],
+      "depth": 0.9812781810760498
+    },
+    "background": {
+      "rgba": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "depth": 1.0
+    }
+  },
+  "removed-stone": {
+    "width": 1920,
+    "height": 1080,
+    "file_length": 24883208,
+    "expected_length": 24883208,
+    "clear_alpha_pixels": 2073600,
+    "opaque_pixels": 0,
+    "block_center": {
+      "rgba": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "depth": 1.0
+    },
+    "background": {
+      "rgba": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "depth": 1.0
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-22T22:12:00.097708+08:00",
+  "remote": "https://github.com/papa-a11y/dst-minecraft-bridge.git",
+  "last_reviewed_base": "676d46ac8fdc8417f98b002e5095f417f4157aa5",
+  "unreviewed_axis_wip_commit": "aae1cc67482da12a7438f16758573ff049667a52",
+  "task_status": {
+    "1": "complete_reviewed",
+    "2": "complete_reviewed",
+    "3": "complete_reviewed",
+    "4": "incomplete_axis_wip_unreviewed_not_deployed",
+    "5": "not_started",
+    "6": "not_started",
+    "7": "not_started",
+    "8": "not_started"
+  },
+  "known_unfixed_blockers": [
+    "Lua mc_origin=(.5,64,.5), Java requires (0,64,0)",
+    "Lua region=first-person-test, Java requires ground"
+  ],
+  "runtime_at_handoff": "DST and MC game processes absent on fresh handoff inspection; do not reuse historical PIDs",
+  "native_verified_runtime_sha256": "8079000eb6e56fa915e91fe1d5c6ae465e5eeaf494b1efced3480f0c2737a77d",
+  "native_axis_wip_candidate_sha256": "5fb38399c52eae3189957cae33b41cdd3ae0c6091941b766487471792d8bd2e0",
+  "raw_assets_worlds_full_evidence": "local external archive only",
+  "fresh_code_tests_for_handoff": "not rerun; preserved historical results with explicit scope",
+  "steam_old_launch_options": "user cleared and empty value independently observed"
+}

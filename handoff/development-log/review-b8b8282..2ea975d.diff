@@ -1,0 +1,2364 @@
+# Review package: b8b82820017427c6069c058d194e5fb007700264..2ea975d63592f11a263462550a7a5da5fbf41419
+
+## Commits
+2ea975d wip: implement first-person compositor pending real graphics gate
+
+## Files changed
+ dst-mod/modinfo.lua                                |  12 +
+ dst-mod/modmain.lua                                |  15 +
+ dst-mod/scripts/components/dstmcidentity.lua       |  20 +
+ dst-mod/scripts/dstmc/camera.lua                   |  61 +++
+ dst-mod/scripts/dstmc/connection.lua               |  86 ++++
+ dst-mod/scripts/dstmc/world.lua                    |  11 +
+ .../java/dev/jay/dstmc/client/BridgeClient.java    |   3 +-
+ .../java/dev/jay/dstmc/client/FrameCapture.java    |  35 +-
+ .../dev/jay/dstmc/client/PassthroughWindow.java    |  85 ++++
+ .../jay/dstmc/client/mixin/WindowCreateMixin.java  |  11 +
+ .../jay/dstmc/client/mixin/WindowPresentMixin.java |  11 +
+ .../resources/dst_mc_bridge.client.mixins.json     |  17 +-
+ native/Makefile                                    |  19 +-
+ native/include/camera_http.h                       |  11 +
+ native/include/camera_service.h                    |  39 ++
+ native/include/compositor.h                        |  57 +++
+ native/src/camera_http.mm                          | 438 +++++++++++++++++++++
+ native/src/camera_service.cpp                      |  93 +++++
+ native/src/compositor.mm                           | 250 ++++++++++++
+ native/src/entry.mm                                | 218 ++++++++--
+ native/src/scene_depth.mm                          | 130 ++++++
+ native/tests/compositor_test.mm                    | 240 +++++++++++
+ native/tests/lease_test.cpp                        |  61 +++
+ tests/test_first_person_gate.py                    | 178 +++++++++
+ 24 files changed, 2071 insertions(+), 30 deletions(-)
+
+## Diff
+diff --git a/dst-mod/modinfo.lua b/dst-mod/modinfo.lua
+new file mode 100644
+index 0000000..c08fcaf
+--- /dev/null
++++ b/dst-mod/modinfo.lua
+@@ -0,0 +1,12 @@
++name = "DST MC First Person Gate"
++description = "Local test-world camera and graphics gate. Requires the dedicated native launcher."
++author = "Jay"
++version = "0.4.0"
++api_version = 10
++dst_compatible = true
++all_clients_require_mod = false
++client_only_mod = false
++server_only_mod = false
++configuration_options = {
++    {name="connect", label="Pair with local MC test world", options={{description="Calibration only",data=false},{description="Connect",data=true}}, default=false},
++}
+diff --git a/dst-mod/modmain.lua b/dst-mod/modmain.lua
+new file mode 100644
+index 0000000..b8145a1
+--- /dev/null
++++ b/dst-mod/modmain.lua
+@@ -0,0 +1,15 @@
++local G=GLOBAL
++AddPrefabPostInit("world",function(inst)
++    if inst.ismastersim and not inst:HasTag("cave") and not G.TheNet:IsDedicated() then inst:AddComponent("dstmcidentity") end
++end)
++AddPlayerPostInit(function(player)
++    player:DoTaskInTime(0,function()
++        if player~=G.ThePlayer or not G.require("dstmc/world").LocalWorld() then return end
++        local connection=G.require("dstmc/connection")
++        connection.Start(GetModConfigData("connect"))
++        G.rawset(G,"DSTMCFirstPersonCalibrate",function() return G.require("dstmc/camera").Calibrate() end)
++        G.rawset(G,"DSTMCFirstPersonRelease",connection.Release)
++        player:ListenForEvent("onremove",connection.Release)
++        G.print("DSTMC_GATE_READY calibration available; connect="..G.tostring(GetModConfigData("connect")))
++    end)
++end)
+diff --git a/dst-mod/scripts/components/dstmcidentity.lua b/dst-mod/scripts/components/dstmcidentity.lua
+new file mode 100644
+index 0000000..c02d32b
+--- /dev/null
++++ b/dst-mod/scripts/components/dstmcidentity.lua
+@@ -0,0 +1,20 @@
++local function uuid()
++    return ("xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"):gsub("[xy]", function(c)
++        return string.format("%x", c == "x" and math.random(0, 15) or math.random(8, 11))
++    end)
++end
++local Identity = Class(function(self, inst)
++    self.inst = inst
++    self.world_uuid = uuid()
++    self.shard = tostring(TheShard:GetShardId())
++end)
++function Identity:OnSave() return {world_uuid=self.world_uuid, shard=self.shard} end
++function Identity:OnLoad(data)
++    if data and type(data.world_uuid) == "string" and data.world_uuid:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
++        self.world_uuid = data.world_uuid
++    end
++    -- Shard identity is the actual loaded shard; a copied cave cannot impersonate Master.
++    self.shard = tostring(TheShard:GetShardId())
++end
++Identity.NewUUID = uuid
++return Identity
+diff --git a/dst-mod/scripts/dstmc/camera.lua b/dst-mod/scripts/dstmc/camera.lua
+new file mode 100644
+index 0000000..1c0248a
+--- /dev/null
++++ b/dst-mod/scripts/dstmc/camera.lua
+@@ -0,0 +1,61 @@
++local M = {}
++local lease, expires, installed, calibration = nil, 0, nil, nil
++local hidden_player, saved_alpha = nil, nil
++local now = GetTimeRealSeconds
++local function finite(n) return type(n)=="number" and n==n and n~=math.huge and n~=-math.huge end
++local function vector(v) return type(v)=="table" and finite(v.x) and finite(v.y) and finite(v.z) end
++local function restore_avatar()
++    if hidden_player and hidden_player:IsValid() and hidden_player.AnimState then
++        local r,g,b,a=hidden_player.AnimState:GetMultColour()
++        if a==0 then hidden_player.AnimState:SetMultColour(r,g,b,saved_alpha) end
++    end
++    hidden_player=nil;saved_alpha=nil
++end
++local function hide_avatar()
++    if hidden_player~=ThePlayer then restore_avatar() end
++    if ThePlayer and ThePlayer:IsValid() and ThePlayer.AnimState then
++        local r,g,b,a=ThePlayer.AnimState:GetMultColour()
++        if hidden_player==nil or a~=0 then saved_alpha=a end
++        hidden_player=ThePlayer
++        -- Render tint only: entity visibility is queried by AI and must stay unchanged.
++        hidden_player.AnimState:SetMultColour(r,g,b,0)
++    end
++end
++local function apply(p)
++    hide_avatar()
++    TheSim:SetCameraPos(p.position.x,p.position.y,p.position.z)
++    TheSim:SetCameraDir(p.forward.x,p.forward.y,p.forward.z)
++    TheSim:SetCameraUp(p.up.x,p.up.y,p.up.z)
++    TheSim:SetCameraFOV(2 * math.atan(1 / p.projection[6]) * 180 / math.pi)
++end
++function M.ApplyLease(value)
++    local p = value and value.pose
++    if not p or p.space~="DST" or not vector(p.position) or not vector(p.forward) or not vector(p.up) or type(p.projection)~="table" or not finite(p.projection[6]) or p.projection[6]<=0 then return false end
++    lease=value;expires=now()+.20
++    return true
++end
++function M.Release() lease=nil;expires=0;calibration=nil;restore_avatar() end
++function M.Key() return lease and lease.key end
++function M.Calibrate()
++    local p = require("dstmc/world").Origin()
++    if not p then return false end
++    M.Release()
++    -- Bounded, no handshake and no saved transform. Fixed right/up landmarks can be compared.
++    p.y=p.y+2
++    calibration={position=p,forward={x=0,y=0,z=-1},up={x=0,y=1,z=0},projection={1,0,0,0,0,1,0,0,0,0,-1,-1,0,0,-2,0}}
++    expires=now()+12
++    print("DSTMC_CALIBRATION "..require("json").encode(calibration))
++    return true
++end
++function M.Install(onupdate)
++    if TheCamera == nil or installed == TheCamera then return end
++    installed=TheCamera
++    local original=installed.Update
++    installed.Update=function(self,...)
++        original(self,...)
++        if now()>=expires then M.Release() end
++        if calibration then apply(calibration) elseif lease then apply(lease.pose) end
++        onupdate()
++    end
++end
++return M
+diff --git a/dst-mod/scripts/dstmc/connection.lua b/dst-mod/scripts/dstmc/connection.lua
+new file mode 100644
+index 0000000..3d1bf36
+--- /dev/null
++++ b/dst-mod/scripts/dstmc/connection.lua
+@@ -0,0 +1,86 @@
++local json = require("json")
++local world = require("dstmc/world")
++local camera = require("dstmc/camera")
++local Identity = require("components/dstmcidentity")
++local M = {}
++local session, generation, pending, camera_pending, last_exchange, enabled = nil,0,false,false,0,false
++local now = GetTimeRealSeconds
++local function request(port,path,body,callback)
++    TheSim:QueryServer("http://127.0.0.1:"..port..path,function(raw,success,code)
++        local ok,value=pcall(json.decode,raw or "")
++        callback(success and code==200 and ok and value or nil)
++    end,body and "POST" or "GET",body and json.encode(body) or nil)
++end
++local function samekey(a,b)
++    if not a or not b or a.id~=b.id or a.epoch~=b.epoch or not a.pair or not b.pair then return false end
++    for _,field in ipairs({"dst_world","dst_shard","mc_world","mc_dimension","region"}) do
++        if a.pair[field]~=b.pair[field] then return false end
++    end
++    return true
++end
++function M.Release()
++    enabled=false
++    generation=generation+1
++    local key=camera.Key()
++    camera.Release()
++    if session and key then request(39380,"/v2/camera/applied",{protocol=2,pair=session.pair,epoch=session.epoch,key=key,applied=false},function() end) end
++    session=nil
++end
++local function handshake()
++    if pending then return end
++    local identity=world.LocalWorld()
++    if not identity then return end
++    pending=true;local token=generation
++    request(39379,"/v2/status",nil,function(status)
++        if token~=generation then pending=false;return end
++        if not status or status.protocol~=2 or status.fixture or not status.mc_world then pending=false;return end
++        local pair={dst_world=identity.world_uuid,dst_shard=identity.shard,mc_world=status.mc_world,mc_dimension="dst_mc_bridge:stage",region="first-person-test"}
++        local epoch=Identity.NewUUID()
++        request(39379,"/v2/handshake",{protocol=2,pair=pair,epoch=epoch,dst_origin=world.Origin(),mc_origin={x=.5,y=64,z=.5}},function(value)
++            pending=false
++            if token~=generation then return end
++            if value and value.epoch==epoch and value.pair.dst_world==identity.world_uuid then session=value;print("DSTMC_PAIRED "..json.encode(value.pair)) end
++        end)
++    end)
++end
++local function updatecamera()
++    if camera_pending or not session then return end
++    camera_pending=true;local token=generation;local expected=session
++    request(39379,"/v2/status",nil,function(status)
++        if token~=generation or session~=expected then camera_pending=false;return end
++        if not status or status.epoch~=expected.epoch or not status.latest_frame then camera_pending=false;M.Release();return end
++        local key=status.latest_frame
++        request(39380,"/v2/camera/lease",{protocol=2,pair=expected.pair,epoch=expected.epoch,key=key},function(value)
++            if token~=generation or session~=expected then camera_pending=false;return end
++            if not value or not value.lease or not samekey(value.lease.key,key) then camera_pending=false;return end
++            if not camera.ApplyLease(value.lease) then camera_pending=false;M.Release();return end
++            -- The wrapper applies this pose on the next camera update, then confirms it there.
++            M.ack={key=key,session=expected,generation=token}
++        end)
++    end)
++end
++function M.Update()
++    if not enabled or not world.LocalWorld() then return end
++    if M.ack then
++        local ack=M.ack;M.ack=nil
++        if ack.generation==generation and samekey(camera.Key(),ack.key) then
++            request(39380,"/v2/camera/applied",{protocol=2,pair=ack.session.pair,epoch=ack.session.epoch,key=ack.key,applied=true},function(value)
++                camera_pending=false
++                if ack.generation==generation and (not value or not value.accepted) then camera.Release() end
++            end)
++        else camera_pending=false end
++    end
++    if not session then if now()-last_exchange>=1 then last_exchange=now();handshake() end;return end
++    updatecamera()
++    if not pending and now()-last_exchange>=.05 then
++        pending=true;last_exchange=now();local token=generation
++        request(39379,"/v2/exchange",{protocol=2,pair=session.pair,epoch=session.epoch,commands={},damage_events={}},function(value)
++            pending=false;if token==generation and not value then M.Release() end
++        end)
++    end
++end
++function M.Start(connect)
++    enabled=connect
++    camera.Install(M.Update)
++end
++return M
+diff --git a/dst-mod/scripts/dstmc/world.lua b/dst-mod/scripts/dstmc/world.lua
+new file mode 100644
+index 0000000..855e602
+--- /dev/null
++++ b/dst-mod/scripts/dstmc/world.lua
+@@ -0,0 +1,11 @@
++local M = {}
++function M.LocalWorld()
++    if TheWorld == nil or not TheWorld.ismastersim or TheWorld:HasTag("cave") or TheNet:IsDedicated() or ThePlayer == nil then return nil end
++    return TheWorld.components.dstmcidentity
++end
++function M.Origin()
++    if ThePlayer == nil then return nil end
++    local x,y,z = ThePlayer.Transform:GetWorldPosition()
++    return {x=x,y=y,z=z}
++end
++return M
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java b/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java
+index 1ae759a..8ec549f 100644
+--- a/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java
++++ b/mc/src/client/java/dev/jay/dstmc/client/BridgeClient.java
+@@ -6,19 +6,20 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+ import net.minecraft.client.Minecraft;
+ import static dev.jay.dstmc.protocol.BridgeTypes.*;
+ public final class BridgeClient implements ClientModInitializer {
+     private String lastScreen="";
+     public static final FrameCapture CAPTURE=new FrameCapture();
+     public static Pose renderPose;
+     public static boolean active(){var mc=Minecraft.getInstance();var bridge=BridgeMod.server;return bridge!=null && bridge.active()!=null && mc.level!=null && mc.level.dimension().equals(BridgeServer.STAGE);}
+     @Override public void onInitializeClient(){
+         ClientTickEvents.END_CLIENT_TICK.register(mc->{
++            PassthroughWindow.tick();
+             if(Boolean.getBoolean("dstmc.frameFixture")){
+                 String screen=mc.screen==null?"game":mc.screen.getClass().getName()+": "+mc.screen.getTitle().getString();
+                 if(!screen.equals(lastScreen)){org.slf4j.LoggerFactory.getLogger("dstmc-fixture").info("Fixture screen: {}",screen);lastScreen=screen;}
+             }
+             if(BridgeMod.server!=null){mc.options.pauseOnLostFocus=false;mc.options.bobView().set(false);mc.options.screenEffectScale().set(0.0);mc.options.renderDistance().set(4);}
+         });
+-        ClientLifecycleEvents.CLIENT_STOPPING.register(mc->CAPTURE.close());
++        ClientLifecycleEvents.CLIENT_STOPPING.register(mc->{PassthroughWindow.restore();CAPTURE.close();});
+     }
+ }
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java b/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java
+index 62ef7f5..661feb5 100644
+--- a/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java
++++ b/mc/src/client/java/dev/jay/dstmc/client/FrameCapture.java
+@@ -12,58 +12,87 @@ import org.lwjgl.opengl.*;
+ import org.lwjgl.system.MemoryUtil;
+ import java.nio.*;
+ 
+ /** Synchronous GL readback: glReadPixels returns only after the current GPU writes
+  * complete. No callback can publish partially filled buffers. GL state restored. */
+ public final class FrameCapture implements AutoCloseable {
+     private FramePublisher publisher;
+     private WorldExchange.HandshakeResult session;
+     private long context,generation;
+     private int width,height;
+-    private ByteBuffer color,depth,hud;
++    private ByteBuffer color,depth,hud,display;
+     public void captureWorld(Pose pose){
+         if(!BridgeClient.active()||pose==null){close();return;}
+         var mc=Minecraft.getInstance();var target=mc.getMainRenderTarget();var bridge=BridgeMod.server;
+         try {
+             long current=GLFW.glfwGetCurrentContext();
+-            if(publisher==null||session!=bridge.active()||context!=current){close();session=bridge.active();context=current;publisher=new FramePublisher(bridge.framesDirectory(),session.pair(),session.epoch(),session.transform());}
++            if(publisher==null||session!=bridge.active()){close();session=bridge.active();context=current;publisher=new FramePublisher(bridge.framesDirectory(),session.pair(),session.epoch(),session.transform());}
++            else if(context!=current){
++                // The CPU publisher owns epoch-wide IDs, independent of the GL context.
++                // Recreate readback buffers and generation without resetting those IDs.
++                releaseBuffers();context=current;bridge.invalidateStream();
++            }
+             if(width!=target.width||height!=target.height){
+                 releaseBuffers();FrameLayout.layerBytes(target.width,target.height);width=target.width;height=target.height;
+                 publisher.resize(width,height);generation=publisher.generation();bridge.invalidateStream();int bytes=FrameLayout.layerBytes(width,height);
+                 color=MemoryUtil.memAlloc(bytes);depth=MemoryUtil.memAlloc(bytes).order(ByteOrder.LITTLE_ENDIAN);hud=MemoryUtil.memAlloc(bytes);
+             }
+             read(target,true,color,depth);
+             // The clear and normal MC blend state already produce premultiplied color.
+             zeroTransparent(color);publisher.world(generation,pose,color,depth);
+             RenderSystem.getDevice().createCommandEncoder().clearColorTexture(target.getColorTexture(),0);
+         }catch(Exception error){close();throw new IllegalStateException("MC frame capture failed",error);}
+     }
+     public void captureHud(){
+         if(publisher==null)return;
+         if(!BridgeClient.active()||GLFW.glfwGetCurrentContext()!=context||BridgeMod.server.active()!=session){close();return;}
+         var target=Minecraft.getInstance().getMainRenderTarget();
+         if(target.width!=width||target.height!=height){publisher.discardPending();return;}
+         read(target,false,hud,null);zeroTransparent(hud);publisher.hud(generation,hud);
+         publisher.publishCompleted().ifPresent(key->BridgeMod.server.updateStream(session,new BridgeServer.Stream(key,publisher.path().toString(),generation,width,height)));
++        if(PassthroughWindow.configured()&&!PassthroughWindow.active())restoreDisplay(target);
++    }
++    /** Rebuild the normal MC image after separate HUD capture when native fusion stops. */
++    private void restoreDisplay(com.mojang.blaze3d.pipeline.RenderTarget target){
++        if(display==null)display=MemoryUtil.memAlloc(color.capacity());
++        for(int i=0;i<color.capacity();i+=4){
++            int inverseAlpha=255-Byte.toUnsignedInt(hud.get(i+3));
++            for(int channel=0;channel<4;channel++){
++                int value=Byte.toUnsignedInt(hud.get(i+channel))+(Byte.toUnsignedInt(color.get(i+channel))*inverseAlpha+127)/255;
++                display.put(i+channel,(byte)Math.min(255,value));
++            }
++            display.put(i+3,(byte)255); // Normal MC display is opaque even though the capture has transparent sky.
++        }
++        int texture=GL11.glGetInteger(GL11.GL_TEXTURE_BINDING_2D),unpack=GL11.glGetInteger(GL21.GL_PIXEL_UNPACK_BUFFER_BINDING);
++        int[] names={GL11.GL_UNPACK_ALIGNMENT,GL11.GL_UNPACK_ROW_LENGTH,GL11.GL_UNPACK_SKIP_ROWS,GL11.GL_UNPACK_SKIP_PIXELS,GL11.GL_UNPACK_SWAP_BYTES};
++        int[] values=new int[names.length];for(int i=0;i<names.length;i++)values[i]=GL11.glGetInteger(names[i]);
++        try{
++            GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER,0);GL11.glBindTexture(GL11.GL_TEXTURE_2D,((GlTexture)target.getColorTexture()).glId());
++            for(int i=0;i<names.length;i++)GL11.glPixelStorei(names[i],i==0?1:0);
++            GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D,0,0,0,width,height,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,display);
++        }finally{
++            for(int i=0;i<names.length;i++)GL11.glPixelStorei(names[i],values[i]);
++            GL11.glBindTexture(GL11.GL_TEXTURE_2D,texture);GL15.glBindBuffer(GL21.GL_PIXEL_UNPACK_BUFFER,unpack);
++        }
+     }
+     private static void zeroTransparent(ByteBuffer bytes){for(int i=0;i<bytes.limit();i+=4)if(bytes.get(i+3)==0){bytes.put(i,(byte)0);bytes.put(i+1,(byte)0);bytes.put(i+2,(byte)0);}}
+     private static void read(com.mojang.blaze3d.pipeline.RenderTarget target,boolean withDepth,ByteBuffer rgba,ByteBuffer depth){
+         int oldFbo=GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING),oldPack=GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+         int align=GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT),row=GL11.glGetInteger(GL11.GL_PACK_ROW_LENGTH),skipRows=GL11.glGetInteger(GL11.GL_PACK_SKIP_ROWS),skipPixels=GL11.glGetInteger(GL11.GL_PACK_SKIP_PIXELS),swap=GL11.glGetInteger(GL11.GL_PACK_SWAP_BYTES);
+         int fbo=GL30.glGenFramebuffers();
+         try {
+             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,fbo);
+             GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER,GL30.GL_COLOR_ATTACHMENT0,GL11.GL_TEXTURE_2D,((GlTexture)target.getColorTexture()).glId(),0);
+             if(withDepth)GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER,GL30.GL_DEPTH_ATTACHMENT,GL11.GL_TEXTURE_2D,((GlTexture)target.getDepthTexture()).glId(),0);
+             if(GL30.glCheckFramebufferStatus(GL30.GL_READ_FRAMEBUFFER)!=GL30.GL_FRAMEBUFFER_COMPLETE)throw new IllegalStateException("incomplete read FBO");
+             GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER,0);
+             GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT,1);GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH,0);GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS,0);GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS,0);GL11.glPixelStorei(GL11.GL_PACK_SWAP_BYTES,0);
+             GL11.glReadPixels(0,0,target.width,target.height,GL11.GL_RGBA,GL11.GL_UNSIGNED_BYTE,rgba);
+             if(withDepth)GL11.glReadPixels(0,0,target.width,target.height,GL11.GL_DEPTH_COMPONENT,GL11.GL_FLOAT,depth);
+         }finally{
+             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER,oldPack);GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT,align);GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH,row);GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS,skipRows);GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS,skipPixels);GL11.glPixelStorei(GL11.GL_PACK_SWAP_BYTES,swap);
+             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER,oldFbo);GL30.glDeleteFramebuffers(fbo);
+         }
+     }
+-    private void releaseBuffers(){if(color!=null)MemoryUtil.memFree(color);if(depth!=null)MemoryUtil.memFree(depth);if(hud!=null)MemoryUtil.memFree(hud);color=depth=hud=null;width=height=0;}
++    private void releaseBuffers(){if(color!=null)MemoryUtil.memFree(color);if(depth!=null)MemoryUtil.memFree(depth);if(hud!=null)MemoryUtil.memFree(hud);if(display!=null)MemoryUtil.memFree(display);color=depth=hud=display=null;width=height=0;}
+     @Override public void close(){try{if(publisher!=null)publisher.close();}catch(java.io.IOException e){throw new java.io.UncheckedIOException(e);}finally{publisher=null;session=null;releaseBuffers();var bridge=BridgeMod.server;if(bridge!=null)bridge.invalidateStream();}}
+ }
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+new file mode 100644
+index 0000000..7013ea6
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java
+@@ -0,0 +1,85 @@
++package dev.jay.dstmc.client;
++
++import com.google.gson.JsonParser;
++import net.minecraft.client.Minecraft;
++import org.lwjgl.glfw.*;
++import org.lwjgl.opengl.*;
++import org.lwjgl.system.MemoryStack;
++import org.lwjgl.system.JNI;
++import org.lwjgl.system.macosx.ObjCRuntime;
++import java.net.URI;
++import java.net.http.*;
++import java.time.Duration;
++import java.util.concurrent.CompletableFuture;
++
++/** GLFW/Cocoa operations are confined to the Minecraft client/render thread. */
++public final class PassthroughWindow {
++    public record WindowBounds(int x,int y,int logicalWidth,int logicalHeight,int physicalWidth,int physicalHeight,double scale) {
++        public WindowBounds {
++            if(logicalWidth<=0||logicalHeight<=0||physicalWidth<=0||physicalHeight<=0||physicalWidth>1920||physicalHeight>1080||!Double.isFinite(scale)||scale<=0
++                ||Math.abs(physicalWidth-logicalWidth*scale)>.5||Math.abs(physicalHeight-logicalHeight*scale)>.5)throw new IllegalArgumentException("inconsistent native render size");
++        }
++    }
++    private static final boolean CONFIGURED=Boolean.getBoolean("dstmc.firstPerson")&&System.getProperty("os.name").startsWith("Mac");
++    private static final HttpClient HTTP=HttpClient.newBuilder().connectTimeout(Duration.ofMillis(150)).build();
++    private static CompletableFuture<WindowBounds> pending;
++    private static boolean active;
++    private static long validUntil,lastPoll,cocoa;
++    private static int x,y,width,height,decorated,floating;
++    private static boolean ignoresMouse,shadow;
++    private static WindowBounds bounds;
++    private static long msgSend(){return ObjCRuntime.getLibrary().getFunctionAddress("objc_msgSend");}
++    private static boolean getBool(long target,String selector){return JNI.invokePPZ(target,ObjCRuntime.sel_registerName(selector),msgSend());}
++    private static void setBool(long target,String selector,boolean value){JNI.invokePPV(target,ObjCRuntime.sel_registerName(selector),value,msgSend());}
++    public static boolean configured(){return CONFIGURED;}
++    public static boolean active(){return active&&System.nanoTime()<validUntil;}
++    public static void creationHints(){if(CONFIGURED){GLFW.glfwWindowHint(GLFW.GLFW_TRANSPARENT_FRAMEBUFFER,GLFW.GLFW_TRUE);GLFW.glfwWindowHint(GLFW.GLFW_COCOA_RETINA_FRAMEBUFFER,GLFW.GLFW_FALSE);}}
++    public static void tick(){
++        if(!CONFIGURED)return;
++        if(!BridgeClient.active()){if(pending!=null){pending.cancel(false);pending=null;}restore();return;}
++        long now=System.nanoTime();
++        if(pending!=null&&pending.isDone()){
++            var result=pending;pending=null;
++            try{WindowBounds value=result.join();validUntil=now+200_000_000L;enable(value);}catch(Exception e){restore();}
++        }
++        if(active&&now>=validUntil)restore();
++        if(pending==null&&now-lastPoll>=50_000_000L){
++            lastPoll=now;
++            var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window")).timeout(Duration.ofMillis(150)).GET().build();
++            pending=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
++                if(response.statusCode()!=200||response.body().length()>4096)throw new IllegalStateException("native fusion inactive");
++                var j=JsonParser.parseString(response.body()).getAsJsonObject();if(j.get("protocol").getAsInt()!=2)throw new IllegalStateException("native protocol mismatch");
++                return new WindowBounds((int)Math.round(j.get("screen_x").getAsDouble()),(int)Math.round(j.get("screen_y").getAsDouble()),(int)Math.round(j.get("logical_width").getAsDouble()),(int)Math.round(j.get("logical_height").getAsDouble()),j.get("physical_width").getAsInt(),j.get("physical_height").getAsInt(),j.get("scale").getAsDouble());
++            });
++        }
++    }
++    public static void enable(WindowBounds value){
++        var window=Minecraft.getInstance().getWindow();long handle=window.handle();
++        if(window.isFullscreen()||GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_TRANSPARENT_FRAMEBUFFER)!=GLFW.GLFW_TRUE){restore();return;}
++        if(value.physicalWidth()!=value.logicalWidth()||value.physicalHeight()!=value.logicalHeight()){restore();return;}
++        if(!active){
++            int[] a=new int[1],b=new int[1];GLFW.glfwGetWindowPos(handle,a,b);x=a[0];y=b[0];GLFW.glfwGetWindowSize(handle,a,b);width=a[0];height=b[0];
++            decorated=GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_DECORATED);floating=GLFW.glfwGetWindowAttrib(handle,GLFW.GLFW_FLOATING);
++            cocoa=GLFWNativeCocoa.glfwGetCocoaWindow(handle);ignoresMouse=getBool(cocoa,"ignoresMouseEvents");shadow=getBool(cocoa,"hasShadow");
++            active=true;GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,GLFW.GLFW_FALSE);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_FLOATING,GLFW.GLFW_TRUE);setBool(cocoa,"setIgnoresMouseEvents:",false);setBool(cocoa,"setHasShadow:",false);
++        }
++        if(!value.equals(bounds)){bounds=value;GLFW.glfwSetWindowPos(handle,value.x(),value.y());GLFW.glfwSetWindowSize(handle,value.logicalWidth(),value.logicalHeight());}
++        int[] w=new int[1],h=new int[1];GLFW.glfwGetFramebufferSize(handle,w,h);if(w[0]!=value.physicalWidth()||h[0]!=value.physicalHeight())restore();
++    }
++    public static void restore(){
++        if(!active)return;
++        long handle=Minecraft.getInstance().getWindow().handle();active=false;bounds=null;validUntil=0;
++        GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_DECORATED,decorated);GLFW.glfwSetWindowAttrib(handle,GLFW.GLFW_FLOATING,floating);GLFW.glfwSetWindowSize(handle,width,height);GLFW.glfwSetWindowPos(handle,x,y);
++        setBool(cocoa,"setIgnoresMouseEvents:",ignoresMouse);setBool(cocoa,"setHasShadow:",shadow);
++        net.minecraft.client.KeyMapping.releaseAll();Minecraft.getInstance().mouseHandler.releaseMouse();
++    }
++    /** Suppress only the duplicate final blit; capture still reads the main target. */
++    public static void clearWindow(){
++        int fbo=GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);boolean scissor=GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
++        try(MemoryStack stack=MemoryStack.stackPush()){
++            var color=stack.mallocFloat(4);var mask=stack.malloc(4);GL11.glGetFloatv(GL11.GL_COLOR_CLEAR_VALUE,color);GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK,mask);
++            try{GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,0);GL11.glDisable(GL11.GL_SCISSOR_TEST);GL11.glColorMask(true,true,true,true);GL11.glClearColor(0,0,0,0);GL11.glClear(GL11.GL_COLOR_BUFFER_BIT);}
++            finally{GL11.glClearColor(color.get(0),color.get(1),color.get(2),color.get(3));GL11.glColorMask(mask.get(0)!=0,mask.get(1)!=0,mask.get(2)!=0,mask.get(3)!=0);if(scissor)GL11.glEnable(GL11.GL_SCISSOR_TEST);GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER,fbo);}
++        }
++    }
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowCreateMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowCreateMixin.java
+new file mode 100644
+index 0000000..2f70490
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowCreateMixin.java
+@@ -0,0 +1,11 @@
++package dev.jay.dstmc.client.mixin;
++import com.mojang.blaze3d.platform.Window;
++import dev.jay.dstmc.client.PassthroughWindow;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++@Mixin(Window.class)
++public abstract class WindowCreateMixin {
++    @Inject(method="<init>",at=@At(value="INVOKE",target="Lorg/lwjgl/glfw/GLFW;glfwCreateWindow(IILjava/lang/CharSequence;JJ)J",shift=At.Shift.BEFORE))
++    private void transparentFramebuffer(CallbackInfo ci){PassthroughWindow.creationHints();}
++}
+diff --git a/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowPresentMixin.java b/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowPresentMixin.java
+new file mode 100644
+index 0000000..9c3b17c
+--- /dev/null
++++ b/mc/src/client/java/dev/jay/dstmc/client/mixin/WindowPresentMixin.java
+@@ -0,0 +1,11 @@
++package dev.jay.dstmc.client.mixin;
++import com.mojang.blaze3d.pipeline.RenderTarget;
++import dev.jay.dstmc.client.PassthroughWindow;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.*;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++@Mixin(RenderTarget.class)
++public abstract class WindowPresentMixin {
++    @Inject(method="blitToScreen",at=@At("HEAD"),cancellable=true)
++    private void suppressDuplicateImage(CallbackInfo ci){if(PassthroughWindow.active()){PassthroughWindow.clearWindow();ci.cancel();}}
++}
+diff --git a/mc/src/client/resources/dst_mc_bridge.client.mixins.json b/mc/src/client/resources/dst_mc_bridge.client.mixins.json
+index 61b5fb1..a3b0d61 100644
+--- a/mc/src/client/resources/dst_mc_bridge.client.mixins.json
++++ b/mc/src/client/resources/dst_mc_bridge.client.mixins.json
+@@ -1 +1,16 @@
+-{"required":true,"package":"dev.jay.dstmc.client.mixin","compatibilityLevel":"JAVA_21","client":["WorldCaptureMixin","GuiCaptureMixin","BridgeSceneMixin","FixtureWorldLoadMixin"],"injectors":{"defaultRequire":1}}
++{
++  "required": true,
++  "package": "dev.jay.dstmc.client.mixin",
++  "compatibilityLevel": "JAVA_21",
++  "client": [
++    "WorldCaptureMixin",
++    "GuiCaptureMixin",
++    "BridgeSceneMixin",
++    "FixtureWorldLoadMixin",
++    "WindowCreateMixin",
++    "WindowPresentMixin"
++  ],
++  "injectors": {
++    "defaultRequire": 1
++  }
++}
+diff --git a/native/Makefile b/native/Makefile
+index be753e6..af8958a 100644
+--- a/native/Makefile
++++ b/native/Makefile
+@@ -26,13 +26,28 @@ $(BUILD)/frame_reader_test: tests/frame_reader_test.cpp src/frame_reader.cpp inc
+ 	$(CXX) $(CXXFLAGS) tests/frame_reader_test.cpp src/frame_reader.cpp -o $@
+ .PHONY: reader-test
+ reader-test: $(BUILD)/frame_reader_test
+ 	./$(BUILD)/frame_reader_test
+ $(BUILD)/loader_test: tests/loader_test.mm
+ 	mkdir -p $(BUILD)
+ 	$(CXX) $(CXXFLAGS) $(GLFLAGS) $< -o $@
+ .PHONY: loader-test
+ loader-test: $(BUILD)/loader_test all
+ 	@d=$$(mktemp -d); DSTMC_PROBE_DIR="$$d" DYLD_INSERT_LIBRARIES="$(CURDIR)/$(BUILD)/libdstmc_probe.dylib" ./$(BUILD)/loader_test; result=$$?; rm -rf "$$d"; exit $$result
+-$(BUILD)/libdstmc_probe.dylib: src/entry.mm src/gl_observer.mm src/frame_reader.cpp include/gl_observer.h include/frame_protocol.h
++$(BUILD)/libdstmc_probe.dylib: src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm include/compositor.h include/camera_http.h include/camera_service.h include/gl_observer.h include/frame_protocol.h
+ 	mkdir -p $(BUILD)
+-	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/gl_observer.mm src/frame_reader.cpp -o $@
++	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm -o $@
++
++$(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) tests/lease_test.cpp src/camera_service.cpp -o $@
++.PHONY: lease-test
++lease-test: $(BUILD)/lease_test
++	./$(BUILD)/lease_test
++
++$(BUILD)/compositor_test: tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp include/compositor.h
++	mkdir -p $(BUILD)
++	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/compositor_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp -o $@
++gl-test: compositor-test
++.PHONY: compositor-test
++compositor-test: $(BUILD)/compositor_test
++	./$(BUILD)/compositor_test
+diff --git a/native/include/camera_http.h b/native/include/camera_http.h
+new file mode 100644
+index 0000000..0d42ccd
+--- /dev/null
++++ b/native/include/camera_http.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include "compositor.h"
++namespace bridge {
++dstmc::CameraService &camera_service();
++bool enabled();
++dstmc::FrameKey key();
++void start(const char *directory);
++void report_compose(const dstmc::RenderProbe &, dstmc::FrameKey,
++                    const dstmc::ComposeResult &);
++void present_window(int render_width, int render_height, bool composited);
++} // namespace bridge
+diff --git a/native/include/camera_service.h b/native/include/camera_service.h
+new file mode 100644
+index 0000000..c690058
+--- /dev/null
++++ b/native/include/camera_service.h
+@@ -0,0 +1,39 @@
++#pragma once
++#include "frame_protocol.h"
++#include <functional>
++#include <memory>
++#include <mutex>
++namespace dstmc {
++using PairKey = std::array<uint8_t, 32>;
++using Epoch = std::array<uint8_t, 16>;
++struct FrameLease {
++  FrameKey key{};
++  FramePose pose{};
++  uint32_t width{}, height{};
++};
++bool same_key(const FrameKey &, const FrameKey &);
++/** Thread-safe rendezvous. HTTP owns no game API; render owns GL. */
++class CameraService {
++public:
++  using Clock = std::function<uint64_t()>;
++  explicit CameraService(Clock clock = {});
++  void offer(std::shared_ptr<FrameView>, std::shared_ptr<void> mapping);
++  std::optional<FrameLease> lease_latest(PairKey, Epoch);
++  bool camera_applied(FrameKey);
++  std::shared_ptr<const FrameView> ready(FrameKey);
++  void release();
++  void resize(uint32_t, uint32_t);
++
++private:
++  void expire();
++  void discard();
++  Clock clock_;
++  std::mutex mutex_;
++  // Declaration order ensures the slot lease is released before mapping unmaps.
++  std::shared_ptr<void> mapping_;
++  std::shared_ptr<FrameView> frame_;
++  FrameKey last_{};
++  bool have_last_ = false, acked_ = false, leased_ = false;
++  uint64_t deadline_{};
++};
++} // namespace dstmc
+diff --git a/native/include/compositor.h b/native/include/compositor.h
+new file mode 100644
+index 0000000..3640218
+--- /dev/null
++++ b/native/include/compositor.h
+@@ -0,0 +1,57 @@
++#pragma once
++#include "camera_service.h"
++#include "gl_observer.h"
++#include <OpenGL/gl.h>
++namespace dstmc {
++enum class ComposeStatus {
++  COMPOSITED,
++  SKIPPED_MISMATCH,
++  SKIPPED_STALE,
++  DEPTH_UNAVAILABLE
++};
++struct ComposeResult {
++  ComposeStatus status;
++  std::string reason;
++};
++/** All methods except CameraService calls require the owning current GL
++ * context. */
++class Compositor {
++public:
++  explicit Compositor(CameraService &service) : service_(service) {}
++  ComposeResult compose(FrameKey, const RenderProbe &, GLuint scene_depth);
++  void hud(const FrameView &);
++  ~Compositor();
++
++private:
++  CGLContextObj owner_ = CGLGetCurrentContext();
++  CameraService &service_;
++  GLuint program_{}, hud_program_{}, textures_[3]{};
++};
++bool matching_camera(const FrameView &, const RenderProbe &);
++bool inverse_matrix(const std::array<float, 16> &, std::array<float, 16> &);
++/** Owns supplemental depth in one context; replays only profiled world sprite
++ * draws. */
++class SceneDepth {
++public:
++  void after_draw(const RenderProbe &, const std::function<void()> &replay);
++  GLuint texture() const {
++    return valid_ && camera_.frame_no == frame_ &&
++                   !camera_.shader_matrices.empty()
++               ? depth_
++               : 0;
++  }
++  const RenderProbe &camera() const { return camera_; }
++  int target() const { return target_; }
++  void reset();
++  ~SceneDepth();
++
++private:
++  CGLContextObj owner_ = CGLGetCurrentContext();
++  bool allocate(int, int);
++  GLuint fbo_{}, depth_{}, color_{};
++  int width_{}, height_{}, target_ = -1;
++  uint64_t frame_{};
++  bool valid_{};
++  RenderProbe camera_{};
++};
++} // namespace dstmc
+diff --git a/native/src/camera_http.mm b/native/src/camera_http.mm
+new file mode 100644
+index 0000000..166cc17
+--- /dev/null
++++ b/native/src/camera_http.mm
+@@ -0,0 +1,438 @@
++#include "camera_http.h"
++#import <Cocoa/Cocoa.h>
++#include <CommonCrypto/CommonDigest.h>
++#include <algorithm>
++#include <chrono>
++#include <fcntl.h>
++#include <fstream>
++#include <netinet/in.h>
++#include <sstream>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++namespace bridge {
++namespace {
++struct State {
++  dstmc::CameraService service;
++  std::mutex key_mutex, window_mutex;
++  dstmc::FrameKey current_key{};
++  NSDictionary *window_info = nil;
++  uint64_t last_composite = 0;
++  bool enabled = false;
++  std::string directory;
++};
++State &state() {
++  static auto *value = new State;
++  return *value;
++}
++uint64_t milliseconds() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++} // namespace
++dstmc::CameraService &camera_service() { return state().service; }
++bool enabled() { return state().enabled; }
++dstmc::FrameKey key() {
++  std::lock_guard<std::mutex> lock(state().key_mutex);
++  return state().current_key;
++}
++void log(NSDictionary *record) {
++  NSData *data = [NSJSONSerialization dataWithJSONObject:record
++                                                 options:0
++                                                   error:nil];
++  if (data) {
++    std::ofstream out(state().directory + "/camera-gate.jsonl", std::ios::app);
++    out.write((const char *)data.bytes, data.length);
++    out << '\n';
++  }
++}
++NSString *string(id object) {
++  if (![object isKindOfClass:[NSString class]])
++    throw std::runtime_error("expected string");
++  return object;
++}
++NSDictionary *object(id value) {
++  if (![value isKindOfClass:[NSDictionary class]])
++    throw std::runtime_error("expected object");
++  return value;
++}
++void fields(NSDictionary *o, NSArray *keys) {
++  object(o);
++  if (![[NSSet setWithArray:o.allKeys] isEqual:[NSSet setWithArray:keys]])
++    throw std::runtime_error("unexpected fields");
++}
++std::array<uint8_t, 16> uuid(id value) {
++  NSUUID *u = [[NSUUID alloc] initWithUUIDString:string(value)];
++  if (!u)
++    throw std::runtime_error("invalid UUID");
++  std::array<uint8_t, 16> b{};
++  [u getUUIDBytes:b.data()];
++  [u release];
++  return b;
++}
++NSString *quote(NSString *s) {
++  NSData *d = [NSJSONSerialization
++      dataWithJSONObject:@[ s ]
++                 options:(NSJSONWritingFragmentsAllowed |
++                          NSJSONWritingWithoutEscapingSlashes)
++                   error:nil];
++  NSString *t = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]
++      autorelease];
++  return [t substringWithRange:NSMakeRange(1, t.length - 2)];
++}
++dstmc::FrameKey parse_key(NSDictionary *key) {
++  fields(key, @[ @"pair", @"epoch", @"id" ]);
++  NSDictionary *p = object(key[@"pair"]);
++  fields(
++      p,
++      @[ @"dst_world", @"dst_shard", @"mc_world", @"mc_dimension", @"region" ]);
++  uuid(p[@"dst_world"]);
++  uuid(p[@"mc_world"]);
++  NSMutableString *canonical = [NSMutableString stringWithString:@"{"];
++  bool first = true;
++  for (NSString *k in @[
++         @"dst_world", @"dst_shard", @"mc_world", @"mc_dimension", @"region"
++       ]) {
++    NSString *v = string(p[k]);
++    if ([k isEqual:@"dst_world"] || [k isEqual:@"mc_world"])
++      v = v.lowercaseString;
++    if (!v.length)
++      throw std::runtime_error("empty pair field");
++    if (!first)
++      [canonical appendString:@","];
++    first = false;
++    [canonical appendFormat:@"%@:%@", quote(k), quote(v)];
++  }
++  [canonical appendString:@"}"];
++  dstmc::FrameKey out{};
++  NSData *d = [canonical dataUsingEncoding:NSUTF8StringEncoding];
++  CC_SHA256(d.bytes, (CC_LONG)d.length, out.pair_hash.data());
++  out.epoch = uuid(key[@"epoch"]);
++  id n = key[@"id"];
++  if (![n isKindOfClass:[NSNumber class]] || [n doubleValue] < 0 ||
++      [n doubleValue] > 9007199254740991. ||
++      [n doubleValue] != std::floor([n doubleValue]))
++    throw std::runtime_error("invalid frame ID");
++  out.id = [n unsignedLongLongValue];
++  return out;
++}
++NSDictionary *get_status() {
++  NSURLRequest *r = [NSURLRequest
++       requestWithURL:[NSURL URLWithString:@"http://127.0.0.1:39379/v2/status"]
++          cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
++      timeoutInterval:.15];
++  NSURLResponse *response = nil;
++  NSData *d = [NSURLConnection sendSynchronousRequest:r
++                                    returningResponse:&response
++                                                error:nil];
++  if (!d || d.length > 65536 ||
++      [(NSHTTPURLResponse *)response statusCode] != 200)
++    throw std::runtime_error("MC status unavailable");
++  return object([NSJSONSerialization JSONObjectWithData:d options:0 error:nil]);
++}
++struct Mapping {
++  void *base = MAP_FAILED;
++  size_t length = 0;
++  ~Mapping() {
++    if (base != MAP_FAILED)
++      munmap(base, length);
++  }
++};
++void discover(dstmc::FrameKey expected) {
++  NSDictionary *s = get_status();
++  if (![s[@"protocol"] isEqual:@2] || ![s[@"status"] isEqual:@"PAIRED"])
++    throw std::runtime_error("MC not paired");
++  // Refresh physical size even while an exact frame is pinned. A new mapping
++  // announced after resize must invalidate the old camera acknowledgment.
++  state().service.resize([s[@"width"] unsignedIntValue],
++                         [s[@"height"] unsignedIntValue]);
++  auto latest = parse_key(object(s[@"latest_frame"]));
++  if (!dstmc::same_key(latest, expected))
++    throw std::runtime_error("exact frame changed; retry");
++  if (![s[@"pair"] isEqual:object(s[@"latest_frame"])[@"pair"]] ||
++      ![s[@"epoch"] isEqual:object(s[@"latest_frame"])[@"epoch"]])
++    throw std::runtime_error("status session mismatch");
++  if (state().service.lease_latest(expected.pair_hash, expected.epoch))
++    return; // Keep the existing slot; never attempt a second reader lease.
++  NSString *path = string(s[@"frame_path"]);
++  int fd = open(path.fileSystemRepresentation, O_RDWR | O_NOFOLLOW);
++  if (fd < 0)
++    throw std::runtime_error("frame open failed");
++  struct stat st{};
++  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
++      st.st_size < 4096 || st.st_size > 80 * 1024 * 1024) {
++    close(fd);
++    throw std::runtime_error("invalid mapping");
++  }
++  auto mapping = std::make_shared<Mapping>();
++  mapping->length = st.st_size;
++  mapping->base =
++      mmap(nullptr, mapping->length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++  close(fd);
++  if (mapping->base == MAP_FAILED)
++    throw std::runtime_error("mapping failed");
++  auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
++  if (!frame)
++    throw std::runtime_error("exact complete frame unavailable");
++  if (frame->width != [s[@"width"] unsignedIntValue] ||
++      frame->height != [s[@"height"] unsignedIntValue])
++    throw std::runtime_error("stream resize");
++  state().service.offer(std::make_shared<dstmc::FrameView>(std::move(*frame)),
++                        mapping);
++}
++NSArray *matrix(const std::array<float, 16> &m) {
++  NSMutableArray *a = [NSMutableArray arrayWithCapacity:16];
++  for (float x : m)
++    [a addObject:@(x)];
++  return a;
++}
++NSDictionary *vec(dstmc::Vec3 v) {
++  return @{@"x" : @(v.x), @"y" : @(v.y), @"z" : @(v.z)};
++}
++NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
++  if ([path isEqual:@"/v2/window"] && [method isEqual:@"GET"]) {
++    std::lock_guard<std::mutex> lock(state().window_mutex);
++    if (!state().window_info || milliseconds() - state().last_composite >= 250)
++      throw std::runtime_error("no recently composited frame");
++    return [[state().window_info retain] autorelease];
++  }
++  if (![method isEqual:@"POST"])
++    throw std::runtime_error("method not supported");
++  bool lease = [path isEqual:@"/v2/camera/lease"],
++       applied = [path isEqual:@"/v2/camera/applied"];
++  if (!lease && !applied)
++    throw std::runtime_error("unknown endpoint");
++  fields(body, lease ? @[ @"protocol", @"pair", @"epoch", @"key" ]
++                     : @[ @"protocol", @"pair", @"epoch", @"key", @"applied" ]);
++  if (![body[@"protocol"] isEqual:@2])
++    throw std::runtime_error("protocol mismatch");
++  NSDictionary *key = object(body[@"key"]);
++  if (![body[@"pair"] isEqual:key[@"pair"]] ||
++      ![body[@"epoch"] isEqual:key[@"epoch"]])
++    throw std::runtime_error("request session mismatch");
++  auto k = parse_key(key);
++  if (applied) {
++    if (CFGetTypeID((CFTypeRef)body[@"applied"]) != CFBooleanGetTypeID())
++      throw std::runtime_error("applied must be boolean");
++    bool accepted = false;
++    if ([body[@"applied"] boolValue])
++      accepted = state().service.camera_applied(k);
++    else {
++      std::lock_guard<std::mutex> lock(state().key_mutex);
++      if (dstmc::same_key(k, state().current_key))
++        state().service.release();
++    }
++    return @{
++      @"protocol" : @2,
++      @"pair" : body[@"pair"],
++      @"epoch" : body[@"epoch"],
++      @"key" : key,
++      @"accepted" : @(accepted)
++    };
++  }
++  // Repeated requests return the pinned pose, never a different image under the
++  // requested key.
++  discover(k);
++  auto l = state().service.lease_latest(k.pair_hash, k.epoch);
++  if (!l || !dstmc::same_key(l->key, k))
++    throw std::runtime_error("different frame pinned or stale");
++  {
++    std::lock_guard<std::mutex> lock(state().key_mutex);
++    state().current_key = k;
++  }
++  NSDictionary *pose = @{
++    @"space" : @"DST",
++    @"position" : vec(l->pose.position),
++    @"forward" : vec(l->pose.forward),
++    @"up" : vec(l->pose.up),
++    @"view" : matrix(l->pose.view),
++    @"projection" : matrix(l->pose.projection)
++  };
++  return @{
++    @"protocol" : @2,
++    @"pair" : body[@"pair"],
++    @"epoch" : body[@"epoch"],
++    @"lease" : @{
++      @"key" : key,
++      @"pose" : pose,
++      @"width" : @(l->width),
++      @"height" : @(l->height)
++    }
++  };
++}
++void serve(int server) {
++  for (;;) {
++    int client = accept(server, nullptr, nullptr);
++    if (client < 0)
++      break;
++    @autoreleasepool {
++      timeval timeout{0, 300000};
++      setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++      setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++      int no_sigpipe = 1;
++      setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
++                 sizeof(no_sigpipe));
++      NSDictionary *response = nil;
++      int code = 200;
++      try {
++        std::string request;
++        size_t end = std::string::npos;
++        char buffer[4096];
++        while ((end = request.find("\r\n\r\n")) == std::string::npos) {
++          ssize_t n = recv(client, buffer, sizeof(buffer), 0);
++          if (n <= 0 || request.size() + n > 8192)
++            throw std::runtime_error("invalid HTTP header");
++          request.append(buffer, n);
++        }
++        std::istringstream headers(request.substr(0, end));
++        std::string method, path, version, line;
++        headers >> method >> path >> version;
++        std::getline(headers, line);
++        size_t length = 0;
++        bool found = false;
++        while (std::getline(headers, line)) {
++          std::transform(line.begin(), line.end(), line.begin(),
++                         [](unsigned char c) { return std::tolower(c); });
++          if (line.rfind("transfer-encoding:", 0) == 0)
++            throw std::runtime_error("chunked body unsupported");
++          if (line.rfind("content-length:", 0) == 0) {
++            if (found)
++              throw std::runtime_error("duplicate length");
++            found = true;
++            length = std::stoul(line.substr(15));
++            if (length > 65536)
++              throw std::runtime_error("body too large");
++          }
++        }
++        size_t offset = end + 4;
++        while (request.size() - offset < length) {
++          ssize_t n = recv(
++              client, buffer,
++              std::min(sizeof(buffer), length - (request.size() - offset)), 0);
++          if (n <= 0)
++            throw std::runtime_error("incomplete body");
++          request.append(buffer, n);
++        }
++        NSDictionary *body = nil;
++        if (length) {
++          NSData *d = [NSData dataWithBytes:request.data() + offset
++                                     length:length];
++          body = object([NSJSONSerialization JSONObjectWithData:d
++                                                        options:0
++                                                          error:nil]);
++        }
++        response = handle([NSString stringWithUTF8String:path.c_str()],
++                          [NSString stringWithUTF8String:method.c_str()], body);
++      } catch (const std::exception &e) {
++        code = 409;
++        response = @{
++          @"protocol" : @2,
++          @"error" : @"GATE_NOT_READY",
++          @"reason" : [NSString stringWithUTF8String:e.what()]
++        };
++      }
++      NSData *json = [NSJSONSerialization dataWithJSONObject:response
++                                                     options:0
++                                                       error:nil];
++      std::string header =
++          "HTTP/1.1 " + std::to_string(code) +
++          " OK\r\nContent-Type: application/json\r\nConnection: "
++          "close\r\nContent-Length: " +
++          std::to_string(json.length) + "\r\n\r\n";
++      std::string bytes =
++          header + std::string((const char *)json.bytes, json.length);
++      size_t sent = 0;
++      while (sent < bytes.size()) {
++        ssize_t n = send(client, bytes.data() + sent, bytes.size() - sent, 0);
++        if (n <= 0)
++          break;
++        sent += n;
++      }
++    }
++    close(client);
++  }
++  close(server);
++}
++void start(const char *dir) {
++  if (!getenv("DSTMC_FIRST_PERSON"))
++    return;
++  state().directory = dir;
++  int server = socket(AF_INET, SOCK_STREAM, 0);
++  int reuse = 1;
++  if (server >= 0)
++    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++  sockaddr_in addr{};
++  addr.sin_family = AF_INET;
++  addr.sin_port = htons(39380);
++  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  if (server < 0 || bind(server, (sockaddr *)&addr, sizeof(addr)) ||
++      listen(server, 8)) {
++    if (server >= 0)
++      close(server);
++    log(@{
++      @"event" : @"camera_service_failed",
++      @"reason" : @"39380 bind conflict"
++    });
++    return;
++  }
++  state().enabled = true;
++  std::thread(serve, server).detach();
++  log(@{@"event" : @"camera_service_started", @"port" : @39380});
++}
++void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
++                    const dstmc::ComposeResult &result) {
++  static uint64_t last = 0;
++  if (milliseconds() - last > 1000) {
++    last = milliseconds();
++    NSMutableArray *matrices = [NSMutableArray array];
++    for (auto &m : camera.shader_matrices)
++      if (m.name == "MatrixV" || m.name == "MatrixP")
++        [matrices addObject:@{
++          @"name" : [NSString stringWithUTF8String:m.name.c_str()],
++          @"value" : matrix(m.value)
++        }];
++    log(@{
++      @"event" : @"compose",
++      @"frame" : @(key.id),
++      @"status" : @(int(result.status)),
++      @"reason" : [NSString stringWithUTF8String:result.reason.c_str()],
++      @"matrices" : matrices,
++      @"width" : @(camera.viewport[2]),
++      @"height" : @(camera.viewport[3])
++    });
++  }
++}
++void present_window(int pw, int ph, bool composited) {
++  if (composited) {
++    std::lock_guard<std::mutex> lock(state().window_mutex);
++    state().last_composite = milliseconds();
++  }
++  // Cocoa view geometry is captured only on the native UI thread. Render pixels
++  // come from the profiled scene.
++  if ([NSThread isMainThread]) {
++    NSWindow *w = [[[NSOpenGLContext currentContext] view] window];
++    NSView *v = w.contentView;
++    if (w && v) {
++      NSRect r = [w convertRectToScreen:[v convertRect:v.bounds toView:nil]];
++      double top = NSMaxY([NSScreen screens][0].frame) - NSMaxY(r);
++      if (pw > 0 && ph > 0) {
++        std::lock_guard<std::mutex> lock(state().window_mutex);
++        [state().window_info release];
++        state().window_info = [@{
++          @"protocol" : @2,
++          @"screen_x" : @(r.origin.x),
++          @"screen_y" : @(top),
++          @"logical_width" : @(r.size.width),
++          @"logical_height" : @(r.size.height),
++          @"physical_width" : @(pw),
++          @"physical_height" : @(ph),
++          @"scale" : @(pw / r.size.width)
++        } retain];
++      }
++    }
++  }
++}
++} // namespace bridge
+diff --git a/native/src/camera_service.cpp b/native/src/camera_service.cpp
+new file mode 100644
+index 0000000..cba7c21
+--- /dev/null
++++ b/native/src/camera_service.cpp
+@@ -0,0 +1,93 @@
++#include "camera_service.h"
++#include <chrono>
++namespace dstmc {
++bool same_key(const FrameKey &a, const FrameKey &b) {
++  return a.pair_hash == b.pair_hash && a.epoch == b.epoch && a.id == b.id;
++}
++CameraService::CameraService(Clock clock)
++    : clock_(clock ? std::move(clock) : [] {
++        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                            std::chrono::steady_clock::now().time_since_epoch())
++                            .count());
++      }) {}
++void CameraService::discard() {
++  frame_.reset();
++  mapping_.reset();
++  acked_ = leased_ = false;
++}
++void CameraService::expire() {
++  if (frame_ && clock_() >= deadline_)
++    discard();
++}
++void CameraService::offer(std::shared_ptr<FrameView> f,
++                          std::shared_ptr<void> mapping) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  expire();
++  if (!f)
++    return;
++  bool session = have_last_ && f->key.pair_hash == last_.pair_hash &&
++                 f->key.epoch == last_.epoch;
++  if (!session)
++    discard();
++  if (session && f->key.id <= last_.id)
++    return;
++  // A leased pose cannot be replaced by a newer image until presentation or
++  // expiry.
++  if (frame_)
++    return;
++  last_ = f->key;
++  have_last_ = true;
++  mapping_ = std::move(mapping);
++  frame_ = std::move(f);
++  deadline_ = clock_() + 250;
++}
++std::optional<FrameLease> CameraService::lease_latest(PairKey pair,
++                                                      Epoch epoch) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  expire();
++  if (!frame_ || frame_->key.pair_hash != pair || frame_->key.epoch != epoch)
++    return {};
++  auto &f = *frame_;
++  auto p = f.pose;
++  const double dx = f.dst_origin.x - f.mc_origin.x,
++               dy = f.dst_origin.y - f.mc_origin.y,
++               dz = f.dst_origin.z - f.mc_origin.z;
++  p.position = {p.position.x + dx, p.position.y + dy, p.position.z + dz};
++  for (int r = 0; r < 4; r++)
++    p.view[12 + r] = float(f.pose.view[12 + r] - f.pose.view[r] * dx -
++                           f.pose.view[4 + r] * dy - f.pose.view[8 + r] * dz);
++  leased_ = true;
++  return FrameLease{f.key, p, f.width, f.height};
++}
++bool CameraService::camera_applied(FrameKey k) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  expire();
++  if (!frame_ || !leased_ || !same_key(frame_->key, k))
++    return false;
++  acked_ = true;
++  return true;
++}
++std::shared_ptr<const FrameView> CameraService::ready(FrameKey k) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  expire();
++  if (!frame_ || !acked_ || !same_key(frame_->key, k))
++    return {};
++  // Returned alias retains both mmap and slot until the render operation
++  // finishes.
++  struct Held {
++    std::shared_ptr<void> mapping;
++    std::shared_ptr<FrameView> frame;
++  };
++  auto h = std::make_shared<Held>(Held{mapping_, frame_});
++  return std::shared_ptr<const FrameView>(h, frame_.get());
++}
++void CameraService::release() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  discard();
++}
++void CameraService::resize(uint32_t w, uint32_t h) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (frame_ && (frame_->width != w || frame_->height != h))
++    discard();
++}
++} // namespace dstmc
+diff --git a/native/src/compositor.mm b/native/src/compositor.mm
+new file mode 100644
+index 0000000..c383b91
+--- /dev/null
++++ b/native/src/compositor.mm
+@@ -0,0 +1,250 @@
++#include "compositor.h"
++#include <OpenGL/glext.h>
++#include <algorithm>
++#include <stdexcept>
++namespace dstmc {
++namespace {
++// GL2 attrib stacks cover legacy raster state; FBO/program/PBO require explicit
++// restoration.
++struct State {
++  GLint program, fbo, active, pack, unpack, matrix;
++  GLint textures[3];
++  State() {
++    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    glGetIntegerv(GL_MATRIX_MODE, &matrix);
++    glPushAttrib(GL_ALL_ATTRIB_BITS);
++    glPushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS);
++    for (int i = 0; i < 3; i++) {
++      glActiveTexture(GL_TEXTURE0 + i);
++      glGetIntegerv(GL_TEXTURE_BINDING_2D, &textures[i]);
++    }
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++    glPixelStorei(GL_UNPACK_SWAP_BYTES, GL_FALSE);
++  }
++  ~State() {
++    for (int i = 0; i < 3; i++) {
++      glActiveTexture(GL_TEXTURE0 + i);
++      glBindTexture(GL_TEXTURE_2D, textures[i]);
++    }
++    glPopClientAttrib();
++    glPopAttrib();
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++    glUseProgram(program);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, pack);
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
++    glActiveTexture(active);
++    glMatrixMode(matrix);
++  }
++};
++GLuint shader(GLenum type, const char *source) {
++  GLuint s = glCreateShader(type);
++  glShaderSource(s, 1, &source, nullptr);
++  glCompileShader(s);
++  GLint ok;
++  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++  if (!ok) {
++    glDeleteShader(s);
++    throw std::runtime_error("compositor shader compilation failed");
++  }
++  return s;
++}
++GLuint program(const char *fragment) {
++  const char *vertex = "#version 120\nvarying vec2 uv;void "
++                       "main(){gl_Position=gl_Vertex;uv=gl_Vertex.xy*.5+.5;}";
++  auto v = shader(GL_VERTEX_SHADER, vertex),
++       f = shader(GL_FRAGMENT_SHADER, fragment);
++  GLuint p = glCreateProgram();
++  glAttachShader(p, v);
++  glAttachShader(p, f);
++  glLinkProgram(p);
++  glDeleteShader(v);
++  glDeleteShader(f);
++  GLint ok;
++  glGetProgramiv(p, GL_LINK_STATUS, &ok);
++  if (!ok) {
++    glDeleteProgram(p);
++    throw std::runtime_error("compositor shader link failed");
++  }
++  return p;
++}
++void quad() {
++  glDisable(GL_DEPTH_TEST);
++  glDepthMask(GL_FALSE);
++  glDisable(GL_ALPHA_TEST);
++  glDisable(GL_SCISSOR_TEST);
++  glDisable(GL_STENCIL_TEST);
++  glDisable(GL_CULL_FACE);
++  glDisable(GL_COLOR_LOGIC_OP);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++  glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
++  glEnable(GL_BLEND);
++  glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
++  glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
++                      GL_ONE_MINUS_SRC_ALPHA);
++  glBegin(GL_QUADS);
++  glVertex2f(-1, -1);
++  glVertex2f(1, -1);
++  glVertex2f(1, 1);
++  glVertex2f(-1, 1);
++  glEnd();
++}
++void upload(GLuint texture, int unit, int w, int h, GLenum internal,
++            GLenum format, GLenum type, const void *pixels) {
++  glActiveTexture(GL_TEXTURE0 + unit);
++  glBindTexture(GL_TEXTURE_2D, texture);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, format, type, pixels);
++}
++const char *fragment = R"GLSL(#version 120
++varying vec2 uv;uniform sampler2D mcColor,mcDepth,hostDepth;uniform mat4 inverseMC,inverseHost;
++void main(){vec4 color=texture2D(mcColor,uv);if(color.a<=0.)discard;
++ float md=texture2D(mcDepth,uv).r,hd=texture2D(hostDepth,uv).r;
++ if(md>=1.||md<0.)discard;
++ vec4 m=inverseMC*vec4(uv*2.-1.,md*2.-1.,1.);vec4 h=inverseHost*vec4(uv*2.-1.,hd*2.-1.,1.);
++ if(abs(m.w)<0.000001||abs(h.w)<0.000001)discard;
++ float mz=-m.z/m.w,hz=-h.z/h.w;if(mz<=0.||(hd<1.&&mz>=hz))discard;gl_FragColor=color;}
++)GLSL";
++} // namespace
++bool inverse_matrix(const std::array<float, 16> &a,
++                    std::array<float, 16> &out) {
++  double m[4][8]{};
++  for (int r = 0; r < 4; r++)
++    for (int c = 0; c < 4; c++) {
++      m[r][c] = a[c * 4 + r];
++      m[r][c + 4] = r == c;
++    }
++  for (int c = 0; c < 4; c++) {
++    int pivot = c;
++    for (int r = c + 1; r < 4; r++)
++      if (std::abs(m[r][c]) > std::abs(m[pivot][c]))
++        pivot = r;
++    if (std::abs(m[pivot][c]) < 1e-12)
++      return false;
++    for (int j = 0; j < 8; j++)
++      std::swap(m[c][j], m[pivot][j]);
++    double s = m[c][c];
++    for (double &v : m[c])
++      v /= s;
++    for (int r = 0; r < 4; r++)
++      if (r != c) {
++        s = m[r][c];
++        for (int j = 0; j < 8; j++)
++          m[r][j] -= s * m[c][j];
++      }
++  }
++  for (int r = 0; r < 4; r++)
++    for (int c = 0; c < 4; c++) {
++      out[c * 4 + r] = float(m[r][c + 4]);
++      if (!std::isfinite(out[c * 4 + r]))
++        return false;
++    }
++  return true;
++}
++bool matching_camera(const FrameView &f, const RenderProbe &p) {
++  if (p.viewport != std::array<int, 4>{0, 0, int(f.width), int(f.height)} ||
++      p.depth_range != std::array<double, 2>{0, 1})
++    return false;
++  const std::array<float, 16> *v = nullptr, *projection = nullptr;
++  for (auto &m : p.shader_matrices) {
++    if (m.name == "MatrixV")
++      v = &m.value;
++    if (m.name == "MatrixP")
++      projection = &m.value;
++  }
++  if (!v || !projection)
++    return false;
++  double delta[3] = {f.dst_origin.x - f.mc_origin.x,
++                     f.dst_origin.y - f.mc_origin.y,
++                     f.dst_origin.z - f.mc_origin.z};
++  for (int i = 0; i < 16; i++) {
++    double expected = f.pose.view[i];
++    if (i >= 12)
++      for (int c = 0; c < 3; c++)
++        expected -= f.pose.view[c * 4 + i - 12] * delta[c];
++    if (!std::isfinite((*v)[i]) || std::abs((*v)[i] - expected) > 0.001)
++      return false;
++  }
++  // Near/far differ by engine; all ray-defining projection entries must agree.
++  for (int i = 0; i < 16; i++)
++    if (i != 10 && i != 14)
++      if (!std::isfinite((*projection)[i]) ||
++          std::abs((*projection)[i] - f.pose.projection[i]) > 0.0002)
++        return false;
++  return true;
++}
++ComposeResult Compositor::compose(FrameKey key, const RenderProbe &p,
++                                  GLuint depth) {
++  auto frame = service_.ready(key);
++  if (!frame)
++    return {ComposeStatus::SKIPPED_STALE, "missing ack or expired frame"};
++  if (!matching_camera(*frame, p))
++    return {ComposeStatus::SKIPPED_MISMATCH,
++            "actual view/rays/pixels mismatch"};
++  if (!depth)
++    return {ComposeStatus::DEPTH_UNAVAILABLE,
++            "verified scene depth unavailable"};
++  std::array<float, 16> mc{}, host{};
++  const std::array<float, 16> *projection = nullptr;
++  for (auto &m : p.shader_matrices)
++    if (m.name == "MatrixP")
++      projection = &m.value;
++  if (!projection || !inverse_matrix(frame->pose.projection, mc) ||
++      !inverse_matrix(*projection, host))
++    return {ComposeStatus::SKIPPED_MISMATCH, "singular projection"};
++  State state;
++  if (!program_) {
++    program_ = program(fragment);
++    glGenTextures(3, textures_);
++  }
++  glUseProgram(program_);
++  upload(textures_[0], 0, frame->width, frame->height, GL_RGBA8, GL_RGBA,
++         GL_UNSIGNED_BYTE, frame->color);
++  upload(textures_[1], 1, frame->width, frame->height, GL_LUMINANCE32F_ARB,
++         GL_LUMINANCE, GL_FLOAT, frame->depth);
++  glActiveTexture(GL_TEXTURE2);
++  glBindTexture(GL_TEXTURE_2D, depth);
++  glUniform1i(glGetUniformLocation(program_, "mcColor"), 0);
++  glUniform1i(glGetUniformLocation(program_, "mcDepth"), 1);
++  glUniform1i(glGetUniformLocation(program_, "hostDepth"), 2);
++  glUniformMatrix4fv(glGetUniformLocation(program_, "inverseMC"), 1, GL_FALSE,
++                     mc.data());
++  glUniformMatrix4fv(glGetUniformLocation(program_, "inverseHost"), 1, GL_FALSE,
++                     host.data());
++  quad();
++  return {ComposeStatus::COMPOSITED, "matched complete frame"};
++}
++void Compositor::hud(const FrameView &f) {
++  State state;
++  if (!hud_program_)
++    hud_program_ =
++        program("#version 120\nvarying vec2 uv;uniform sampler2D color;void "
++                "main(){gl_FragColor=texture2D(color,uv);}");
++  if (!textures_[2])
++    glGenTextures(1, &textures_[2]);
++  glUseProgram(hud_program_);
++  upload(textures_[2], 0, f.width, f.height, GL_RGBA8, GL_RGBA,
++         GL_UNSIGNED_BYTE, f.hud);
++  glUniform1i(glGetUniformLocation(hud_program_, "color"), 0);
++  quad();
++}
++Compositor::~Compositor() {
++  if (CGLGetCurrentContext() != owner_)
++    return;
++  if (program_)
++    glDeleteProgram(program_);
++  if (hud_program_)
++    glDeleteProgram(hud_program_);
++  glDeleteTextures(3, textures_);
++}
++} // namespace dstmc
+diff --git a/native/src/entry.mm b/native/src/entry.mm
+index 6e31678..98fce28 100644
+--- a/native/src/entry.mm
++++ b/native/src/entry.mm
+@@ -1,30 +1,202 @@
+-#import <Cocoa/Cocoa.h>
+-#import <objc/runtime.h>
++#include "camera_http.h"
+ #include "gl_observer.h"
++#import <Cocoa/Cocoa.h>
+ #include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
+ #include <cstdlib>
+ #include <fstream>
++#include <map>
++#import <objc/runtime.h>
+ #include <unistd.h>
++namespace bridge {
++struct Context {
++  dstmc::SceneDepth depth;
++  dstmc::Compositor compositor{camera_service()};
++  bool composited = false;
++  std::shared_ptr<const dstmc::FrameView> displayed;
++};
++std::map<CGLContextObj, std::unique_ptr<Context>> contexts;
++std::recursive_mutex contexts_mutex;
++Context &context() {
++  auto &c = contexts[CGLGetCurrentContext()];
++  if (!c)
++    c = std::make_unique<Context>();
++  return *c;
++}
++void before_draw(const dstmc::RenderProbe &p) {
++  if (!enabled())
++    return;
++  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
++  auto &c = context();
++  if (p.program_fingerprint !=
++          "1cedce6eb12563dcd2ef433dd70128f43272600fbc06755f8c0364af85f612c8" ||
++      !c.depth.texture())
++    return;
++  auto frame_key = key();
++  struct TargetState {
++    GLint fbo, viewport[4];
++    TargetState() {
++      glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
++      glGetIntegerv(GL_VIEWPORT, viewport);
++    }
++    ~TargetState() {
++      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++      glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    }
++  } target_state;
++  glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, c.depth.target());
++  auto camera = c.depth.camera();
++  glViewport(0, 0, camera.viewport[2], camera.viewport[3]);
++  auto result = c.compositor.compose(frame_key, camera, c.depth.texture());
++  c.composited = result.status == dstmc::ComposeStatus::COMPOSITED;
++  if (c.composited)
++    c.displayed = camera_service().ready(frame_key);
++  report_compose(camera, frame_key, result);
++}
++void after_draw(const dstmc::RenderProbe &p,
++                const std::function<void()> &replay) {
++  if (!enabled())
++    return;
++  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
++  context().depth.after_draw(p, replay);
++  if (context().depth.texture() && p.target_id == context().depth.target())
++    camera_service().resize(p.viewport[2], p.viewport[3]);
++}
++void present() {
++  if (!enabled())
++    return;
++  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
++  auto &c = context();
++  bool presented =
++      c.composited && c.displayed && camera_service().ready(c.displayed->key);
++  if (presented) {
++    c.compositor.hud(*c.displayed);
++    camera_service().release();
++  }
++  present_window(c.depth.camera().viewport[2], c.depth.camera().viewport[3],
++                 presented);
++  c.composited = false;
++  c.displayed.reset();
++  c.depth.reset();
++}
++void forget(CGLContextObj c) {
++  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
++  contexts.erase(c);
++  camera_service().release();
++}
++} // namespace bridge
++
+ namespace {
+-thread_local bool observing=false;
+-void (*original_flush)(id,SEL)=nullptr;
+-void (*original_dealloc)(id,SEL)=nullptr;
+-template<class F> void diagnostic(F fn) noexcept {if(observing)return;observing=true;try{fn();}catch(...){/* Diagnostics must never escape into the game's renderer. */}observing=false;}
+-void flush(id self,SEL cmd){diagnostic([]{dstmc::begin_present();});original_flush(self,cmd);}
+-void dealloc_context(id self,SEL cmd){auto c=[(NSOpenGLContext*)self CGLContextObj];diagnostic([&]{dstmc::forget_context(c);});original_dealloc(self,cmd);}
+-void draw_arrays(GLenum mode,GLint first,GLsizei count){glDrawArrays(mode,first,count);diagnostic([]{dstmc::after_draw("glDrawArrays");});}
+-void draw_elements(GLenum mode,GLsizei count,GLenum type,const GLvoid* indices){glDrawElements(mode,count,type,indices);diagnostic([]{dstmc::after_draw("glDrawElements");});}
+-CGLError destroy_context(CGLContextObj c){diagnostic([&]{dstmc::forget_context(c);});return CGLDestroyContext(c);}
+-#define INTERPOSE(replacement,original) __attribute__((used)) static struct {const void* replacement_ptr;const void* original_ptr;} hook_##original __attribute__((section("__DATA,__interpose")))={(const void*)&replacement,(const void*)&original}
+-INTERPOSE(draw_arrays,glDrawArrays);
+-INTERPOSE(draw_elements,glDrawElements);
+-INTERPOSE(destroy_context,CGLDestroyContext);
+-__attribute__((constructor)) void loaded(){@autoreleasepool {
+- const char* dir=getenv("DSTMC_PROBE_DIR");if(!dir||!*dir)return;
+- diagnostic([&]{dstmc::configure_probe(dir);Class cls=[NSOpenGLContext class];Method method=class_getInstanceMethod(cls,@selector(flushBuffer));if(!method)return;original_flush=(decltype(original_flush))method_setImplementation(method,(IMP)flush);
+- // Add a class-local dealloc override so inherited NSObject dealloc is never changed.
+- SEL selector=sel_registerName("dealloc");Method d=class_getInstanceMethod(cls,selector);original_dealloc=(decltype(original_dealloc))method_getImplementation(d);if(!class_addMethod(cls,selector,(IMP)dealloc_context,method_getTypeEncoding(d)))method_setImplementation(d,(IMP)dealloc_context);
+- std::ofstream(std::string(dir)+"/loaded.json")<<"{\"schema\":1,\"pid\":"<<getpid()<<",\"architecture\":\"x86_64\",\"present_hook\":\"NSOpenGLContext.flushBuffer\",\"draw_hooks\":[\"glDrawArrays\",\"glDrawElements\"],\"synthetic_draws\":false}\n";
+- });
+-}}
++thread_local bool observing = false;
++void (*original_flush)(id, SEL) = nullptr;
++void (*original_dealloc)(id, SEL) = nullptr;
++template <class F> void diagnostic(F fn) noexcept {
++  if (observing)
++    return;
++  observing = true;
++  try {
++    fn();
++  } catch (...) { /* Diagnostics must never escape into the game's renderer. */
++  }
++  observing = false;
++}
++void flush(id self, SEL cmd) {
++  diagnostic([] {
++    bridge::present();
++    dstmc::begin_present();
++  });
++  original_flush(self, cmd);
++}
++void dealloc_context(id self, SEL cmd) {
++  auto c = [(NSOpenGLContext *)self CGLContextObj];
++  diagnostic([&] {
++    bridge::forget(c);
++    dstmc::forget_context(c);
++  });
++  original_dealloc(self, cmd);
++}
++void draw_arrays(GLenum mode, GLint first, GLsizei count) {
++  if (observing) {
++    glDrawArrays(mode, first, count);
++    return;
++  }
++  dstmc::RenderProbe p;
++  diagnostic([&] {
++    if (bridge::enabled()) {
++      p = dstmc::inspect_draw("glDrawArrays");
++      bridge::before_draw(p);
++    }
++  });
++  glDrawArrays(mode, first, count);
++  diagnostic([&] {
++    bridge::after_draw(p, [&] { glDrawArrays(mode, first, count); });
++    dstmc::after_draw("glDrawArrays");
++  });
++}
++void draw_elements(GLenum mode, GLsizei count, GLenum type,
++                   const GLvoid *indices) {
++  if (observing) {
++    glDrawElements(mode, count, type, indices);
++    return;
++  }
++  dstmc::RenderProbe p;
++  diagnostic([&] {
++    if (bridge::enabled()) {
++      p = dstmc::inspect_draw("glDrawElements");
++      bridge::before_draw(p);
++    }
++  });
++  glDrawElements(mode, count, type, indices);
++  diagnostic([&] {
++    bridge::after_draw(p, [&] { glDrawElements(mode, count, type, indices); });
++    dstmc::after_draw("glDrawElements");
++  });
++}
++CGLError destroy_context(CGLContextObj c) {
++  diagnostic([&] {
++    bridge::forget(c);
++    dstmc::forget_context(c);
++  });
++  return CGLDestroyContext(c);
++}
++#define INTERPOSE(replacement, original)                                       \
++  __attribute__((used)) static struct {                                        \
++    const void *replacement_ptr;                                               \
++    const void *original_ptr;                                                  \
++  } hook_##original __attribute__((section("__DATA,__interpose"))) = {         \
++      (const void *)&replacement, (const void *)&original}
++INTERPOSE(draw_arrays, glDrawArrays);
++INTERPOSE(draw_elements, glDrawElements);
++INTERPOSE(destroy_context, CGLDestroyContext);
++__attribute__((constructor)) void loaded() {
++  @autoreleasepool {
++    const char *dir = getenv("DSTMC_PROBE_DIR");
++    if (!dir || !*dir)
++      return;
++    diagnostic([&] {
++      dstmc::configure_probe(dir);
++      bridge::start(dir);
++      Class cls = [NSOpenGLContext class];
++      Method method = class_getInstanceMethod(cls, @selector(flushBuffer));
++      if (!method)
++        return;
++      original_flush = (decltype(original_flush))method_setImplementation(
++          method, (IMP)flush);
++      // Add a class-local dealloc override so inherited NSObject dealloc is
++      // never changed.
++      SEL selector = sel_registerName("dealloc");
++      Method d = class_getInstanceMethod(cls, selector);
++      original_dealloc =
++          (decltype(original_dealloc))method_getImplementation(d);
++      if (!class_addMethod(cls, selector, (IMP)dealloc_context,
++                           method_getTypeEncoding(d)))
++        method_setImplementation(d, (IMP)dealloc_context);
++      std::ofstream(std::string(dir) + "/loaded.json")
++          << "{\"schema\":1,\"pid\":" << getpid()
++          << ",\"architecture\":\"x86_64\",\"present_hook\":\"NSOpenGLContext."
++             "flushBuffer\",\"draw_hooks\":[\"glDrawArrays\","
++             "\"glDrawElements\"],\"synthetic_draws\":false}\n";
++    });
++  }
+ }
++} // namespace
+diff --git a/native/src/scene_depth.mm b/native/src/scene_depth.mm
+new file mode 100644
+index 0000000..b539161
+--- /dev/null
++++ b/native/src/scene_depth.mm
+@@ -0,0 +1,130 @@
++#include "compositor.h"
++#include <OpenGL/glext.h>
++namespace dstmc {
++namespace {
++constexpr const char *ground =
++    "833d35bdce5a6750698019fa17b075405c0915e72b44dea61690ffef1a57bfd4";
++constexpr const char *sprite =
++    "4832ea38aab44e14f22f77a2345a4631960e1b1a340ccfe3a752e0dfa854c063";
++struct State {
++  GLint fbo, active, texture, unpack;
++  State() {
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack);
++    glPushAttrib(GL_ALL_ATTRIB_BITS);
++  }
++  ~State() {
++    glPopAttrib();
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++    glActiveTexture(active);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
++  }
++};
++} // namespace
++void SceneDepth::reset() {
++  valid_ = false;
++  target_ = -1;
++  camera_ = {};
++}
++bool SceneDepth::allocate(int w, int h) {
++  if (w == width_ && h == height_ && fbo_)
++    return true;
++  glDeleteTextures(1, &depth_);
++  glDeleteTextures(1, &color_);
++  glDeleteFramebuffersEXT(1, &fbo_);
++  depth_ = color_ = fbo_ = 0;
++  if (w <= 0 || h <= 0 || w > 1920 || h > 1080)
++    return false;
++  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++  glGenTextures(1, &depth_);
++  glBindTexture(GL_TEXTURE_2D, depth_);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, w, h, 0,
++               GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
++  for (GLenum param : {GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER})
++    glTexParameteri(GL_TEXTURE_2D, param, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  glGenTextures(1, &color_);
++  glBindTexture(GL_TEXTURE_2D, color_);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
++               nullptr);
++  glGenFramebuffersEXT(1, &fbo_);
++  glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo_);
++  glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT,
++                            GL_TEXTURE_2D, depth_, 0);
++  glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
++                            GL_TEXTURE_2D, color_, 0);
++  bool ok = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) ==
++            GL_FRAMEBUFFER_COMPLETE_EXT;
++  width_ = w;
++  height_ = h;
++  return ok;
++}
++void SceneDepth::after_draw(const RenderProbe &p,
++                            const std::function<void()> &replay) {
++  if (frame_ != p.frame_no) {
++    reset();
++    frame_ = p.frame_no;
++  }
++  if (p.viewport[0] || p.viewport[1] ||
++      p.depth_range != std::array<double, 2>{0, 1})
++    return;
++  if (p.program_fingerprint == ground && p.depth_enabled && p.depth_mask &&
++      p.depth_bits >= 24) {
++    State state;
++    if (!allocate(p.viewport[2], p.viewport[3]))
++      return;
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, p.target_id);
++    glBindTexture(GL_TEXTURE_2D, depth_);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width_, height_);
++    target_ = p.target_id;
++    valid_ = true;
++    return;
++  }
++  if (p.program_fingerprint != sprite || !valid_ || p.target_id != target_ ||
++      p.viewport[2] != width_ || p.viewport[3] != height_)
++    return;
++  bool alpha = false;
++  for (auto &s : p.shader_sources)
++    if (s.type == GL_FRAGMENT_SHADER && s.source_available &&
++        s.contains_discard && !s.writes_frag_depth)
++      alpha = true;
++  if (!alpha) {
++    reset();
++    return;
++  }
++  bool perspective = false;
++  for (auto &m : p.shader_matrices)
++    if (m.name == "MatrixP" && m.value[11] == -1 && m.value[15] == 0)
++      perspective = true;
++  if (!perspective) {
++    reset();
++    return;
++  }
++  // Original shader, sampler bindings, vertex streams and discard branch are
++  // retained.
++  State state;
++  glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo_);
++  glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
++  glEnable(GL_DEPTH_TEST);
++  glDepthMask(GL_TRUE);
++  glDepthFunc(GL_LESS);
++  glDisable(GL_BLEND);
++  // Reject zero final alpha too, including the render-only hidden local avatar.
++  glEnable(GL_ALPHA_TEST);
++  glAlphaFunc(GL_GREATER, 0);
++  replay();
++  camera_ = p;
++}
++SceneDepth::~SceneDepth() {
++  if (CGLGetCurrentContext() != owner_)
++    return;
++  glDeleteTextures(1, &depth_);
++  glDeleteTextures(1, &color_);
++  glDeleteFramebuffersEXT(1, &fbo_);
++}
++} // namespace dstmc
+diff --git a/native/tests/compositor_test.mm b/native/tests/compositor_test.mm
+new file mode 100644
+index 0000000..11c89b6
+--- /dev/null
++++ b/native/tests/compositor_test.mm
+@@ -0,0 +1,240 @@
++#include "compositor.h"
++#include <OpenGL/glext.h>
++#include <cassert>
++#include <iostream>
++using namespace dstmc;
++static std::array<float, 16> projection(float n, float f) {
++  return {1,
++          0,
++          0,
++          0,
++          0,
++          1,
++          0,
++          0,
++          0,
++          0,
++          -(f + n) / (f - n),
++          -1,
++          0,
++          0,
++          -2 * f * n / (f - n),
++          0};
++}
++static float depth(float distance, float n, float f) {
++  return (f / (f - n)) - (f * n / (f - n)) / distance;
++}
++static void sprite_replay_test(GLuint target) {
++  GLuint depth_buffer;
++  glGenRenderbuffersEXT(1, &depth_buffer);
++  glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, depth_buffer);
++  glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH_COMPONENT24, 2, 1);
++  glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT,
++                               GL_RENDERBUFFER_EXT, depth_buffer);
++  glDisable(GL_SCISSOR_TEST);
++  glDepthMask(GL_TRUE);
++  glClearDepth(.9);
++  glClear(GL_DEPTH_BUFFER_BIT);
++  const char *vs = "#version 120\nvoid main(){gl_Position=gl_Vertex;}";
++  const char *fs = "#version 120\nuniform float opacity; void "
++                   "main(){if(gl_FragCoord.x>1.)discard;gl_FragColor=vec4(1.,0."
++                   ",0.,opacity);}";
++  GLuint vertex = glCreateShader(GL_VERTEX_SHADER),
++         fragment = glCreateShader(GL_FRAGMENT_SHADER),
++         program = glCreateProgram();
++  glShaderSource(vertex, 1, &vs, nullptr);
++  glCompileShader(vertex);
++  glShaderSource(fragment, 1, &fs, nullptr);
++  glCompileShader(fragment);
++  glAttachShader(program, vertex);
++  glAttachShader(program, fragment);
++  glLinkProgram(program);
++  GLint linked;
++  glGetProgramiv(program, GL_LINK_STATUS, &linked);
++  assert(linked);
++  glUseProgram(program);
++  glUniform1f(glGetUniformLocation(program, "opacity"), 1);
++  RenderProbe p;
++  p.frame_no = 4;
++  p.target_id = target;
++  p.viewport = {0, 0, 2, 1};
++  p.depth_range = {0, 1};
++  p.depth_bits = 24;
++  p.depth_enabled = p.depth_mask = true;
++  p.program_fingerprint =
++      "833d35bdce5a6750698019fa17b075405c0915e72b44dea61690ffef1a57bfd4";
++  {
++    SceneDepth scene;
++    scene.after_draw(p, [] {});
++    assert(!scene.texture() && "ground_only_has_no_verified_camera");
++    p.program_fingerprint =
++        "4832ea38aab44e14f22f77a2345a4631960e1b1a340ccfe3a752e0dfa854c063";
++    p.depth_enabled = p.depth_mask = false;
++    p.shader_sources = {
++        {GL_FRAGMENT_SHADER, "test-silhouette", true, true, false}};
++    p.shader_matrices = {{"MatrixP", 0, projection(1, 200)}};
++    glDisable(GL_DEPTH_TEST);
++    glDepthMask(GL_FALSE);
++    glEnable(GL_BLEND);
++    uint8_t before[8], after[8];
++    glReadPixels(0, 0, 2, 1, GL_RGBA, GL_UNSIGNED_BYTE, before);
++    scene.after_draw(p, [] {
++      glBegin(GL_QUADS);
++      glVertex3f(-1, -1, 0);
++      glVertex3f(1, -1, 0);
++      glVertex3f(1, 1, 0);
++      glVertex3f(-1, 1, 0);
++      glEnd();
++    });
++    assert(scene.texture());
++    assert(!glIsEnabled(GL_DEPTH_TEST) && glIsEnabled(GL_BLEND));
++    GLboolean mask;
++    glGetBooleanv(GL_DEPTH_WRITEMASK, &mask);
++    assert(!mask);
++    GLint current;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &current);
++    assert(current == int(target));
++    glGetIntegerv(GL_CURRENT_PROGRAM, &current);
++    assert(current == int(program));
++    glReadPixels(0, 0, 2, 1, GL_RGBA, GL_UNSIGNED_BYTE, after);
++    assert(std::equal(before, before + 8, after) &&
++           "replay_preserves_host_color");
++    glBindTexture(GL_TEXTURE_2D, scene.texture());
++    float depth[2];
++    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depth);
++    assert(std::abs(depth[0] - .5) < .00001 &&
++           std::abs(depth[1] - .9) < .00001 &&
++           "sprite_discard_preserves_hole_depth");
++    scene.reset();
++    assert(!scene.texture() && scene.camera().shader_matrices.empty());
++    p.frame_no++;
++    p.program_fingerprint =
++        "833d35bdce5a6750698019fa17b075405c0915e72b44dea61690ffef1a57bfd4";
++    p.depth_enabled = p.depth_mask = true;
++    scene.after_draw(p, [] {});
++    p.program_fingerprint =
++        "4832ea38aab44e14f22f77a2345a4631960e1b1a340ccfe3a752e0dfa854c063";
++    p.depth_enabled = p.depth_mask = false;
++    glUniform1f(glGetUniformLocation(program, "opacity"), 0);
++    scene.after_draw(p, [] {
++      glBegin(GL_QUADS);
++      glVertex3f(-1, -1, 0);
++      glVertex3f(1, -1, 0);
++      glVertex3f(1, 1, 0);
++      glVertex3f(-1, 1, 0);
++      glEnd();
++    });
++    glBindTexture(GL_TEXTURE_2D, scene.texture());
++    glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depth);
++    assert(std::abs(depth[0] - .9) < .00001 &&
++           std::abs(depth[1] - .9) < .00001 &&
++           "hidden_avatar_final_zero_alpha_writes_no_depth");
++    assert(!glIsEnabled(GL_ALPHA_TEST) && "replay_alpha_test_state_restored");
++  }
++  glUseProgram(0);
++  glDeleteProgram(program);
++  glDeleteShader(vertex);
++  glDeleteShader(fragment);
++  glDeleteRenderbuffersEXT(1, &depth_buffer);
++  assert(glGetError() == GL_NO_ERROR);
++}
++int main() {
++  CGLPixelFormatAttribute attrs[] = {
++      kCGLPFAAccelerated,          kCGLPFAColorSize,
++      (CGLPixelFormatAttribute)24, kCGLPFADepthSize,
++      (CGLPixelFormatAttribute)24, (CGLPixelFormatAttribute)0};
++  CGLPixelFormatObj pf;
++  GLint count;
++  assert(CGLChoosePixelFormat(attrs, &pf, &count) == kCGLNoError);
++  CGLContextObj ctx;
++  assert(CGLCreateContext(pf, nullptr, &ctx) == kCGLNoError);
++  CGLDestroyPixelFormat(pf);
++  CGLSetCurrentContext(ctx);
++  GLuint fbo, tex, host;
++  glGenFramebuffersEXT(1, &fbo);
++  glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++  glGenTextures(1, &tex);
++  glBindTexture(GL_TEXTURE_2D, tex);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
++               nullptr);
++  glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT,
++                            GL_TEXTURE_2D, tex, 0);
++  assert(glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT) ==
++         GL_FRAMEBUFFER_COMPLETE_EXT);
++  glViewport(0, 0, 2, 1);
++  glClearColor(0, 0, 1, 1);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glGenTextures(1, &host);
++  glBindTexture(GL_TEXTURE_2D, host);
++  float hd[] = {depth(6, 1, 200), depth(6, 1, 200)};
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE32F_ARB, 2, 1, 0, GL_LUMINANCE,
++               GL_FLOAT, hd);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  uint8_t colors[] = {255, 0, 0, 255, 0, 0, 0, 0}, hud[8] = {};
++  float md[] = {depth(2, .05, 100), depth(2, .05, 100)};
++  auto f = std::make_shared<FrameView>();
++  f->width = 2;
++  f->height = 1;
++  f->key.id = 1;
++  f->color = colors;
++  f->depth = (uint8_t *)md;
++  f->hud = hud;
++  f->pose.view = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++  f->pose.projection = projection(.05, 100);
++  RenderProbe p;
++  p.viewport = {0, 0, 2, 1};
++  p.depth_range = {0, 1};
++  p.shader_matrices = {{"MatrixV", 0, f->pose.view},
++                       {"MatrixP", 1, projection(1, 200)}};
++  uint64_t now = 0;
++  CameraService service([&] { return now; });
++  service.offer(f, {});
++  service.lease_latest(f->key.pair_hash, f->key.epoch);
++  assert(service.camera_applied(f->key));
++  {
++    Compositor c(service);
++    glEnable(GL_SCISSOR_TEST);
++    glScissor(0, 0, 1, 1);
++    glEnable(GL_DEPTH_TEST);
++    glDepthMask(GL_TRUE);
++    glActiveTexture(GL_TEXTURE3);
++    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++    GLint before[4];
++    glGetIntegerv(GL_VIEWPORT, before);
++    assert(c.compose(f->key, p, host).status == ComposeStatus::COMPOSITED);
++    assert(glIsEnabled(GL_SCISSOR_TEST) && glIsEnabled(GL_DEPTH_TEST));
++    GLboolean mask;
++    glGetBooleanv(GL_DEPTH_WRITEMASK, &mask);
++    assert(mask);
++    GLint active;
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
++    assert(active == GL_TEXTURE3);
++    GLint after[4];
++    glGetIntegerv(GL_VIEWPORT, after);
++    assert(std::equal(before, before + 4, after));
++    uint8_t pixels[8];
++    glReadPixels(0, 0, 2, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++    assert(pixels[0] >= 254 && pixels[2] <= 1 && "closer_surface_wins");
++    assert(pixels[4] <= 1 && pixels[6] >= 254 &&
++           "transparent_pixel_preserves_host");
++    p.shader_matrices[0].value[0] = -1;
++    assert(c.compose(f->key, p, host).status ==
++               ComposeStatus::SKIPPED_MISMATCH &&
++           "reflected_view_rejected");
++    p.shader_matrices[0].value[0] = 1;
++    assert(c.compose(f->key, p, 0).status == ComposeStatus::DEPTH_UNAVAILABLE);
++    now = 250;
++    assert(c.compose(f->key, p, host).status == ComposeStatus::SKIPPED_STALE);
++    assert(glGetError() == GL_NO_ERROR);
++  }
++  sprite_replay_test(fbo);
++  glDeleteTextures(1, &host);
++  glDeleteTextures(1, &tex);
++  glDeleteFramebuffersEXT(1, &fbo);
++  CGLSetCurrentContext(nullptr);
++  CGLDestroyContext(ctx);
++  std::cout << "PASS transparent_pixel_preserves_host closer_surface_wins "
++               "ui_state_restored reflected_view_rejected "
++               "expired_compose_skipped sprite_discard_preserves_hole_depth\n";
++}
+diff --git a/native/tests/lease_test.cpp b/native/tests/lease_test.cpp
+new file mode 100644
+index 0000000..cd852c2
+--- /dev/null
++++ b/native/tests/lease_test.cpp
+@@ -0,0 +1,61 @@
++#include "camera_service.h"
++#include <cassert>
++#include <iostream>
++using namespace dstmc;
++static std::shared_ptr<FrameView> frame(uint64_t id = 1) {
++  auto f = std::make_shared<FrameView>();
++  f->key.id = id;
++  f->key.epoch[0] = 1;
++  f->width = 960;
++  f->height = 540;
++  f->pose.position = {1, 2, 3};
++  f->dst_origin = {10, 0, 20};
++  f->mc_origin = {0, 0, 0};
++  f->pose.view = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1, -2, -3, 1};
++  f->axes = {1, 0, 0, 0, 1, 0, 0, 0, 1};
++  return f;
++}
++int main(int argc, char **argv) {
++  if (argc == 2 && std::string(argv[1]) == "--http-fixture") {
++    std::string stop;
++    std::getline(std::cin, stop);
++    return 0;
++  }
++  uint64_t now = 1000;
++  CameraService s([&] { return now; });
++  auto f = frame();
++  s.offer(f, {});
++  auto l = s.lease_latest(f->key.pair_hash, f->key.epoch);
++  assert(l && l->pose.position.x == 11 && l->pose.position.z == 23);
++  auto next = frame(2);
++  s.offer(next, {});
++  assert(s.lease_latest(f->key.pair_hash, f->key.epoch)->key.id == 1 &&
++         "lease_pins_matching_pose");
++  assert(s.camera_applied(f->key));
++  assert(s.ready(f->key));
++  now += 250;
++  assert(!s.ready(f->key) && "stale_frame_releases_camera");
++  assert(!s.camera_applied(f->key) && "late_camera_ack_rejected");
++  s.offer(f, {});
++  assert(!s.lease_latest(f->key.pair_hash, f->key.epoch) &&
++         "expired_frame_must_not_be_released_again");
++  s.offer(next, {});
++  assert(s.lease_latest(next->key.pair_hash, next->key.epoch));
++  s.resize(1920, 1080);
++  assert(!s.camera_applied(next->key) && "retina_resize_cancels_lease");
++  auto newer = frame(3);
++  s.offer(newer, {});
++  s.release();
++  assert(!s.camera_applied(newer->key));
++  s.offer(newer, {});
++  assert(!s.lease_latest(newer->key.pair_hash, newer->key.epoch) &&
++         "release_invalidates_old_callbacks");
++  auto other = frame(1);
++  other->key.epoch[0] = 2;
++  s.offer(other, {});
++  assert(s.lease_latest(other->key.pair_hash, other->key.epoch));
++  assert(!s.camera_applied(f->key));
++  std::cout << "PASS lease_pins_matching_pose late_camera_ack_rejected "
++               "stale_frame_releases_camera retina_resize_cancels_lease "
++               "release_invalidates_old_callbacks\n";
++}
+diff --git a/tests/test_first_person_gate.py b/tests/test_first_person_gate.py
+new file mode 100644
+index 0000000..811c2d8
+--- /dev/null
++++ b/tests/test_first_person_gate.py
+@@ -0,0 +1,178 @@
++"""Task4 behavioral tests. Real graphics/input acceptance is a separate evidence gate."""
++import json
++import os
++import shutil
++import socket
++import struct
++import tempfile
++import threading
++import time
++import urllib.request
++import urllib.error
++from http.server import BaseHTTPRequestHandler, HTTPServer
++import pathlib
++import subprocess
++import unittest
++ROOT=pathlib.Path(__file__).resolve().parents[1]
++try:
++    from lupa import LuaRuntime
++except ImportError:
++    LuaRuntime=None
++
++class NativeGateTests(unittest.TestCase):
++    def test_lease_lifecycle(self):
++        result=subprocess.run([str(ROOT/'native/build/lease_test')],capture_output=True,text=True,check=True)
++        self.assertIn('late_camera_ack_rejected',result.stdout)
++    def test_real_offscreen_depth_and_state(self):
++        result=subprocess.run([str(ROOT/'native/build/compositor_test')],capture_output=True,text=True,check=True)
++        self.assertIn('transparent_pixel_preserves_host',result.stdout)
++        self.assertIn('closer_surface_wins',result.stdout)
++
++class NativeHttpTests(unittest.TestCase):
++    def test_exact_frame_ack_expiry_and_malformed_http(self):
++        for port in (39379,39380):
++            with socket.socket() as sock:
++                sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
++                try:sock.bind(('127.0.0.1',port))
++                except OSError:self.skipTest('test port unavailable; confirm game exit or TCP reuse delay')
++        fixture=json.loads((ROOT/'protocol/fixtures/frame-v2.json').read_text())
++        key={k:fixture[k] for k in ('pair','epoch','id')}
++        with tempfile.TemporaryDirectory(prefix='dstmc-http-fixture-') as temp:
++            temp=pathlib.Path(temp);frame=temp/'frame.bin'
++            shutil.copyfile(ROOT/'protocol/fixtures/frame-v2.bin',frame)
++            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'])
++            class Status(BaseHTTPRequestHandler):
++                def do_GET(self):
++                    data=json.dumps(status).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
++                def log_message(self,*args):pass
++            server=HTTPServer(('127.0.0.1',39379),Status)
++            thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True);thread.start()
++            env=os.environ|{'DSTMC_PROBE_DIR':str(temp),'DSTMC_FIRST_PERSON':'1','DYLD_INSERT_LIBRARIES':str(ROOT/'native/build/libdstmc_probe.dylib')}
++            proc=subprocess.Popen([str(ROOT/'native/build/lease_test'),'--http-fixture'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
++            def post(path,body):
++                data=body if isinstance(body,bytes) else json.dumps(body).encode()
++                request=urllib.request.Request('http://127.0.0.1:39380'+path,data=data,headers={'Content-Type':'application/json'})
++                try:response=urllib.request.urlopen(request,timeout=2)
++                except urllib.error.HTTPError as error:response=error
++                return response.status,json.loads(response.read())
++            try:
++                for _ in range(100):
++                    if (temp/'camera-gate.jsonl').exists():break
++                    if proc.poll() is not None:self.fail('HTTP fixture process exited before listening')
++                    time.sleep(.01)
++                request=dict(protocol=2,pair=key['pair'],epoch=key['epoch'],key=key)
++                for invalid in (b'',b'null',b'[]',b'{',b'{}'):
++                    code,response=post('/v2/camera/lease',invalid);self.assertEqual(code,409);self.assertEqual(response['error'],'GATE_NOT_READY')
++                code,response=post('/v2/camera/lease',request);self.assertEqual(code,200,response);self.assertEqual(response['lease']['key'],key);self.assertEqual(response['lease']['pose']['space'],'DST')
++                self.assertTrue(any(struct.unpack_from('<Q',frame.read_bytes(),4096+i*struct.unpack_from('<Q',frame.read_bytes(),32)[0]+8)[0] for i in range(3)))
++                code,response=post('/v2/camera/applied',request|{'applied':True});self.assertEqual(code,200);self.assertTrue(response['accepted'])
++                code,response=post('/v2/camera/applied',request|{'applied':1});self.assertEqual(code,409)
++                time.sleep(.26)
++                code,response=post('/v2/camera/applied',request|{'applied':True});self.assertEqual(code,200);self.assertFalse(response['accepted'])
++                code,response=post('/v2/camera/lease',request);self.assertEqual(code,409)
++                # With the expired slot released, publish a fresh fixture ID.
++                data=bytearray(frame.read_bytes());stride=struct.unpack_from('<Q',data,32)[0]
++                for i in range(3):
++                    offset=4096+i*stride
++                    self.assertEqual(struct.unpack_from('<Q',data,offset+8)[0],0)
++                    if struct.unpack_from('<Q',data,offset)[0]:struct.pack_into('<Q',data,offset+64,43)
++                frame.write_bytes(data);key['id']=43
++                code,response=post('/v2/camera/lease',request);self.assertEqual(code,200,response)
++                # Discovery has resized while the old exact frame is still pinned.
++                status['width']=fixture['width']+1
++                code,response=post('/v2/camera/lease',request);self.assertEqual(code,409,'resize must invalidate a pinned lease')
++                code,response=post('/v2/camera/applied',request|{'applied':True});self.assertFalse(response['accepted'])
++                self.assertIsNone(proc.poll())
++            finally:
++                if proc.poll() is None:proc.communicate('stop\n',timeout=3)
++                server.shutdown();server.server_close();thread.join(timeout=1)
++
++@unittest.skipUnless(LuaRuntime,'Lua behavioral checks require lupa (isolated test environment)')
++class LuaCameraTests(unittest.TestCase):
++    def setUp(self):
++        self.lua=LuaRuntime(unpack_returned_tuples=True)
++        self.lua.execute('''
++            clock=0; calls={}; updates=0
++            function GetTimeRealSeconds() return clock end
++            TheSim={}
++            for _,name in ipairs({'SetCameraPos','SetCameraDir','SetCameraUp','SetCameraFOV'}) do
++                TheSim[name]=function(self,...) table.insert(calls,{name,...}) end
++            end
++            TheCamera={Update=function() updates=updates+1 end}
++        ''')
++        self.camera=self.lua.execute((ROOT/'dst-mod/scripts/dstmc/camera.lua').read_text())
++        self.lua.globals().camera=self.camera
++        self.lua.execute('''
++            lease={key={id=3},pose={space='DST',position={x=1,y=2,z=3},forward={x=0,y=0,z=-1},up={x=0,y=1,z=0},projection={1,0,0,0,0,1,0,0,0,0,-1,-1,0,0,-2,0}}}
++            camera.Install(function() end)
++        ''')
++    def test_pose_applies_on_camera_thread_and_expires_on_real_clock(self):
++        self.lua.execute('assert(camera.ApplyLease(lease));assert(#calls==0);TheCamera:Update(0);assert(#calls==4);assert(calls[1][2]==1);clock=.201;TheCamera:Update(0);assert(#calls==4);assert(updates==2);assert(camera.Key()==nil)')
++    def test_avatar_render_alpha_restored_without_entity_visibility_changes(self):
++        self.lua.execute("""
++            color={.2,.4,.6,.75};visibility_changes=0
++            ThePlayer={IsValid=function()return true end,AnimState={}}
++            ThePlayer.AnimState.GetMultColour=function()return table.unpack(color)end
++            ThePlayer.AnimState.SetMultColour=function(self,r,g,b,a)color={r,g,b,a}end
++            ThePlayer.Hide=function()visibility_changes=visibility_changes+1 end
++            assert(camera.ApplyLease(lease));TheCamera:Update(0)
++            assert(color[4]==0,'leased first-person avatar must be invisible')
++            camera.Release();assert(color[4]==.75);assert(color[1]==.2);assert(visibility_changes==0)
++            assert(camera.ApplyLease(lease));TheCamera:Update(0);clock=.201;TheCamera:Update(0);assert(color[4]==.75)
++        """)
++
++    def test_release_cannot_restore_from_old_pose(self):
++        self.lua.execute('assert(camera.ApplyLease(lease));camera.Release();TheCamera:Update(0);assert(#calls==0);assert(camera.Key()==nil)')
++    def test_rejects_invalid_projection(self):
++        self.lua.execute('lease.pose.projection[6]=0;assert(not camera.ApplyLease(lease));TheCamera:Update(0);assert(#calls==0)')
++    def test_mod_exports_respect_strict_globals(self):
++        lua=LuaRuntime(unpack_returned_tuples=True)
++        lua.execute("""
++            GLOBAL=_G
++            ThePlayer={DoTaskInTime=function(self,delay,callback)callback()end,ListenForEvent=function()end}
++            function AddPrefabPostInit(name,callback)end
++            function AddPlayerPostInit(callback)callback(ThePlayer)end
++            function GetModConfigData(name)return false end
++            package.preload['dstmc/world']=function()return {LocalWorld=function()return {}end}end
++            package.preload['dstmc/connection']=function()return {Start=function()end,Release=function()end}end
++            package.preload['dstmc/camera']=function()return {Calibrate=function()return true end}end
++            print=function()end
++            setmetatable(_G,{__newindex=function(table,key,value)error('assign to undeclared variable '..key)end})
++        """)
++        lua.execute((ROOT/'dst-mod/modmain.lua').read_text())
++        lua.execute("assert(type(DSTMCFirstPersonCalibrate)=='function');assert(DSTMCFirstPersonCalibrate())")
++
++    def test_all_adapter_sources_parse(self):
++        for path in (ROOT/'dst-mod').rglob('*.lua'):
++            self.lua.execute('assert(load(...))',path.read_text())
++
++@unittest.skipUnless(LuaRuntime,'Lua behavioral checks require lupa')
++class LuaConnectionTests(unittest.TestCase):
++    def test_late_callback_does_not_reacquire_camera(self):
++        lua=LuaRuntime(unpack_returned_tuples=True)
++        lua.execute("""
++            clock=1;requests={};applied=0;released=0;print=function()end
++            function GetTimeRealSeconds() return clock end
++            package.preload['json']=function() return {encode=function(v)return setmetatable(v,{__concat=function()return "log"end}) end,decode=function(v)return v end} end
++            package.preload['dstmc/world']=function() return {LocalWorld=function()return {world_uuid='world',shard='Master'}end,Origin=function()return {x=0,y=0,z=0}end} end
++            package.preload['components/dstmcidentity']=function()return {NewUUID=function()return 'epoch'end}end
++            package.preload['dstmc/camera']=function()return {Install=function()end,Release=function()released=released+1 end,Key=function()return nil end,ApplyLease=function()applied=applied+1;return true end}end
++            TheSim={QueryServer=function(self,url,cb,method,body)table.insert(requests,{url=url,cb=cb,body=body})end}
++        """)
++        connection=lua.execute((ROOT/'dst-mod/scripts/dstmc/connection.lua').read_text())
++        lua.globals().connection=connection
++        lua.execute("""
++            connection.Start(true);connection.Update();assert(#requests==1)
++            requests[1].cb({protocol=2,fixture=false,mc_world='mc'},true,200);assert(#requests==2)
++            pair=requests[2].body.pair
++            requests[2].cb({epoch='epoch',pair=pair},true,200)
++            connection.Update();assert(#requests==3)
++            key={pair=pair,epoch='epoch',id=4}
++            requests[3].cb({epoch='epoch',latest_frame=key},true,200);assert(#requests==4)
++            connection.Update();assert(#requests==4) -- one camera request in flight
++            connection.Release()
++            requests[4].cb({lease={key=key}},true,200)
++            clock=3;connection.Update();assert(applied==0);assert(#requests==4)
++        """)
++
++if __name__=='__main__':unittest.main()
