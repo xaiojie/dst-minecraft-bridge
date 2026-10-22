@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Steam Launch Options wrapper; never invokes the DST executable directly."""
+import sys
+
+# Diagnostics and rejected starts must not write import caches, including helpers.
+sys.dont_write_bytecode = True
+
 import argparse
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 
 if __package__:

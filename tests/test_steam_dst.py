@@ -6,6 +6,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -209,6 +211,57 @@ class SteamWrapperTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn('%command%', output)
         self.assert_no_launch_effects()
+
+
+class FreshInterpreterReadOnlyTests(unittest.TestCase):
+    # Break: importing local helpers before suppression writes cache on otherwise read-only paths.
+    def test_diagnostic_and_rejected_startup_never_write_local_module_cache(self):
+        source = Path(__file__).resolve().parents[1] / 'tools/steam_dst.py'
+        with tempfile.TemporaryDirectory(prefix='steam-read-only-') as temporary:
+            root = Path(temporary).resolve()
+            tools = root / 'tools'
+            tools.mkdir()
+            script = tools / 'steam_dst.py'
+            script.write_bytes(source.read_bytes())
+            app = root / 'Game.app'
+            (tools / 'preflight.py').write_text(
+                'from pathlib import Path\n'
+                f'DEFAULT_EXE = Path({str(app / "Contents/MacOS/game")!r})\n'
+                f'DEFAULT_CLUSTER = Path({str(root / "cluster")!r})\n'
+                'def preflight(executable, cluster):\n'
+                '    return {"ready": False, "blockers": ["fixture_blocker"],\n'
+                '            "extension": {"path": "/fixture/probe.dylib", "architecture": "x86_64"},\n'
+                '            "permissions": {"allow_dyld_environment_variables": True,\n'
+                '                            "disable_library_validation": True}}\n')
+            # Even a regression must never cross a real external launch boundary.
+            (tools / 'subprocess.py').write_text(
+                'def run(*args, **kwargs):\n'
+                '    raise AssertionError("external launch forbidden in cache test")\n')
+            cases = [
+                ('help', ['--help'], {}, 0),
+                ('dry-run', ['--dry-run', str(app)], {}, 1),
+                ('missing-marker', [str(app)], {}, 2),
+                ('wrong-marker', [str(app)], {'SteamAppId': '1'}, 2),
+                ('conflicting-markers', [str(app)],
+                 {'SteamAppId': '322330', 'SteamGameId': '1'}, 2),
+                ('wrong-app', [str(root / 'Other.app')], {'SteamAppId': '322330'}, 2),
+            ]
+            for name, args, marker, expected_code in cases:
+                with self.subTest(path=name):
+                    cache = root / ('cache-' + name)
+                    result = subprocess.run(
+                        [sys.executable, '-S', str(script), *args],
+                        env={'PATH': os.environ.get('PATH', ''),
+                             'PYTHONPYCACHEPREFIX': str(cache), **marker},
+                        capture_output=True, text=True)
+                    self.assertEqual(expected_code, result.returncode, result.stderr)
+                    # Python bootstrap can populate its own stdlib cache before script
+                    # execution. Only imports caused by our wrapper are in this subtree.
+                    local_cache = cache / str(tools).lstrip('/')
+                    self.assertFalse(local_cache.exists(),
+                                     f'{name} wrote wrapper/helper cache: {list(local_cache.rglob("*"))}')
+                    self.assertFalse((tools / '__pycache__').exists())
+                    self.assertFalse((root / 'evidence').exists())
 
 
 if __name__ == '__main__':
