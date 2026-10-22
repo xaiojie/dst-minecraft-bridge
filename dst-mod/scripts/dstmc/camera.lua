@@ -31,7 +31,9 @@ end
 function M.ApplyLease(value)
     local p = value and value.pose
     if not p or p.space~="DST" or not vector(p.position) or not vector(p.forward) or not vector(p.up) or type(p.projection)~="table" or not finite(p.projection[6]) or p.projection[6]<=0 then return false end
-    lease=value;expires=now()+.20
+    -- Hold the applied pose until the next lease arrives; the connection loop
+    -- re-leases several times a second, and a dead client must release it.
+    lease=value;expires=now()+1.0
     return true
 end
 function M.Release() lease=nil;expires=0;calibration=nil;restore_avatar() end

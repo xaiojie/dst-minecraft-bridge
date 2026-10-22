@@ -160,7 +160,7 @@ class LuaCameraTests(unittest.TestCase):
             camera.Install(function() end)
         ''')
     def test_pose_applies_on_camera_thread_and_expires_on_real_clock(self):
-        self.lua.execute('assert(camera.ApplyLease(lease));assert(#calls==0);TheCamera:Update(0);assert(#calls==4);assert(calls[1][2]==1);clock=.201;TheCamera:Update(0);assert(#calls==4);assert(updates==2);assert(camera.Key()==nil)')
+        self.lua.execute('assert(camera.ApplyLease(lease));assert(#calls==0);TheCamera:Update(0);assert(#calls==4);assert(calls[1][2]==1);clock=1.01;TheCamera:Update(0);assert(#calls==4);assert(updates==2);assert(camera.Key()==nil)')
     def test_avatar_render_alpha_restored_without_entity_visibility_changes(self):
         self.lua.execute("""
             color={.2,.4,.6,.75};visibility_changes=0
@@ -171,7 +171,7 @@ class LuaCameraTests(unittest.TestCase):
             assert(camera.ApplyLease(lease));TheCamera:Update(0)
             assert(color[4]==0,'leased first-person avatar must be invisible')
             camera.Release();assert(color[4]==.75);assert(color[1]==.2);assert(visibility_changes==0)
-            assert(camera.ApplyLease(lease));TheCamera:Update(0);clock=.201;TheCamera:Update(0);assert(color[4]==.75)
+            assert(camera.ApplyLease(lease));TheCamera:Update(0);clock=1.01;TheCamera:Update(0);assert(color[4]==.75)
         """)
 
     def test_release_cannot_restore_from_old_pose(self):
@@ -226,6 +226,45 @@ class LuaConnectionTests(unittest.TestCase):
             connection.Release()
             requests[4].cb({lease={key=key}},true,200)
             clock=3;connection.Update();assert(applied==0);assert(#requests==4)
+        """)
+
+    def test_empty_stream_and_epoch_change_reconnect_instead_of_dying(self):
+        lua=LuaRuntime(unpack_returned_tuples=True)
+        lua.execute("""
+            clock=1;requests={};print=function()end
+            function GetTimeRealSeconds() return clock end
+            package.preload['json']=function() return {encode=function(v)return setmetatable(v,{__concat=function()return "log"end}) end,decode=function(v)return v end} end
+            package.preload['dstmc/world']=function() return {LocalWorld=function()return {world_uuid='world',shard='Master'}end,Origin=function()return {x=0,y=0,z=0}end} end
+            package.preload['components/dstmcidentity']=function()return {NewUUID=function()return 'epoch'end}end
+            package.preload['dstmc/camera']=function()return {Install=function()end,Release=function()end,Key=function()return nil end,ApplyLease=function()return true end}end
+            TheSim={QueryServer=function(self,url,cb,method,body)table.insert(requests,{url=url,cb=cb,body=body})end}
+            function last_request_matching(fragment,from)
+                from=from or 1
+                for i=#requests,from,-1 do if requests[i].url:find(fragment,1,true) then return i end end
+                return nil
+            end
+        """)
+        connection=lua.execute((ROOT/'dst-mod/scripts/dstmc/connection.lua').read_text())
+        lua.globals().connection=connection
+        lua.execute("""
+            connection.Start(true);connection.Update();assert(#requests==1)
+            requests[1].cb({protocol=2,fixture=false,mc_world='mc'},true,200)
+            pair=requests[2].body.pair
+            requests[2].cb({epoch='epoch',pair=pair},true,200)
+            -- PAIRED but the stream is briefly empty: keep the pairing, retry, never disable.
+            connection.Update()
+            local camera_status=last_request_matching('/v2/status')
+            assert(camera_status~=nil and camera_status>1)
+            requests[camera_status].cb({epoch='epoch',latest_frame=nil},true,200)
+            clock=2;local before=#requests;connection.Update()
+            assert(last_request_matching('/v2/status',before+1),'must retry the camera status')
+            assert(not last_request_matching('/v2/handshake',before+1),'must not re-pair for an empty stream')
+            requests[last_request_matching('/v2/exchange')].cb({protocol=2},true,200)
+            -- A rotated epoch must re-handshake instead of disabling the bridge.
+            requests[last_request_matching('/v2/status',before+1)].cb({epoch='other',latest_frame=nil},true,200)
+            clock=6;before=#requests;connection.Update()
+            assert(last_request_matching('/v2/status',before+1),'must ask for a new handshake')
+            assert(not last_request_matching('/v2/camera/lease',before+1),'must not lease while unpaired')
         """)
 
 if __name__=='__main__':unittest.main()
