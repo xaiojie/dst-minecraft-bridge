@@ -28,4 +28,4 @@ Steam 以 Intel 兼容模式运行时，会把直接调用的系统 Python 也�
 
 每次获准的实际请求使用 `evidence/steam-launches/` 下的独立目录。`request.json` 记录 PID、规范应用与可执行文件路径、请求的模块路径和 SHA、输出目录、Steam 应用标记、`open` 参数及时间；`preflight.json` 为捕获工具保留预检结果；`completion.json` 记录 `open` 返回码。`open` 返回成功不表示探针加载或在线。实际加载仍要查看同目录由原生模块生成的 `loaded.json`、`heartbeat.json` 和实时回调，再完成独立图形验收。
 
-本方案依据 [sgentle 的 2026 年 macOS Steam 启动记录](https://gist.github.com/sgentle/8cace35bfad585a2866a9e825a5203af)，其中 `.app` 替换行为是待本机验证的经验信息。包装器不创建 `steam_appid.txt`，不修改游戏包、签名或 Info.plist，不重启 Steam，不重建原生模块。
+本方案依据 [sgentle 的 2026 年 macOS Steam 启动记录](https://gist.github.com/sgentle/8cace35bfad585a2866a9e825a5203af)，其中 `.app` 替换行为已由本机 Steam 启动日志确认；加上 ARM Python 前缀后的真实重启及后续加载验收仍待完成。包装器不创建 `steam_appid.txt`，不修改游戏包、签名或 Info.plist，不重启 Steam，不重建原生模块。
