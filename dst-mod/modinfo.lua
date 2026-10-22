@@ -1,7 +1,7 @@
-name = "DST MC First Person Gate"
-description = "Local test-world camera and graphics gate. Requires the dedicated native launcher."
+name = "DST MC Fusion Bridge"
+description = "Local first-person building, collision and combat bridge. Requires the matching MC mod and native launcher."
 author = "Jay"
-version = "0.4.0"
+version = "0.5.0"
 api_version = 10
 dst_compatible = true
 all_clients_require_mod = false

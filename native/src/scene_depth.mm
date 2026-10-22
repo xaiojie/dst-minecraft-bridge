@@ -83,6 +83,7 @@ void SceneDepth::after_draw(const RenderProbe &p,
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width_, height_);
     target_ = p.target_id;
     valid_ = true;
+    camera_ = p;
     return;
   }
   if (p.program_fingerprint != sprite || !valid_ || p.target_id != target_ ||

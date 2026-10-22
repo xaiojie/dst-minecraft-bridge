@@ -65,3 +65,10 @@ $(BUILD)/transform_status_test: tests/transform_status_test.mm src/camera_http.m
 .PHONY: transform-status-test
 transform-status-test: $(BUILD)/transform_status_test
 	$(BUILD)/transform_status_test
+
+$(BUILD)/scene_pipeline_test: tests/scene_pipeline_test.mm src/entry.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp src/gl_observer.mm include/compositor.h include/camera_service.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/scene_pipeline_test.mm src/compositor.mm src/scene_depth.mm src/camera_service.cpp src/gl_observer.mm -o $@
+.PHONY: pipeline-test
+pipeline-test: $(BUILD)/scene_pipeline_test
+	$(BUILD)/scene_pipeline_test

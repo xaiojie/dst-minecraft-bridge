@@ -20,6 +20,7 @@ public:
   void offer(std::shared_ptr<FrameView>, std::shared_ptr<void> mapping);
   std::optional<FrameLease> lease_latest(PairKey, Epoch);
   bool camera_applied(FrameKey);
+  std::optional<FrameKey> acknowledged_key();
   std::shared_ptr<const FrameView> ready(FrameKey);
   // Pinned by a lease, whether or not the client has acknowledged it yet.
   std::shared_ptr<const FrameView> pinned(FrameKey);
@@ -47,6 +48,9 @@ private:
   // Newest offered frame; the next lease pins it at its own pose.
   std::shared_ptr<void> latest_mapping_;
   std::shared_ptr<FrameView> latest_;
+  std::shared_ptr<void> acknowledged_mapping_;
+  std::shared_ptr<FrameView> acknowledged_;
+  uint64_t acknowledged_deadline_{};
   FrameKey last_{};
   WorldTransform last_transform_{};
   bool have_last_ = false, acked_ = false, leased_ = false;

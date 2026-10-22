@@ -63,6 +63,8 @@ def lua_handshake():
         clock=1;requests={};print=function()end
         function GetTimeRealSeconds() return clock end
         package.preload['json']=function() return {encode=function(v)return v end,decode=function(v)return v end} end
+        package.preload['dstmc/gameplay']=function()return {Update=function()end}end
+        package.preload['dstmc/mailbox']=function()return {Active=function()return false end,Poll=function()end}end
         package.preload['dstmc/world']=function() return {
             LocalWorld=function()return {world_uuid='11111111-2222-4333-8444-555555555555',shard='Master'}end,
             Origin=function()return {x=12.5,y=0,z=-8.25}end} end

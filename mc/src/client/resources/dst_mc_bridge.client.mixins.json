@@ -8,7 +8,8 @@
     "BridgeSceneMixin",
     "FixtureWorldLoadMixin",
     "WindowCreateMixin",
-    "WindowPresentMixin"
+    "WindowPresentMixin",
+    "IntegratedServerPauseMixin"
   ],
   "injectors": {
     "defaultRequire": 1

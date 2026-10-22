@@ -2,6 +2,9 @@ local G=GLOBAL
 AddPrefabPostInit("world",function(inst)
     if inst.ismastersim and not inst:HasTag("cave") and not G.TheNet:IsDedicated() then inst:AddComponent("dstmcidentity") end
 end)
+AddPrefabPostInitAny(function(inst)
+    if G.TheWorld and G.TheWorld.ismastersim and inst.components.health and inst.components.combat and not inst.components.dstmcidentity then inst:AddComponent("dstmcidentity")end
+end)
 AddPlayerPostInit(function(player)
     player:DoTaskInTime(0,function()
         if player~=G.ThePlayer or not G.require("dstmc/world").LocalWorld() then return end

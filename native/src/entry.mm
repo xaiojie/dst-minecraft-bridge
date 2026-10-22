@@ -12,6 +12,11 @@ namespace bridge {
 struct Context {
   dstmc::SceneDepth depth;
   dstmc::Compositor compositor{camera_service()};
+  std::shared_ptr<const dstmc::FrameView> displayed;
+  dstmc::RenderProbe scene_camera;
+  bool sprite_state = false;
+  GLint depth_func{};
+  GLboolean depth_test{}, depth_mask{};
 };
 std::map<CGLContextObj, std::unique_ptr<Context>> contexts;
 std::recursive_mutex contexts_mutex;
@@ -22,18 +27,44 @@ Context &context() {
   return *c;
 }
 void before_draw(const dstmc::RenderProbe &p) {
-  // The scene is still being drawn here: this pass — and every pass after it —
-  // paints over whatever a composite written now would leave behind, so only
-  // the HUD survived into the presented image. Compositing is deferred to
-  // present(), which runs last, right before the back buffer is swapped.
-  (void)p;
+  if (!enabled()) return;
+  std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
+  auto &c = context();
+  bool sprite=p.program_fingerprint=="4832ea38aab44e14f22f77a2345a4631960e1b1a340ccfe3a752e0dfa854c063" && p.target_id==c.depth.target();
+  bool boundary=c.depth.terrain_texture() && p.target_id!=c.depth.target();
+  if(!sprite && !boundary)return;
+  // A target transition is also a scene boundary: empty landscapes may have no
+  // sprite draw. Insert into the terrain target before the following resolve.
+  auto camera=sprite?p:c.depth.camera();
+  if (!c.displayed) {
+    auto k=key();auto candidate=camera_service().pinned(k);
+    if(!candidate || !dstmc::matching_camera(*candidate,camera)){
+      auto ack=camera_service().acknowledged_key();if(ack){k=*ack;candidate=camera_service().ready(k);}
+    }
+    GLint original_fbo,viewport[4];glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT,&original_fbo);glGetIntegerv(GL_VIEWPORT,viewport);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,c.depth.target());glViewport(camera.viewport[0],camera.viewport[1],camera.viewport[2],camera.viewport[3]);
+    auto result=c.compositor.compose(k,camera,c.depth.terrain_texture(),true);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,original_fbo);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+    report_compose(camera,k,result);
+    if(result.status==dstmc::ComposeStatus::COMPOSITED){c.displayed=candidate;c.scene_camera=camera;}
+  }
+  if (sprite && c.displayed) {
+    c.depth_test=glIsEnabled(GL_DEPTH_TEST);glGetBooleanv(GL_DEPTH_WRITEMASK,&c.depth_mask);
+    glGetIntegerv(GL_DEPTH_FUNC,&c.depth_func);c.sprite_state=true;
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_FALSE);
+  }
 }
 void after_draw(const dstmc::RenderProbe &p,
                 const std::function<void()> &replay) {
-  if (!enabled())
-    return;
   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
-  context().depth.after_draw(p, replay);
+  auto &c=context();
+  if(c.sprite_state) {
+    if(c.depth_test)glEnable(GL_DEPTH_TEST);else glDisable(GL_DEPTH_TEST);
+    glDepthMask(c.depth_mask);glDepthFunc(c.depth_func);c.sprite_state=false;
+  }
+  if(!enabled()){c.displayed.reset();c.depth.reset();return;}
+  if(p.program_fingerprint=="833d35bdce5a6750698019fa17b075405c0915e72b44dea61690ffef1a57bfd4")c.displayed.reset();
+  c.depth.after_draw(p, replay);
   // Do NOT resize the camera service with the drawable viewport: the stream
   // size is the Minecraft framebuffer size advertised through /v2/status, and
   // resize() discards any pinned frame whose size differs. The compositor
@@ -42,46 +73,23 @@ void after_draw(const dstmc::RenderProbe &p,
   // discover_frame(), which has the authoritative status dimensions.
 }
 void present() {
-  if (!enabled())
-    return;
   std::lock_guard<std::recursive_mutex> lock(contexts_mutex);
   auto &c = context();
-  bool composited = false;
-  std::shared_ptr<const dstmc::FrameView> displayed;
-  if (c.depth.texture()) {
-    auto camera = c.depth.camera();
-    if (camera.viewport[2] > 0 && camera.viewport[3] > 0) {
-      GLint fbo = 0, viewport[4]{};
-      glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &fbo);
-      glGetIntegerv(GL_VIEWPORT, viewport);
-      // Composite into the drawable the window will present, after the whole
-      // host scene (ground, sprites, lighting, post passes) has been drawn.
-      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
-      glViewport(0, 0, camera.viewport[2], camera.viewport[3]);
-      auto frame_key = key();
-      auto result = c.compositor.compose(frame_key, camera, c.depth.texture());
-      composited = result.status == dstmc::ComposeStatus::COMPOSITED;
-      if (composited)
-        displayed = camera_service().pinned(frame_key);
-      report_compose(camera, frame_key, result);
-      glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
-      glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-    }
-  }
-  bool presented = composited && displayed;
-  // Window activation proof additionally requires the acknowledgement, but the
-  // HUD and the composited image do not.
-  bool proven = presented && camera_service().ready(displayed->key);
-  if (presented) {
+  if(!enabled()){c.displayed.reset();c.depth.reset();return;}
+  auto displayed=c.displayed;
+  bool proven=displayed && camera_service().ready(displayed->key);
+  if(displayed) {
+    GLint fbo,viewport[4];glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT,&fbo);glGetIntegerv(GL_VIEWPORT,viewport);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,0);
+    glViewport(0,0,c.scene_camera.viewport[2],c.scene_camera.viewport[3]);
+    // Captured after hand rendering and GUI: these stay in the foreground,
+    // like native MC first person, independently of world occlusion.
     c.compositor.hud(*displayed);
-    // Do not release the pin here: the pose is still applied to the host
-    // camera, so the same frame may be composited on following draws until the
-    // client leases a new pose or the lease expires. Releasing made every other
-    // draw fall back to the host-only image.
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,fbo);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
   }
-  present_window(c.depth.camera().viewport[2], c.depth.camera().viewport[3],
-                 proven ? std::optional<dstmc::FrameKey>(displayed->key)
-                        : std::nullopt);
+  present_window(c.scene_camera.viewport[2],c.scene_camera.viewport[3],
+      proven ? std::optional<dstmc::FrameKey>(displayed->key) : std::nullopt);
+  c.displayed.reset();
   c.depth.reset();
 }
 void forget(CGLContextObj c) {
@@ -91,6 +99,7 @@ void forget(CGLContextObj c) {
 }
 } // namespace bridge
 
+#ifndef DSTMC_PIPELINE_TEST
 namespace {
 thread_local bool observing = false;
 void (*original_flush)(id, SEL) = nullptr;
@@ -205,3 +214,5 @@ __attribute__((constructor)) void loaded() {
   }
 }
 } // namespace
+
+#endif // DSTMC_PIPELINE_TEST

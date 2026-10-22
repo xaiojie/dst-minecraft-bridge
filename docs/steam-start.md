@@ -1,12 +1,12 @@
 # 从 Steam 启动 macOS DST 探针
 
-此包装器必须由 Steam 调用。已在本机 Steam 日志中确认 `%command%` 正确传入 DST `.app`；原来的直接脚本入口因 Intel 模式下的系统 Python 启动失败而退出。下面的 ARM 启动前缀已通过本机实测：用户由 Steam 进入原测试世界，x86_64 探针加载且持续产生绘制回调。两款游戏的合成、输入和遮挡验收仍未完成，部分后台 Klei 服务仍有 SSL 错误。
+此包装器必须由 Steam 调用。下方路径对应本轮工作树；迁移目录后以 `tools/launch_bridge.py` 打印的路径为准。已在本机 Steam 日志中确认 `%command%` 正确传入 DST `.app`；原来的直接脚本入口因 Intel 模式下的系统 Python 启动失败而退出。下面的 ARM 启动前缀已通过本机实测：用户由 Steam 进入原测试世界，x86_64 探针加载且持续产生绘制回调。两款游戏的合成、输入和遮挡验收仍未完成，部分后台 Klei 服务仍有 SSL 错误。
 
 1. 先复制保存 Steam → Don't Starve Together → 属性 → 通用中现有的「启动选项」。退出已运行的 DST。
 2. 在「启动选项」中使用下面这一整行。路径外的双引号和 `%command%` 都要保留。现有游戏参数放在 `%command%` 后；如果原配置包含其他包装器，先人工检查组合方式。
 
    ```text
-   /usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/dst-minecraft-bridge-3/tools/steam_dst.py" %command%
+   /usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/饥荒融合MC/implementation/tools/steam_dst.py" %command%
    ```
 
 3. 点击 Steam「开始游戏」，进入原测试世界。
@@ -21,7 +21,7 @@ Steam 以 Intel 兼容模式运行时，会把直接调用的系统 Python 也�
 可先从终端运行只读检查：
 
 ```sh
-/usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/dst-minecraft-bridge-3/tools/steam_dst.py" --dry-run
+/usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/饥荒融合MC/implementation/tools/steam_dst.py" --dry-run
 ```
 
 它不会创建文件或启动任何应用。普通终端缺少 Steam 标记时会列出相应阻塞项；这不是启动旁路。`--help` 同样只读。

@@ -78,6 +78,7 @@ int main(int argc, char **argv) {
   auto pinned = s.lease_latest(next->key.pair_hash, next->key.epoch);
   assert(pinned && pinned->key.id == 2 && "lease_pins_newest_frame");
   assert(!s.ready(next->key) && "new_lease_requires_new_ack");
+  assert(s.ready(f->key) && s.pinned(f->key) && "acked_frame_survives_next_lease_until_pose_changes");
   assert(s.camera_applied(next->key));
   assert(s.ready(next->key) && "acked_frame_composites_on_every_draw");
   assert(s.ready(next->key) && "pin_survives_presentation");

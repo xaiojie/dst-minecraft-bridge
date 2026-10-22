@@ -12,7 +12,9 @@ public final class BridgeClient implements ClientModInitializer {
     public static Pose renderPose;
     public static boolean active(){var mc=Minecraft.getInstance();var bridge=BridgeMod.server;return bridge!=null && bridge.active()!=null && mc.level!=null && mc.level.dimension().equals(BridgeServer.STAGE);}
     @Override public void onInitializeClient(){
+        net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry.register(dev.jay.dstmc.server.BridgeRegistries.ACTOR, net.minecraft.client.renderer.entity.NoopRenderer::new);
         ClientTickEvents.END_CLIENT_TICK.register(mc->{
+            InputOwnership.tick();
             PassthroughWindow.tick();
             if(Boolean.getBoolean("dstmc.frameFixture")){
                 String screen=mc.screen==null?"game":mc.screen.getClass().getName()+": "+mc.screen.getTitle().getString();

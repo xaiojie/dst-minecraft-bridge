@@ -12,6 +12,8 @@ CameraService::CameraService(Clock clock)
                             .count());
       }) {}
 void CameraService::discard() {
+  acknowledged_.reset();
+  acknowledged_mapping_.reset();
   frame_.reset();
   mapping_.reset();
   latest_.reset();
@@ -19,12 +21,10 @@ void CameraService::discard() {
   acked_ = leased_ = false;
 }
 void CameraService::expire() {
+  if(acknowledged_ && clock_()>=acknowledged_deadline_){acknowledged_.reset();acknowledged_mapping_.reset();}
   if (frame_ && clock_() >= deadline_) {
-    // The applied pose is no longer guaranteed; stop compositing but keep the
-    // newest frame so the next lease can pin it without another file read.
-    frame_.reset();
-    mapping_.reset();
-    acked_ = leased_ = false;
+    discard(); // Expiry releases both slot references; old pixels cannot renew.
+
   }
 }
 void CameraService::offer(std::shared_ptr<FrameView> f,
@@ -57,6 +57,9 @@ std::optional<FrameLease> CameraService::lease_latest(PairKey pair,
   if (!latest_ || latest_->key.pair_hash != pair ||
       latest_->key.epoch != epoch)
     return {};
+  if (frame_ && leased_ && same_key(frame_->key, latest_->key)) {
+    return FrameLease{frame_->key, pose_to_dst(*frame_, frame_->pose), frame_->width, frame_->height};
+  }
   // Pin the newest frame at the authoritative pose the client must apply.
   frame_ = latest_;
   mapping_ = latest_mapping_;
@@ -78,33 +81,29 @@ bool CameraService::camera_applied(FrameKey k) {
   if (!frame_ || !leased_ || !same_key(frame_->key, k))
     return false;
   acked_ = true;
+  acknowledged_=frame_;acknowledged_mapping_=mapping_;acknowledged_deadline_=deadline_;
   return true;
 }
 std::shared_ptr<const FrameView> CameraService::pinned(FrameKey k) {
   std::lock_guard<std::mutex> lock(mutex_);
   expire();
-  if (!frame_ || !leased_ || !same_key(frame_->key, k))
-    return {};
-  struct Held {
-    std::shared_ptr<void> mapping;
-    std::shared_ptr<FrameView> frame;
-  };
-  auto h = std::make_shared<Held>(Held{mapping_, frame_});
-  return std::shared_ptr<const FrameView>(h, frame_.get());
+  auto chosen=frame_;auto mapping=mapping_;
+  if(!chosen || !leased_ || !same_key(chosen->key,k)){chosen=acknowledged_;mapping=acknowledged_mapping_;}
+  if(!chosen || !same_key(chosen->key,k))return {};
+  struct Held {std::shared_ptr<void> mapping;std::shared_ptr<FrameView> frame;};
+  auto held=std::make_shared<Held>(Held{mapping,chosen});
+  return std::shared_ptr<const FrameView>(held,chosen.get());
+}
+std::optional<FrameKey> CameraService::acknowledged_key(){
+  std::lock_guard<std::mutex> lock(mutex_);expire();
+  return acknowledged_?std::optional<FrameKey>(acknowledged_->key):std::nullopt;
 }
 std::shared_ptr<const FrameView> CameraService::ready(FrameKey k) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  expire();
-  if (!frame_ || !acked_ || !same_key(frame_->key, k))
-    return {};
-  // Returned alias retains both mmap and slot until the render operation
-  // finishes.
-  struct Held {
-    std::shared_ptr<void> mapping;
-    std::shared_ptr<FrameView> frame;
-  };
-  auto h = std::make_shared<Held>(Held{mapping_, frame_});
-  return std::shared_ptr<const FrameView>(h, frame_.get());
+  std::lock_guard<std::mutex> lock(mutex_);expire();
+  if(!acknowledged_ || !same_key(acknowledged_->key,k))return {};
+  struct Held {std::shared_ptr<void> mapping;std::shared_ptr<FrameView> frame;};
+  auto held=std::make_shared<Held>(Held{acknowledged_mapping_,acknowledged_});
+  return std::shared_ptr<const FrameView>(held,acknowledged_.get());
 }
 bool CameraService::validate_transform(const WorldTransform &t) {
   std::lock_guard<std::mutex> lock(mutex_);

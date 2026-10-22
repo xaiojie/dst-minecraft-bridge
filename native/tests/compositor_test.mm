@@ -240,6 +240,28 @@ int main() {
     assert(pixels[0] >= 254 && pixels[2] <= 1 && "closer_surface_wins");
     assert(pixels[4] <= 1 && pixels[6] >= 254 &&
            "transparent_pixel_preserves_host");
+    // Scene insertion must write HOST depth, allowing original alpha sprites to
+    // blend over MC while opaque fragments behind the cube fail depth testing.
+    GLuint db;glGenRenderbuffersEXT(1,&db);glBindRenderbufferEXT(GL_RENDERBUFFER_EXT,db);
+    glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT,GL_DEPTH_COMPONENT24,2,1);
+    glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT,GL_DEPTH_ATTACHMENT_EXT,GL_RENDERBUFFER_EXT,db);
+    glDisable(GL_SCISSOR_TEST);glClearDepth(1);glClear(GL_DEPTH_BUFFER_BIT);
+    assert(c.compose(f->key,p,host,true).status==ComposeStatus::COMPOSITED);
+    float written[2];glReadPixels(0,0,2,1,GL_DEPTH_COMPONENT,GL_FLOAT,written);
+    assert(std::abs(written[0]-depth(2,1,200))<.00001 && written[1]>.99999);
+    glUseProgram(0);glEnable(GL_DEPTH_TEST);glDepthMask(GL_FALSE);glDepthFunc(GL_LESS);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glMatrixMode(GL_PROJECTION);glLoadIdentity();glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+    glColor4f(0,1,0,.5);glBegin(GL_QUADS);glVertex3f(-1,-1,-.5);glVertex3f(0,-1,-.5);glVertex3f(0,1,-.5);glVertex3f(-1,1,-.5);glEnd();
+    glReadPixels(0,0,2,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    assert(pixels[0]>120 && pixels[0]<136 && pixels[1]>120 && pixels[1]<136 && "alpha_foreground_blends_with_MC_not_old_background");
+    glColor4f(0,0,1,1);glBegin(GL_QUADS);glVertex3f(-1,-1,.9);glVertex3f(0,-1,.9);glVertex3f(0,1,.9);glVertex3f(-1,1,.9);glEnd();
+    glReadPixels(0,0,2,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    assert(pixels[2]<2 && "behind_sprite_rejected_by_MC_depth");
+    hud[0]=255;hud[1]=255;hud[3]=255;c.hud(*f);
+    glReadPixels(0,0,2,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    assert(pixels[0]>253 && pixels[1]>253 && "hand_HUD_is_foreground");
+    glDeleteRenderbuffersEXT(1,&db);
     p.shader_matrices[0].value[0] = -1;
     assert(c.compose(f->key, p, host).status ==
                ComposeStatus::SKIPPED_MISMATCH &&

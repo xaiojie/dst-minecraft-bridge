@@ -75,9 +75,10 @@ GLuint program(const char *fragment) {
   }
   return p;
 }
-void quad() {
-  glDisable(GL_DEPTH_TEST);
-  glDepthMask(GL_FALSE);
+void quad(bool write_depth = false) {
+  if (write_depth) { glEnable(GL_DEPTH_TEST); glDepthFunc(GL_ALWAYS); }
+  else glDisable(GL_DEPTH_TEST);
+  glDepthMask(write_depth ? GL_TRUE : GL_FALSE);
   glDisable(GL_ALPHA_TEST);
   glDisable(GL_SCISSOR_TEST);
   glDisable(GL_STENCIL_TEST);
@@ -107,13 +108,14 @@ void upload(GLuint texture, int unit, int w, int h, GLenum internal,
   glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, format, type, pixels);
 }
 const char *fragment = R"GLSL(#version 120
-varying vec2 uv;uniform sampler2D mcColor,mcDepth,hostDepth;uniform mat4 inverseMC,inverseHost;
+varying vec2 uv;uniform sampler2D mcColor,mcDepth,hostDepth;uniform mat4 inverseMC,inverseHost,hostProjection;
 void main(){vec4 color=texture2D(mcColor,uv);if(color.a<=0.)discard;
  float md=texture2D(mcDepth,uv).r,hd=texture2D(hostDepth,uv).r;
  if(md>=1.||md<0.)discard;
  vec4 m=inverseMC*vec4(uv*2.-1.,md*2.-1.,1.);vec4 h=inverseHost*vec4(uv*2.-1.,hd*2.-1.,1.);
  if(abs(m.w)<0.000001||abs(h.w)<0.000001)discard;
- float mz=-m.z/m.w,hz=-h.z/h.w;if(mz<=0.||(hd<1.&&mz>=hz))discard;gl_FragColor=color;}
+ float mz=-m.z/m.w,hz=-h.z/h.w;if(mz<=0.||(hd<1.&&mz>=hz))discard;vec4 clip=hostProjection*vec4(m.xyz/m.w,1.);
+ gl_FragDepth=clamp(clip.z/clip.w*.5+.5,0.,1.);gl_FragColor=color;}
 )GLSL";
 } // namespace
 bool inverse_matrix(const std::array<float, 16> &a,
@@ -187,7 +189,7 @@ bool matching_camera(const FrameView &f, const RenderProbe &p) {
   return true;
 }
 ComposeResult Compositor::compose(FrameKey key, const RenderProbe &p,
-                                  GLuint depth) {
+                                  GLuint depth, bool write_scene_depth) {
   // Compose the frame pinned by the current lease even before its
   // acknowledgement lands: matching_camera() already proves that the host
   // camera carries this exact frame's pose, so composing it is safe and the
@@ -229,7 +231,8 @@ ComposeResult Compositor::compose(FrameKey key, const RenderProbe &p,
                      mc.data());
   glUniformMatrix4fv(glGetUniformLocation(program_, "inverseHost"), 1, GL_FALSE,
                      host.data());
-  quad();
+  glUniformMatrix4fv(glGetUniformLocation(program_, "hostProjection"), 1, GL_FALSE, projection->data());
+  quad(write_scene_depth);
   return {ComposeStatus::COMPOSITED, "matched complete frame"};
 }
 void Compositor::hud(const FrameView &f) {

@@ -2,6 +2,7 @@
 #import <Cocoa/Cocoa.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fcntl.h>
 #include <fstream>
@@ -21,7 +22,10 @@ struct State {
   NSDictionary *window_info = nil;
   WindowProof window_proof;
   bool enabled = false;
+  std::atomic<bool> input_mc{true};
+  uint64_t input_version=0;
   std::string directory;
+  std::string mailbox_directory;
 };
 State &state() {
   static auto *value = new State;
@@ -34,7 +38,7 @@ uint64_t milliseconds() {
 }
 } // namespace
 dstmc::CameraService &camera_service() { return state().service; }
-bool enabled() { return state().enabled; }
+bool enabled() { return state().enabled && state().input_mc; }
 dstmc::FrameKey key() {
   std::lock_guard<std::mutex> lock(state().key_mutex);
   return state().current_key;
@@ -212,8 +216,8 @@ void discover_frame(dstmc::FrameKey expected) {
   if (![s[@"pair"] isEqual:object(s[@"latest_frame"])[@"pair"]] ||
       ![s[@"epoch"] isEqual:object(s[@"latest_frame"])[@"epoch"]])
     throw std::runtime_error("status session mismatch");
-  if (state().service.lease_latest(expected.pair_hash, expected.epoch))
-    return; // Keep the existing slot; never attempt a second reader lease.
+  auto pinned = state().service.pinned(latest);
+  if (pinned) return; // Reuse only this exact publication, never an older slot.
   int fd = open(path.fileSystemRepresentation, O_RDWR | O_NOFOLLOW);
   if (fd < 0)
     throw std::runtime_error("frame open failed");
@@ -230,13 +234,9 @@ void discover_frame(dstmc::FrameKey expected) {
   close(fd);
   if (mapping->base == MAP_FAILED)
     throw std::runtime_error("mapping failed");
-  auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
-  // A slow round trip can let the requested slot rotate out of the three-slot
-  // ring. Fall back to the newest published frame of the same session; the
-  // lease then reports that frame's key so pose, pixels and acknowledgement all
-  // name one exact frame.
-  if (!frame && !dstmc::same_key(latest, expected))
-    frame = dstmc::read_frame(mapping->base, mapping->length, latest);
+  // The status publication is authoritative. The caller's older key is only
+  // a session hint; reading it first can perpetually reacquire frozen pixels.
+  auto frame = dstmc::read_frame(mapping->base, mapping->length, latest);
   if (!frame)
     throw std::runtime_error("exact complete frame unavailable");
   if (!dstmc::same_transform(*frame,transform))
@@ -265,6 +265,31 @@ NSDictionary *vec(dstmc::Vec3 v) {
   return @{@"x" : @(v.x), @"y" : @(v.y), @"z" : @(v.z)};
 }
 NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
+  static std::recursive_mutex requests;
+  std::lock_guard<std::recursive_mutex> request_lock(requests);
+  if([path isEqual:@"/v2/camera/cycle"] && [method isEqual:@"POST"]) {
+    auto ack=handle(@"/v2/camera/applied",method,body);
+    if(![ack[@"accepted"] boolValue])throw std::runtime_error("cycle acknowledgement expired");
+    NSMutableDictionary *next=[NSMutableDictionary dictionaryWithDictionary:body];[next removeObjectForKey:@"applied"];
+    return handle(@"/v2/camera/lease",method,next);
+  }
+  if ([path hasPrefix:@"/v2/input"]) {
+    std::lock_guard<std::mutex> lock(state().key_mutex);
+    auto expected=WindowProof::request(state().current_key);expected.replace(0,10,"/v2/input");
+    if ([method isEqual:@"GET"]) {
+      if(expected!=path.UTF8String)throw std::runtime_error("input session mismatch");
+    } else if([method isEqual:@"POST"] && [path isEqual:@"/v2/input"]) {
+      fields(body,@[@"protocol",@"key",@"owner",@"version"]);
+      auto requested=parse_key(object(body[@"key"]));
+      if(![body[@"protocol"] isEqual:@2]||requested.pair_hash!=state().current_key.pair_hash||requested.epoch!=state().current_key.epoch)throw std::runtime_error("input session mismatch");
+      NSString *owner=string(body[@"owner"]);
+      if(![owner isEqual:@"MC"]&&![owner isEqual:@"DST"])throw std::runtime_error("input owner");
+      if([body[@"version"] unsignedLongLongValue]!=state().input_version)throw std::runtime_error("input revision conflict");
+      state().input_mc=[owner isEqual:@"MC"];state().input_version++;
+    } else throw std::runtime_error("input method");
+    return @{@"protocol":@2,@"owner":state().input_mc?@"MC":@"DST",@"version":@(state().input_version)};
+  }
+
   if ([path hasPrefix:@"/v2/window"] && [method isEqual:@"GET"]) {
     std::lock_guard<std::mutex> lock(state().window_mutex);
     if (!state().window_info ||
@@ -323,6 +348,7 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
     throw std::runtime_error("different frame pinned or stale");
   {
     std::lock_guard<std::mutex> lock(state().key_mutex);
+    if(state().current_key.pair_hash!=l->key.pair_hash||state().current_key.epoch!=l->key.epoch){state().input_mc=true;state().input_version++;}
     state().current_key = l->key;
   }
   NSDictionary *leased_key = @{
@@ -342,6 +368,8 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
     @"protocol" : @2,
     @"pair" : body[@"pair"],
     @"epoch" : body[@"epoch"],
+    @"mailbox" : [NSString stringWithUTF8String:state().mailbox_directory.c_str()],
+    @"input_owner" : state().input_mc?@"MC":@"DST",
     @"lease" : @{
       @"key" : leased_key,
       @"pose" : pose,
@@ -543,6 +571,32 @@ void serve(int server) {
   }
   close(server);
 }
+void serve_mailbox() {
+  std::string previous;
+  while(true) {
+    @autoreleasepool {
+      NSString *requestPath=[NSString stringWithUTF8String:(state().mailbox_directory+"/request.json").c_str()];
+      NSData *data=[NSData dataWithContentsOfFile:requestPath];
+      if(data && data.length<16384) {
+        id value=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if([value isKindOfClass:[NSDictionary class]]) {
+          NSDictionary *r=value;id identifier=r[@"id"];
+          if([identifier isKindOfClass:[NSString class]] && std::string([identifier UTF8String])!=previous) {
+            previous=[identifier UTF8String];NSDictionary *reply;
+            try {
+              NSString *route=string(r[@"path"]);
+              if(![route hasPrefix:@"/v2/camera/"])throw std::runtime_error("invalid mailbox route");
+              reply=@{@"id":identifier,@"value":handle(route,@"POST",object(r[@"body"]))};
+            }catch(const std::exception &e){reply=@{@"id":identifier,@"error":[NSString stringWithUTF8String:e.what()]};}
+            NSData *output=[NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
+            [output writeToFile:[NSString stringWithUTF8String:(state().mailbox_directory+"/response.json").c_str()] options:NSDataWritingAtomic error:nil];
+          }
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+  }
+}
 void start(const char *dir) {
   if (!getenv("DSTMC_FIRST_PERSON"))
     return;
@@ -565,7 +619,20 @@ void start(const char *dir) {
     });
     return;
   }
+  state().mailbox_directory=state().directory+"/camera-mailbox";
+  if(mkdir(state().mailbox_directory.c_str(),0700)==0)std::thread(serve_mailbox).detach();
+  else state().mailbox_directory.clear();
   state().enabled = true;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
+      if(event.keyCode==100 && !event.isARepeat) {
+        std::lock_guard<std::mutex> lock(state().key_mutex);
+        state().input_mc=!state().input_mc.load();state().input_version++;
+        return nil;
+      }
+      return event;
+    }];
+  });
   std::thread(serve, server).detach();
   log(@{@"event" : @"camera_service_started", @"port" : @39380});
 }
@@ -589,7 +656,9 @@ void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
       @"frame" : @(key.id),
       @"status" : @(int(result.status)),
       @"reason" : [NSString stringWithUTF8String:result.reason.c_str()],
-      @"lease" : @{
+      @"mailbox" : [NSString stringWithUTF8String:state().mailbox_directory.c_str()],
+    @"input_owner" : state().input_mc?@"MC":@"DST",
+    @"lease" : @{
         @"pinned" : @(ls.pinned),
         @"acked" : @(ls.acked),
         @"leased" : @(ls.leased),

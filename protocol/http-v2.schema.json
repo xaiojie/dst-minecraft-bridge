@@ -467,7 +467,14 @@
         "commands": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/Command"
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Command"
+              },
+              {
+                "$ref": "#/$defs/WorldSnapshotCommand"
+              }
+            ]
           }
         },
         "damage_events": {
@@ -504,20 +511,46 @@
             "$ref": "#/$defs/CommandResult"
           }
         },
-        "actors": {
-          "$ref": "#/$defs/ActorSnapshot"
+        "blocks": {
+          "$ref": "#/$defs/BlockDelta"
         },
-        "block_changes": {
+        "player": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlayerState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "events": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/BlockChange"
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DamageEnvelope"
+              },
+              {
+                "$ref": "#/$defs/ExplosionEvent"
+              }
+            ]
           }
         },
-        "terrain": {
+        "terrain_conflicts": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/TerrainCell"
+            "$ref": "#/$defs/Cell"
           }
+        },
+        "input_owner": {
+          "enum": [
+            "MC",
+            "DST"
+          ]
+        },
+        "snapshot_ticket": {
+          "$ref": "#/$defs/UUID"
         }
       },
       "required": [
@@ -525,9 +558,12 @@
         "pair",
         "epoch",
         "results",
-        "actors",
-        "block_changes",
-        "terrain"
+        "blocks",
+        "player",
+        "events",
+        "terrain_conflicts",
+        "input_owner",
+        "snapshot_ticket"
       ],
       "additionalProperties": false
     },
@@ -665,6 +701,45 @@
               "type": "null"
             }
           ]
+        },
+        "gameplay": {
+          "type": "object",
+          "properties": {
+            "connected": {
+              "type": "boolean"
+            },
+            "block_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "block_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "proxy_count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "terrain_cells": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "pending_events": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "snapshot_sequence": {
+              "type": "integer",
+              "minimum": -1
+            }
+          },
+          "required": [],
+          "additionalProperties": false
         }
       },
       "required": [
@@ -842,6 +917,15 @@
         },
         "lease": {
           "$ref": "#/$defs/FrameLease"
+        },
+        "mailbox": {
+          "type": "string"
+        },
+        "input_owner": {
+          "enum": [
+            "MC",
+            "DST"
+          ]
         }
       },
       "required": [
@@ -1006,6 +1090,318 @@
           1
         ]
       ]
+    },
+    "TerrainRun": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        },
+        "z": {
+          "type": "integer"
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z",
+        "length"
+      ],
+      "additionalProperties": false
+    },
+    "TerrainSnapshot": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "ground": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TerrainRun"
+          }
+        },
+        "obstacles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Box"
+          }
+        }
+      },
+      "required": [
+        "revision",
+        "ground",
+        "obstacles"
+      ],
+      "additionalProperties": false
+    },
+    "WorldSnapshotPayload": {
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "block_revision": {
+          "type": "integer",
+          "minimum": -1
+        },
+        "actors": {
+          "$ref": "#/$defs/ActorSnapshot"
+        },
+        "terrain": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerrainSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommandResult"
+          }
+        },
+        "input_owner": {
+          "enum": [
+            "MC",
+            "DST"
+          ]
+        },
+        "snapshot_ticket": {
+          "$ref": "#/$defs/UUID"
+        }
+      },
+      "required": [
+        "sequence",
+        "block_revision",
+        "actors",
+        "results",
+        "input_owner"
+      ],
+      "additionalProperties": false
+    },
+    "WorldSnapshotCommand": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "world_snapshot"
+        },
+        "payload": {
+          "$ref": "#/$defs/WorldSnapshotPayload"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    "BlockDelta": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "from": {
+          "type": "integer",
+          "minimum": -1
+        },
+        "full": {
+          "type": "boolean"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BlockChange"
+          }
+        }
+      },
+      "required": [
+        "revision",
+        "from",
+        "full",
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "PlayerState": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "position": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "health": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max_health": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "alive": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "position",
+        "health",
+        "max_health",
+        "alive"
+      ],
+      "additionalProperties": false
+    },
+    "DamageEnvelope": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "source": {
+          "$ref": "#/$defs/Space"
+        },
+        "target": {
+          "$ref": "#/$defs/UUID"
+        },
+        "position": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "amount": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "const": "damage"
+        }
+      },
+      "required": [
+        "id",
+        "pair",
+        "epoch",
+        "source",
+        "target",
+        "position",
+        "amount",
+        "kind",
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "ExplosionEvent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/UUID"
+        },
+        "type": {
+          "const": "explosion"
+        },
+        "pair": {
+          "$ref": "#/$defs/PairKey"
+        },
+        "epoch": {
+          "$ref": "#/$defs/UUID"
+        },
+        "position": {
+          "$ref": "#/$defs/Vec3"
+        },
+        "radius": {
+          "const": 4
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "pair",
+        "epoch",
+        "position",
+        "radius"
+      ],
+      "additionalProperties": false
+    },
+    "InputRequest": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "key": {
+          "$ref": "#/$defs/FrameKey"
+        },
+        "owner": {
+          "enum": [
+            "MC",
+            "DST"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "protocol",
+        "key",
+        "owner",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "InputResponse": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": 2
+        },
+        "owner": {
+          "enum": [
+            "MC",
+            "DST"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "protocol",
+        "owner",
+        "version"
+      ],
+      "additionalProperties": false
     }
   },
   "anyOf": [
@@ -1041,6 +1437,12 @@
     },
     {
       "$ref": "#/$defs/ErrorResponse"
+    },
+    {
+      "$ref": "#/$defs/InputRequest"
+    },
+    {
+      "$ref": "#/$defs/InputResponse"
     }
   ],
   "x-endpoints": {
@@ -1095,6 +1497,32 @@
       "GET": {
         "response": {
           "$ref": "#/$defs/WindowResponse"
+        }
+      }
+    },
+    "127.0.0.1:39380/v2/input": {
+      "GET": {
+        "query": "pair_hash (SHA256 hex), epoch (UUID)",
+        "response": {
+          "$ref": "#/$defs/InputResponse"
+        }
+      },
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/InputRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/InputResponse"
+        }
+      }
+    },
+    "127.0.0.1:39380/v2/camera/cycle": {
+      "POST": {
+        "request": {
+          "$ref": "#/$defs/CameraAppliedRequest"
+        },
+        "response": {
+          "$ref": "#/$defs/CameraLeaseResponse"
         }
       }
     }

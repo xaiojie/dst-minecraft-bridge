@@ -18,7 +18,7 @@ struct ComposeResult {
 class Compositor {
 public:
   explicit Compositor(CameraService &service) : service_(service) {}
-  ComposeResult compose(FrameKey, const RenderProbe &, GLuint scene_depth);
+  ComposeResult compose(FrameKey, const RenderProbe &, GLuint scene_depth, bool write_scene_depth = false);
   void hud(const FrameView &);
   ~Compositor();
 
@@ -42,6 +42,7 @@ public:
   }
   const RenderProbe &camera() const { return camera_; }
   int target() const { return target_; }
+  GLuint terrain_texture() const { return valid_ ? depth_ : 0; }
   void reset();
   ~SceneDepth();
 

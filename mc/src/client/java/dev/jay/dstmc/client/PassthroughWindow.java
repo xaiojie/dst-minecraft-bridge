@@ -39,6 +39,7 @@ public final class PassthroughWindow {
     public static void creationHints(){if(CONFIGURED){GLFW.glfwWindowHint(GLFW.GLFW_TRANSPARENT_FRAMEBUFFER,GLFW.GLFW_TRUE);GLFW.glfwWindowHint(GLFW.GLFW_COCOA_RETINA_FRAMEBUFFER,GLFW.GLFW_FALSE);}}
     public static void tick(){
         if(!CONFIGURED)return;
+        if(!InputOwnership.ownsInput()){restore();return;}
         // Capture session identity only on the client thread. Re-pairing may keep
         // BridgeClient.active() true, so a boolean is not an activation proof.
         var session=BridgeClient.active()?BridgeMod.server.active():null;
