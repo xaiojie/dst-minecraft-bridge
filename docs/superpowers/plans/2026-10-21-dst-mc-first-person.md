@@ -93,13 +93,13 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 **Interfaces:** 消费 `FrameKey`、`Pose`、`FrameLayout`；产生 `FrameCapture.captureWorld(Pose): void` / `captureHud(): void`、`FramePublisher.publishCompleted(): Optional<FrameKey>`、`WorldExchange.handshake(UUID dstWorld, String shard, Vec3 dstOrigin): HandshakeResult(pair, epoch, transform, reason)`。共享帧只能在 GPU 读回完成后发布；槽被原生租用时跳过，不覆盖。
 
-- [ ] 写并运行失败测试 `leased_slot_not_overwritten`、`partial_readback_not_published`、`resize_discards_pending_readback`、`alpha_and_channel_order`。断言：RGBA 红色透明样本在 x86_64 读回仍是红色；未完成或上下文失效的 GPU 回调不发布新帧。
-- [ ] 写 `test_active_save_copy_refused`，以持有实际文件锁的源存档夹具确认拒绝复制；实现 `prepare_test_copy.py --source PATH --dest PATH`，只复制无活动锁的测试存档，不覆盖现有目标并记录来源。运行 `python3 -m unittest tests.test_test_copy -v` 后，生成独立 `mc/run/saves/DST-MC-FirstPerson-Test`；不再等到最终打包阶段才准备测试副本。
-- [ ] 配置 Loom 客户端源码集，并把客户端输出加入 contractTest 的编译/运行 classpath，固定已验证版本和原安装 assets/index=29；模组 ID 使用 `dst_mc_bridge`。独立副本增加空场景维度 `dst_mc_bridge:stage`，临时底面先用原版不可见 barrier 块，任务 6 再替换为精确桥接形状；MC 原有测试世界的地形不渲染到共享画面。先在该维度放一个真实石头方块做图形验收。
-- [ ] 建立最小 `BridgeServer/WorldExchange`，提供 v2 握手、状态和本机心跳，MC 世界 UUID 保存在副本内；首次配对原点为 MC `(0,64,0)` 与 DST 当时的脚底位置。同一 MC 副本已配对另一 DST 世界时返回 `WORLD_MISMATCH`，不得把新世界直接锚定到旧方块。任务 5 在此接口增加 actor 和方块流。
-- [ ] 按本机 1.21.11 源码挂接：在 `GameRenderer.renderLevel` 内调用 `CommandEncoder.clearDepthTexture` **之前**复制世界颜色和深度；随后清空世界颜色供手部/HUD 分层；在 GUI 实际绘制后捕获 HUD。使用当前 `RenderTarget.getColorTexture/getDepthTexture` 与 `GlTexture.glId()`，不套用 1.21.1 的 `frameBufferId` 字段。取消天空/云和不属于合成层的背景，保留真实方块、必要实体和粒子。
-- [ ] 停止本工程开发客户端后运行 `./gradlew build coreTest --console plain`；再启动开发客户端，运行 `python3 -m unittest tests.test_live_frames -v`。必须观察到新进程产生的新帧、实际石头纹理、有效深度和透明背景；不能用磁盘旧样本满足 live 测试。
-- [ ] 提交 `feat: stream real Minecraft world and HUD frames with matched poses`。
+- [x] 写并运行失败测试 `leased_slot_not_overwritten`、`partial_readback_not_published`、`resize_discards_pending_readback`、`alpha_and_channel_order`。断言：RGBA 红色透明样本在 x86_64 读回仍是红色；未完成或上下文失效的 GPU 回调不发布新帧。
+- [x] 写 `test_active_save_copy_refused`，以持有实际文件锁的源存档夹具确认拒绝复制；实现 `prepare_test_copy.py --source PATH --dest PATH`，只复制无活动锁的测试存档，不覆盖现有目标并记录来源。运行 `python3 -m unittest tests.test_test_copy -v` 后，生成独立 `mc/run/saves/DST-MC-FirstPerson-Test`；不再等到最终打包阶段才准备测试副本。
+- [x] 配置 Loom 客户端源码集，并把客户端输出加入 contractTest 的编译/运行 classpath，固定已验证版本和原安装 assets/index=29；模组 ID 使用 `dst_mc_bridge`。独立副本增加空场景维度 `dst_mc_bridge:stage`，临时底面先用原版不可见 barrier 块，任务 6 再替换为精确桥接形状；MC 原有测试世界的地形不渲染到共享画面。先在该维度放一个真实石头方块做图形验收。
+- [x] 建立最小 `BridgeServer/WorldExchange`，提供 v2 握手、状态和本机心跳，MC 世界 UUID 保存在副本内；首次配对原点为 MC `(0,64,0)` 与 DST 当时的脚底位置。同一 MC 副本已配对另一 DST 世界时返回 `WORLD_MISMATCH`，不得把新世界直接锚定到旧方块。任务 5 在此接口增加 actor 和方块流。
+- [x] 按本机 1.21.11 源码挂接：在 `GameRenderer.renderLevel` 内调用 `CommandEncoder.clearDepthTexture` **之前**复制世界颜色和深度；随后清空世界颜色供手部/HUD 分层；在 GUI 实际绘制后捕获 HUD。使用当前 `RenderTarget.getColorTexture/getDepthTexture` 与 `GlTexture.glId()`，不套用 1.21.1 的 `frameBufferId` 字段。取消天空/云和不属于合成层的背景，保留真实方块、必要实体和粒子。
+- [x] 停止本工程开发客户端后运行 `./gradlew build coreTest --console plain`；再启动开发客户端，运行 `python3 -m unittest tests.test_live_frames -v`。必须观察到新进程产生的新帧、实际石头纹理、有效深度和透明背景；不能用磁盘旧样本满足 live 测试。
+- [x] 提交 `feat: stream real Minecraft world and HUD frames with matched poses`。
 
 ## Task 4: 第一人称镜头与原生深度合成——画面关口
 
