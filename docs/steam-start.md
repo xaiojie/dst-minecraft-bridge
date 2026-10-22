@@ -6,7 +6,7 @@
 2. 在「启动选项」中使用下面这一整行。路径外的双引号和 `%command%` 都要保留。现有游戏参数放在 `%command%` 后；如果原配置包含其他包装器，先人工检查组合方式。
 
    ```text
-   /usr/bin/arch -arm64 /usr/bin/python3 -B "/Users/jay/Documents/Codex/2026-10-20/https-mp-weixin-qq-com-s/work/dst-mc-bridge/.worktrees/implementation/tools/steam_dst.py" %command%
+   /usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/dst-minecraft-bridge-3/tools/steam_dst.py" %command%
    ```
 
 3. 点击 Steam「开始游戏」，进入原测试世界。
@@ -21,7 +21,7 @@ Steam 以 Intel 兼容模式运行时，会把直接调用的系统 Python 也�
 可先从终端运行只读检查：
 
 ```sh
-/usr/bin/arch -arm64 /usr/bin/python3 -B "/Users/jay/Documents/Codex/2026-10-20/https-mp-weixin-qq-com-s/work/dst-mc-bridge/.worktrees/implementation/tools/steam_dst.py" --dry-run
+/usr/bin/arch -arm64 /usr/bin/python3 -B "/Volumes/OS/Work/个人开发/dst-minecraft-bridge-3/tools/steam_dst.py" --dry-run
 ```
 
 它不会创建文件或启动任何应用。普通终端缺少 Steam 标记时会列出相应阻塞项；这不是启动旁路。`--help` 同样只读。
