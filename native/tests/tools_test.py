@@ -1,4 +1,4 @@
-import importlib.util, json, os, pathlib, struct, subprocess, sys, tempfile, unittest
+import contextlib, importlib.util, io, json, os, pathlib, struct, subprocess, sys, tempfile, unittest
 from unittest.mock import patch
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('preflight',ROOT/'tools/preflight.py')
@@ -6,6 +6,20 @@ preflight=importlib.util.module_from_spec(spec);spec.loader.exec_module(prefligh
 capture_spec=importlib.util.spec_from_file_location('capture',ROOT/'tools/capture_render_probe.py')
 capture=importlib.util.module_from_spec(capture_spec);capture_spec.loader.exec_module(capture)
 class ToolsTest(unittest.TestCase):
+ def test_cli_launch_requires_steam_before_spawn_or_hint(self):
+  # Trap the old launch boundary: even a ready preflight must not reach it.
+  for flags in (['--launch'],['--launch','--json']):
+   with self.subTest(flags=flags), tempfile.TemporaryDirectory() as d:
+    out=pathlib.Path(d)/'evidence';output=io.StringIO()
+    ready={'ready':True,'executable':{'path':str(pathlib.Path(d)/'MacOS/dst')},'extension':{'path':'probe.dylib'}}
+    with patch.object(sys,'argv',['preflight.py',*flags,'--out',str(out)]), patch.object(preflight,'preflight',return_value=ready), patch.object(preflight,'run_game',return_value=0) as run, patch.object(preflight,'steam_app_id_hint') as hint, patch.object(preflight.subprocess,'run') as spawn, contextlib.redirect_stdout(output):
+     status=preflight.main()
+    self.assertEqual(run.call_count,0,'CLI must not call run_game')
+    hint.assert_not_called();spawn.assert_not_called()
+    self.assertNotEqual(status,0)
+    self.assertEqual(json.loads(output.getvalue())['error'],'STEAM_START_REQUIRED')
+    self.assertFalse(out.exists())
+
  def test_request_remains_old_until_complete_publication(self):
   # A renderer may read at any write boundary. It must see old or complete-new,
   # never a public partial request. The adapter still writes real files.

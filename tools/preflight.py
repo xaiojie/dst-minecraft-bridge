@@ -73,14 +73,10 @@ def run_game(argv,cwd,environment,log_path):
 
 def main():
  p=argparse.ArgumentParser();p.add_argument('--json',action='store_true');p.add_argument('--executable',type=pathlib.Path,default=DEFAULT_EXE);p.add_argument('--cluster',type=pathlib.Path,default=DEFAULT_CLUSTER);p.add_argument('--launch',action='store_true');p.add_argument('--dry-run',action='store_true');p.add_argument('--out',type=pathlib.Path,default=ROOT/'evidence/render-probe');a=p.parse_args()
+ # Actual starts belong to Steam or the user; --dry-run remains diagnostic only.
+ if a.launch and not a.dry_run:
+  print(json.dumps({'error':'STEAM_START_REQUIRED','message':'Start DST through Steam, or ask the user to start it. Direct executable launch is disabled.'}));return 2
  result=preflight(a.executable,a.cluster);exe=result['executable']['path'];out=a.out.resolve();environment={'DYLD_INSERT_LIBRARIES':result['extension']['path'],'DSTMC_PROBE_DIR':str(out)};cwd=str(pathlib.Path(exe).parent.parent/'data')
  if a.dry_run:print(json.dumps({'executable':exe,'working_directory':cwd,'environment':environment,'preflight':result},indent=2));return 0 if result['ready'] else 1
- if not a.launch or not result['ready']:print(json.dumps(result,indent=2));return 0 if result['ready'] else 1
- out.mkdir(parents=True,exist_ok=True)
- # Each launch must use a new evidence directory, preserving earlier samples.
- if (out/'loaded.json').exists():print(json.dumps({'error':'choose_fresh_evidence_directory'}));return 1
- (out/'preflight.json').write_text(json.dumps(result,indent=2));env=os.environ.copy();env.update(environment)
- # Wait for this child so the documented Steam app-id hint can be cleaned safely.
- try:return run_game([exe],cwd,env,out/'launch.log')
- except (OSError,ValueError) as error:print(json.dumps({'error':str(error)}));return 1
+ print(json.dumps(result,indent=2));return 0 if result['ready'] else 1
 if __name__=='__main__':sys.exit(main())
