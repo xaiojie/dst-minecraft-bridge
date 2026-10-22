@@ -103,6 +103,8 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 ## Task 4: 第一人称镜头与原生深度合成——画面关口
 
+> 当前执行状态（2026-10-22）：候选代码及两轮审查修复已保存，代码复核无未解决发现。现有测试世界的 Klei 在线登录待恢复，camera、same-frame、transparency、depth occlusion、UI 五项实机验收仍为 NOT_VERIFIED；任务 4 未完成，不进入任务 5。网络由用户处理，恢复后继续原存档实测。
+
 **Files:** 创建 `native/src/{camera_service.cpp,compositor.mm,scene_depth.mm}`、`native/include/{camera_service.h,compositor.h}`、`native/tests/{lease_test.cpp,compositor_test.mm}`；创建 `dst-mod/{modmain.lua,modinfo.lua}`、`dst-mod/scripts/dstmc/{camera.lua,connection.lua,world.lua}`、`dst-mod/scripts/components/dstmcidentity.lua`；创建 `mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java`、`mc/src/client/java/dev/jay/dstmc/client/mixin/{WindowCreateMixin,WindowPresentMixin}.java`、`tests/test_first_person_gate.py`，修改 `native/src/entry.mm`。
 
 **Interfaces:** 消费 `FrameView`、`RenderProbe`；产生 C++ `lease_latest(PairKey, Epoch): optional<FrameLease>`、`camera_applied(FrameKey): bool`、`compose(FrameKey, RenderProbe): ComposeResult`；Lua `camera.ApplyLease(lease): boolean` / `camera.Release(): void`；Java `PassthroughWindow.enable(WindowBounds): void` / `restore(): void`，`WindowBounds` 使用 `/v2/window` 的点/像素及缩放数据。`ComposeResult` 明确 `COMPOSITED`、`SKIPPED_MISMATCH`、`SKIPPED_STALE`、`DEPTH_UNAVAILABLE`。
