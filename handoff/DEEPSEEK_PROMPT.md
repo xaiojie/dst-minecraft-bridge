@@ -1,6 +1,6 @@
 你接手的是一个已有代码和实测证据的跨游戏联动项目，请直接在现有进度上继续开发。
 
-仓库：https://github.com/papa-a11y/dst-minecraft-bridge.git
+仓库：https://github.com/xaiojie/dst-minecraft-bridge.git
 项目：dst-minecraft-bridge（饥荒 × Minecraft 联动桥）
 
 先克隆仓库，在新目录工作。依次阅读：
