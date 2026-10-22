@@ -11,6 +11,9 @@ public final class FramePublisherTest {
  static ByteBuffer depth(){return ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0,.5f);}
  static void completed(FramePublisher p,long g){p.world(g,POSE,rgba(),depth());p.hud(g,rgba());}
  static void check(boolean b,String s){if(!b)throw new AssertionError(s);}
+ static int readNative(Path helper,FramePublisher p,FrameKey key)throws Exception{
+  return new ProcessBuilder("/usr/bin/arch","-x86_64",helper.toString(),p.path().toString(),HexFormat.of().formatHex(pairHash(key.pair())),key.epoch().toString().replace("-",""),Long.toUnsignedString(key.id())).inheritIO().start().waitFor();
+ }
  interface Test{void run()throws Exception;}
  static int failures;
  static void test(String name,Test test){try{test.run();System.out.println("PASS "+name);}catch(Throwable e){failures++;System.out.println("FAIL "+name+": "+e);}}
@@ -31,7 +34,24 @@ public final class FramePublisherTest {
   // Break: delayed callbacks after resize contaminate next generation.
   test("resize_discards_pending_readback",()->{try(var p=publisher()){long old=p.generation();p.world(old,POSE,rgba(),depth());p.resize(2,1);p.hud(old,rgba());check(p.publishCompleted().isEmpty(),"stale resize callback published");check(p.generation()!=old,"generation unchanged");}});
   // Break: native-endian packed integers swap red/blue or leave straight alpha.
-  test("alpha_and_channel_order",()->{var b=ByteBuffer.wrap(new byte[]{(byte)255,0,0,(byte)128,0,0,(byte)255,0});FramePublisher.premultiplyRgba(b);check((b.get(0)&255)==128 && b.get(1)==0 && b.get(2)==0 && (b.get(3)&255)==128,"red premultiplied RGBA mismatch");check(b.get(4)==0&&b.get(5)==0&&b.get(6)==0&&b.get(7)==0,"transparent RGB not zero");});
+  test("alpha_and_channel_order",()->{
+   check(System.getProperty("os.arch").equals("aarch64"),"test requires actual ARM64 Java producer");
+   var helper=Files.createTempDirectory("publisher-native").resolve("rgba-reader");
+   check(new ProcessBuilder("clang++","-arch","x86_64","-std=c++17","-Wall","-Wextra","-Werror","-O2","-I../native/include","src/contractTest/cpp/publisher_rgba_reader.cpp","-o",helper.toString()).inheritIO().start().waitFor()==0,"native reader compile failed");
+   try(var p=publisher()){
+    // Input is already premultiplied, as real GL blend output is. Do not call
+    // the conversion helper here: the producer must preserve these exact bytes.
+    var world=ByteBuffer.wrap(new byte[]{(byte)128,0,0,(byte)128});
+    var depth=ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(0,.25f);
+    var hud=ByteBuffer.wrap(new byte[]{0,0,64,64});
+    p.world(p.generation(),POSE,world,depth);p.hud(p.generation(),hud);
+    var key=p.publishCompleted().orElseThrow();
+    check(readNative(helper,p,key)==0,"native published channels/depth/HUD mismatch");
+    // Negative control: prove the real reader's assertions catch red/blue swaps.
+    p.world(p.generation(),POSE,ByteBuffer.wrap(new byte[]{0,0,(byte)128,(byte)128}),depth);p.hud(p.generation(),hud);
+    check(readNative(helper,p,p.publishCompleted().orElseThrow())==7,"swapped world RGBA escaped native assertions");
+   }
+  });
   if(failures>0)throw new AssertionError(failures+" publisher assertion(s) failed");
  }
  public static void main(String[] args)throws Exception{run();}

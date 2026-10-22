@@ -17,6 +17,29 @@ import zlib
 
 ROOT=Path(__file__).resolve().parents[1]
 
+def evaluate_samples(samples):
+    """Capture target is30FPS; allow server tick jitter within19–21Hz."""
+    duration=samples[-1]['elapsed']-samples[0]['elapsed']
+    if duration<=0:raise AssertionError('sample interval must advance')
+    fps=(samples[-1]['frame']-samples[0]['frame'])/duration
+    heartbeat_hz=(samples[-1]['heartbeat']-samples[0]['heartbeat'])/duration
+    if fps<30:raise AssertionError(f'capture below30FPS target: {fps:.3f}FPS')
+    if not 19<=heartbeat_hz<=21:raise AssertionError(f'heartbeat outside19–21Hz: {heartbeat_hz:.3f}Hz')
+    return fps,heartbeat_hz
+
+class LiveSampleEvaluation(unittest.TestCase):
+    def samples(self,fps,heartbeat_hz):
+        return [{'elapsed':0,'frame':10,'heartbeat':20},
+                {'elapsed':60,'frame':10+60*fps,'heartbeat':20+60*heartbeat_hz}]
+    # Break: merely requiring100new frames permits unusably low capture rates.
+    def test_targets_and_jitter(self):
+        for heartbeat_hz in (19,20,21):self.assertEqual((30,heartbeat_hz),evaluate_samples(self.samples(30,heartbeat_hz)))
+    def test_slow_capture_rejected(self):
+        with self.assertRaisesRegex(AssertionError,'30FPS'):evaluate_samples(self.samples(29,20))
+    def test_wrong_tick_rates_rejected(self):
+        for heartbeat_hz in (18,22):
+            with self.assertRaisesRegex(AssertionError,'19–21Hz'):evaluate_samples(self.samples(30,heartbeat_hz))
+
 def request(path, data=None):
     body=None if data is None else json.dumps(data).encode()
     with urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:39379'+path,body,{'Content-Type':'application/json'}),timeout=8) as r:return json.load(r)
@@ -113,7 +136,7 @@ std::ofstream out(a[5],std::ios::binary);uint32_t w=frame->width,h=frame->height
             self.assertEqual(status['run_id'],state['run_id']);self.assertEqual(status['pid'],state['pid'])
             samples.append({'elapsed':time.monotonic()-start,'frame':state['latest_frame']['id'],'heartbeat':state['heartbeat'],'width':state['width'],'height':state['height']})
             time.sleep(.5)
-        fps=(samples[-1]['frame']-samples[0]['frame'])/(samples[-1]['elapsed']-samples[0]['elapsed'])
-        self.assertGreater(samples[-1]['frame'],lastid+100,'no continuous new frames')
-        (evidence/'result.json').write_text(json.dumps({'status':s,'opaque_pixels':opaque,'clear_pixels':clear,'texture_colors':len(greys),'fps':fps,'samples':samples},indent=2))
+        fps,heartbeat_hz=evaluate_samples(samples)
+        self.assertGreater(samples[0]['frame'],lastid,'no fresh frames after scene update')
+        (evidence/'result.json').write_text(json.dumps({'status':s,'opaque_pixels':opaque,'clear_pixels':clear,'texture_colors':len(greys),'fps':fps,'heartbeat_hz':heartbeat_hz,'samples':samples},indent=2))
         print('LIVE EVIDENCE',evidence,'FPS',fps,flush=True)
