@@ -1,6 +1,6 @@
 # 从 Steam 启动 macOS DST 探针
 
-此包装器必须由 Steam 调用。已在本机 Steam 日志中确认 `%command%` 正确传入 DST `.app`；原来的直接脚本入口因 Intel 模式下的系统 Python 启动失败而退出。下面的 ARM 启动前缀已通过同架构环境下的只读预检，探针实际加载及游戏在线仍待重新启动后验证。
+此包装器必须由 Steam 调用。已在本机 Steam 日志中确认 `%command%` 正确传入 DST `.app`；原来的直接脚本入口因 Intel 模式下的系统 Python 启动失败而退出。下面的 ARM 启动前缀已通过本机实测：用户由 Steam 进入原测试世界，x86_64 探针加载且持续产生绘制回调。两款游戏的合成、输入和遮挡验收仍未完成，部分后台 Klei 服务仍有 SSL 错误。
 
 1. 先复制保存 Steam → Don't Starve Together → 属性 → 通用中现有的「启动选项」。退出已运行的 DST。
 2. 在「启动选项」中使用下面这一整行。路径外的双引号和 `%command%` 都要保留。现有游戏参数放在 `%command%` 后；如果原配置包含其他包装器，先人工检查组合方式。
@@ -9,7 +9,7 @@
    /usr/bin/arch -arm64 /usr/bin/python3 -B "/Users/jay/Documents/Codex/2026-10-20/https-mp-weixin-qq-com-s/work/dst-mc-bridge/.worktrees/implementation/tools/steam_dst.py" %command%
    ```
 
-3. 由用户点击 Steam「开始游戏」。本任务没有代为修改 Steam 或启动游戏。
+3. 点击 Steam「开始游戏」，进入原测试世界。
 4. 恢复时移除本项目添加的整段启动前缀和包装器配置，恢复原来保存的启动选项；若原来为空，清空本次新增的整行。
 
 包装器只接受包含 `preflight.DEFAULT_EXE` 的规范 DST `.app`。实际启动要求 `SteamAppId` 或 `SteamGameId` 为 `322330`，且所有已提供的标记一致；这是防止误操作的检查，不是身份认证。检查可执行文件、已有进程、探针库、库的 `x86_64` 架构和两项所需 entitlement 后，才会产生证据和调用 `/usr/bin/open`。旧 `preflight.py --launch` 继续拒绝直接启动。
@@ -28,4 +28,4 @@ Steam 以 Intel 兼容模式运行时，会把直接调用的系统 Python 也�
 
 每次获准的实际请求使用 `evidence/steam-launches/` 下的独立目录。`request.json` 记录 PID、规范应用与可执行文件路径、请求的模块路径和 SHA、输出目录、Steam 应用标记、`open` 参数及时间；`preflight.json` 为捕获工具保留预检结果；`completion.json` 记录 `open` 返回码。`open` 返回成功不表示探针加载或在线。实际加载仍要查看同目录由原生模块生成的 `loaded.json`、`heartbeat.json` 和实时回调，再完成独立图形验收。
 
-本方案依据 [sgentle 的 2026 年 macOS Steam 启动记录](https://gist.github.com/sgentle/8cace35bfad585a2866a9e825a5203af)，其中 `.app` 替换行为已由本机 Steam 启动日志确认；加上 ARM Python 前缀后的真实重启及后续加载验收仍待完成。包装器不创建 `steam_appid.txt`，不修改游戏包、签名或 Info.plist，不重启 Steam，不重建原生模块。
+本方案依据 [sgentle 的 2026 年 macOS Steam 启动记录](https://gist.github.com/sgentle/8cace35bfad585a2866a9e825a5203af)，其中 `.app` 替换行为已由本机 Steam 启动日志确认；加上 ARM Python 前缀后的 Steam 重启及探针加载已在本机实测；双游戏合成与完整验收仍待完成。包装器不创建 `steam_appid.txt`，不修改游戏包、签名或 Info.plist，不重启 Steam，不重建原生模块。

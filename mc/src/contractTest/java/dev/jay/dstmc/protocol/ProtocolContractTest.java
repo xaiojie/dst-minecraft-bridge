@@ -67,6 +67,35 @@ public final class ProtocolContractTest {
             var reopened = new PairingStore(dir).loadOrCreate(PAIR, new Vec3(0,0,0), new Vec3(999,0,0));
             check(original.equals(reopened), "restart changed persisted origin");
         });
+        // Break: a saved mode is forgotten, or direction conversion incorrectly includes translation.
+        test("reflected_pair_store_and_direction_roundtrip", () -> {
+            Path dir=Files.createTempDirectory("reflected-pair");
+            var t=new PairingStore(dir).loadOrCreate(PAIR,new Vec3(100,2,-50),new Vec3(5,64,9),WorldTransform.AxisMode.REFLECT_X);
+            check(t.toMc(new Vec3(106,5,-47)).equals(new Vec3(-1,67,12)),"reflected nonzero origins incorrect");
+            check(t.directionToMc(new Vec3(2,3,-4)).equals(new Vec3(-2,3,-4)),"direction used translation or wrong axis");
+            check(t.directionToDst(new Vec3(-2,3,-4)).equals(new Vec3(2,3,-4)),"direction inverse changed vector");
+            check(new PairingStore(dir).loadOrCreate(PAIR,new Vec3(0,0,0),new Vec3(0,0,0),WorldTransform.AxisMode.REFLECT_X).equals(t),"saved reflected origins replaced");
+            Path file=dir.resolve(HexFormat.of().formatHex(pairHash(PAIR))+".pair"); byte[] before=Files.readAllBytes(file);
+            boolean rejected=false;try{new PairingStore(dir).loadOrCreate(PAIR,new Vec3(0,0,0),new Vec3(0,0,0));}catch(IllegalArgumentException expected){rejected=true;}
+            check(rejected && Arrays.equals(before,Files.readAllBytes(file)),"mode mismatch migrated pair record");
+        });
+        test("legacy_pair_record_stays_identity", () -> {
+            Path dir=Files.createTempDirectory("legacy-pair"); Path file=dir.resolve(HexFormat.of().formatHex(pairHash(PAIR))+".pair");
+            try(var out=new java.io.DataOutputStream(Files.newOutputStream(file))){out.writeInt(0x44535032);out.writeUTF(canonicalPair(PAIR));for(double n:new double[]{100,0,-50,0,64,0})out.writeDouble(n);}
+            byte[] before=Files.readAllBytes(file);
+            check(new PairingStore(dir).loadOrCreate(PAIR,new Vec3(0,0,0),new Vec3(0,0,0)).toMc(new Vec3(106,2,-47)).equals(new Vec3(6,66,3)),"legacy pair changed basis");
+            boolean rejected=false;try{new PairingStore(dir).loadOrCreate(PAIR,new Vec3(0,0,0),new Vec3(0,0,0),WorldTransform.AxisMode.REFLECT_X);}catch(IllegalArgumentException expected){rejected=true;}
+            check(rejected && Arrays.equals(before,Files.readAllBytes(file)),"legacy record silently migrated");
+        });
+        test("malformed_pair_records_fail_closed", () -> {
+            for(int corrupt=0;corrupt<4;corrupt++) {
+                Path dir=Files.createTempDirectory("bad-pair"); Path file=dir.resolve(HexFormat.of().formatHex(pairHash(PAIR))+".pair");
+                try(var out=new java.io.DataOutputStream(Files.newOutputStream(file))){out.writeInt(corrupt==0?0x44535034:0x44535033);out.writeUTF(canonicalPair(PAIR));for(double n:new double[]{corrupt==1?Double.NaN:100,0,-50,0,64,0})out.writeDouble(n);out.writeUTF(corrupt==2?"REFLECT_Y":"REFLECT_X");if(corrupt==3)out.writeByte(1);}
+                byte[] before=Files.readAllBytes(file);boolean rejected=false;
+                try{new PairingStore(dir).loadOrCreate(PAIR,new Vec3(0,0,0),new Vec3(0,0,0),WorldTransform.AxisMode.REFLECT_X);}catch(RuntimeException expected){rejected=true;}
+                check(rejected && Arrays.equals(before,Files.readAllBytes(file)),"malformed record overwritten or accepted");
+            }
+        });
         // Break caught: accepting damage from an old handshake/world.
         test("foreign_epoch_rejected", () -> {
             var ledger = new RequestLedger(Files.createTempDirectory("ledger-epoch"), PAIR, EPOCH);
@@ -165,6 +194,25 @@ public final class ProtocolContractTest {
                 try { new Command(UUID.randomUUID(),PAIR,EPOCH,"invalid",Map.of("amount",invalid)); }
                 catch(IllegalArgumentException expected) { rejected=true; }
                 check(rejected,"non-finite floating-point value accepted");
+            }
+        });
+        test("reflected_shared_frame_metadata", () -> {
+            Path file=Files.createTempDirectory("reflected-frame").resolve("frame.bin");
+            var t=new WorldTransform(new Vec3(100,2,-50),new Vec3(5,64,9),WorldTransform.AxisMode.REFLECT_X);
+            try(var w=FrameLayout.create(file,2,2)){
+                check(w.publish(new FrameKey(PAIR,EPOCH,1),t,pose(),2,2,ByteBuffer.allocate(16),ByteBuffer.allocate(16),ByteBuffer.allocate(16)),"reflected frame missing");
+            }
+            var b=ByteBuffer.wrap(Files.readAllBytes(file)).order(ByteOrder.LITTLE_ENDIAN);
+            check(b.getDouble(4096+128)==100 && b.getDouble(4096+152)==5 && b.getDouble(4096+176)==-1 && b.getDouble(4096+208)==1 && b.getDouble(4096+240)==1,"binary reflection/origin ABI incorrect");
+        });
+        test("mapping_rejects_transform_changes_within_epoch", () -> {
+            Path file=Files.createTempDirectory("fixed-frame-transform").resolve("frame.bin");
+            var t=new WorldTransform(new Vec3(100,0,-50),new Vec3(0,64,0));
+            try(var w=FrameLayout.create(file,2,2)){
+                check(w.publish(new FrameKey(PAIR,EPOCH,1),t,pose(),2,2,ByteBuffer.allocate(16),ByteBuffer.allocate(16),ByteBuffer.allocate(16)),"initial frame missing");
+                byte[] before=Files.readAllBytes(file);boolean rejected=false;
+                try{w.publish(new FrameKey(PAIR,EPOCH,2),new WorldTransform(t.dstOrigin(),t.mcOrigin(),WorldTransform.AxisMode.REFLECT_X),pose(),2,2,ByteBuffer.allocate(16),ByteBuffer.allocate(16),ByteBuffer.allocate(16));}catch(IllegalArgumentException expected){rejected=true;}
+                check(rejected && Arrays.equals(before,Files.readAllBytes(file)),"same mapping published changed calibration");
             }
         });
         // Break caught: publication acknowledged without writing a complete mapped frame.

@@ -25,8 +25,10 @@ void CameraService::offer(std::shared_ptr<FrameView> f,
   expire();
   if (!f)
     return;
+  if (!valid_transform(*f)) { discard(); return; }
   bool session = have_last_ && f->key.pair_hash == last_.pair_hash &&
                  f->key.epoch == last_.epoch;
+  if (session && !same_transform(*f,last_transform_)) { discard(); return; }
   if (!session)
     discard();
   if (session && f->key.id <= last_.id)
@@ -36,6 +38,7 @@ void CameraService::offer(std::shared_ptr<FrameView> f,
   if (frame_)
     return;
   last_ = f->key;
+  last_transform_ = *f;
   have_last_ = true;
   mapping_ = std::move(mapping);
   frame_ = std::move(f);
@@ -48,14 +51,7 @@ std::optional<FrameLease> CameraService::lease_latest(PairKey pair,
   if (!frame_ || frame_->key.pair_hash != pair || frame_->key.epoch != epoch)
     return {};
   auto &f = *frame_;
-  auto p = f.pose;
-  const double dx = f.dst_origin.x - f.mc_origin.x,
-               dy = f.dst_origin.y - f.mc_origin.y,
-               dz = f.dst_origin.z - f.mc_origin.z;
-  p.position = {p.position.x + dx, p.position.y + dy, p.position.z + dz};
-  for (int r = 0; r < 4; r++)
-    p.view[12 + r] = float(f.pose.view[12 + r] - f.pose.view[r] * dx -
-                           f.pose.view[4 + r] * dy - f.pose.view[8 + r] * dz);
+  auto p = pose_to_dst(f,f.pose);
   leased_ = true;
   return FrameLease{f.key, p, f.width, f.height};
 }
@@ -80,6 +76,14 @@ std::shared_ptr<const FrameView> CameraService::ready(FrameKey k) {
   };
   auto h = std::make_shared<Held>(Held{mapping_, frame_});
   return std::shared_ptr<const FrameView>(h, frame_.get());
+}
+bool CameraService::validate_transform(const WorldTransform &t) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  expire();
+  if (!valid_transform(t) || (frame_ && !same_transform(*frame_,t))) {
+    discard(); return false;
+  }
+  return true;
 }
 void CameraService::release() {
   std::lock_guard<std::mutex> lock(mutex_);

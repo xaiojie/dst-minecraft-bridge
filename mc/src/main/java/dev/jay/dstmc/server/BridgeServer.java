@@ -64,6 +64,7 @@ public final class BridgeServer implements AutoCloseable {
         var m=new LinkedHashMap<String,Object>();var a=active;var s=stream;
         if(a==null || (s!=null && (!s.key().pair().equals(a.pair()) || !s.key().epoch().equals(a.epoch()))))s=null;
         m.put("protocol",2);m.put("status",a==null?"UNPAIRED":"PAIRED");m.put("pair",a==null?null:pair(a.pair()));m.put("epoch",a==null?null:a.epoch().toString());
+        m.put("dst_origin",a==null?null:vec(a.transform().dstOrigin()));m.put("mc_origin",a==null?null:vec(a.transform().mcOrigin()));m.put("axes",a==null?null:a.transform().axes());
         m.put("mc_world",exchange.mcWorld().toString());m.put("pid",HttpIntegers.exact(ProcessHandle.current().pid()));m.put("run_id",runId);m.put("started_at_ms",HttpIntegers.exact(started));
         m.put("heartbeat",HttpIntegers.exact(heartbeat));m.put("peer_last_seen_ms",HttpIntegers.exact(lastPeerMs));m.put("fixture",fixture);m.put("stage_ready",stageReady);
         m.put("frame_path",s==null?null:s.path());m.put("generation",s==null?null:HttpIntegers.exact(s.generation()));m.put("latest_frame",s==null?null:key(s.key()));m.put("width",s==null?null:s.width());m.put("height",s==null?null:s.height());

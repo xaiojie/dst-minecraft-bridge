@@ -21,6 +21,7 @@ public:
   std::optional<FrameLease> lease_latest(PairKey, Epoch);
   bool camera_applied(FrameKey);
   std::shared_ptr<const FrameView> ready(FrameKey);
+  bool validate_transform(const WorldTransform &);
   void release();
   void resize(uint32_t, uint32_t);
 
@@ -33,6 +34,7 @@ private:
   std::shared_ptr<void> mapping_;
   std::shared_ptr<FrameView> frame_;
   FrameKey last_{};
+  WorldTransform last_transform_{};
   bool have_last_ = false, acked_ = false, leased_ = false;
   uint64_t deadline_{};
 };

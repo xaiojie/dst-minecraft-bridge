@@ -19,6 +19,7 @@ public final class FrameLayout implements AutoCloseable {
     private final int capacityWidth,capacityHeight,stride;
     private boolean closed;
     private FrameKey session;
+    private WorldTransform sessionTransform;
     private long sequence;
     private int nextSlot;
     private FrameLayout(FileChannel channel,MappedByteBuffer map,int w,int h,int stride) {
@@ -49,6 +50,7 @@ public final class FrameLayout implements AutoCloseable {
         if(pose.space()!=Space.MC) throw new IllegalArgumentException("shared frame pose must use MC space");
         if(color.remaining()!=bytes || depth.remaining()!=bytes || hud.remaining()!=bytes) throw new IllegalArgumentException("layer length mismatch");
         if(session!=null && (!session.pair().equals(key.pair()) || !session.epoch().equals(key.epoch()))) throw new IllegalArgumentException("new handshake requires a new mapping");
+        if(sessionTransform!=null && !sessionTransform.equals(transform)) throw new IllegalArgumentException("TRANSFORM_MISMATCH");
         if(session!=null && Long.compareUnsigned(key.id(),session.id())<=0) throw new IllegalArgumentException("frame id must increase within epoch");
         var pair=pairHash(key.pair());
         for(int attempt=0;attempt<SLOT_COUNT;attempt++) {
@@ -64,7 +66,7 @@ public final class FrameLayout implements AutoCloseable {
                 putVec(b,pose.position());putVec(b,pose.forward());putVec(b,pose.up());
                 for(float v:pose.view())b.putFloat(v);for(float v:pose.projection())b.putFloat(v);
                 b.position(base+512);b.put(color.duplicate());b.put(depth.duplicate());b.put(hud.duplicate());
-                U64.setRelease(map,base,seq);sequence=seq;session=key;nextSlot=(slot+1)%SLOT_COUNT;
+                U64.setRelease(map,base,seq);sequence=seq;session=key;sessionTransform=transform;nextSlot=(slot+1)%SLOT_COUNT;
                 return true;
             } finally { U64.setRelease(map,base+8,0L); }
         }

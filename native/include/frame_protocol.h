@@ -19,14 +19,46 @@ struct FramePose {
     Vec3 position{},forward{},up{};
     std::array<float,16> view{},projection{}; // MC space, column-major.
 };
+struct WorldTransform {
+    Vec3 dst_origin{}, mc_origin{};
+    std::array<double,9> axes{};
+};
+inline bool supported_axes(const std::array<double,9>& a) {
+    return (a[0]==1 || a[0]==-1) && a[1]==0 && a[2]==0 && a[3]==0 &&
+           a[4]==1 && a[5]==0 && a[6]==0 && a[7]==0 && a[8]==1;
+}
+inline bool valid_transform(const WorldTransform& t) {
+    return supported_axes(t.axes) && std::isfinite(t.dst_origin.x) && std::isfinite(t.dst_origin.y) &&
+           std::isfinite(t.dst_origin.z) && std::isfinite(t.mc_origin.x) &&
+           std::isfinite(t.mc_origin.y) && std::isfinite(t.mc_origin.z);
+}
+inline bool same_transform(const WorldTransform& a, const WorldTransform& b) {
+    return valid_transform(a) && valid_transform(b) && a.axes==b.axes &&
+           a.dst_origin.x==b.dst_origin.x && a.dst_origin.y==b.dst_origin.y && a.dst_origin.z==b.dst_origin.z &&
+           a.mc_origin.x==b.mc_origin.x && a.mc_origin.y==b.mc_origin.y && a.mc_origin.z==b.mc_origin.z;
+}
+inline Vec3 direction_to_dst(const WorldTransform& t, Vec3 v) { return {t.axes[0]*v.x,v.y,v.z}; }
+inline Vec3 position_to_dst(const WorldTransform& t, Vec3 p) {
+    auto d=direction_to_dst(t,{p.x-t.mc_origin.x,p.y-t.mc_origin.y,p.z-t.mc_origin.z});
+    return {d.x+t.dst_origin.x,d.y+t.dst_origin.y,d.z+t.dst_origin.z};
+}
+// V_dst = V_mc * [S, mcOrigin - S*dstOrigin]. This also preserves inverse-projected camera-space depth.
+inline FramePose pose_to_dst(const WorldTransform& t, const FramePose& source) {
+    auto p=source; p.position=position_to_dst(t,source.position);
+    p.forward=direction_to_dst(t,source.forward); p.up=direction_to_dst(t,source.up);
+    double offset[3]={t.mc_origin.x-t.axes[0]*t.dst_origin.x,t.mc_origin.y-t.dst_origin.y,t.mc_origin.z-t.dst_origin.z};
+    for(int r=0;r<4;r++) {
+        p.view[r]=float(source.view[r]*t.axes[0]);
+        p.view[12+r]=float(source.view[12+r]+source.view[r]*offset[0]+source.view[4+r]*offset[1]+source.view[8+r]*offset[2]);
+    }
+    return p;
+}
 /** Read-only data view; owns a shared slot lease. Mapping must outlive this object. */
-struct FrameView {
+struct FrameView : WorldTransform {
     FrameKey key{};
     uint32_t width{},height{};
     const uint8_t *color{},*depth{},*hud{};
     uint64_t layer_bytes{},sequence{};
-    Vec3 dst_origin{},mc_origin{};
-    std::array<double,9> axes{};
     FramePose pose{};
     FrameView()=default;
     FrameView(const FrameView&)=delete;
@@ -85,8 +117,7 @@ inline std::optional<FrameView> read_frame(const void* memory,size_t length,Fram
         view.dst_origin=detail::vec(slot,128);view.mc_origin=detail::vec(slot,152);
         bool valid=detail::finite(view.dst_origin)&&detail::finite(view.mc_origin);
         for(unsigned j=0;j<9;j++) { view.axes[j]=load<double>(slot,176+j*8);valid &= std::isfinite(view.axes[j]); }
-        // v2 first calibration has identity axes; do not silently accept an unsupported transform.
-        for(unsigned j=0;j<9;j++) valid &= view.axes[j]==((j==0||j==4||j==8)?1.0:0.0);
+        valid &= valid_transform(view);
         view.pose.position=detail::vec(slot,248);view.pose.forward=detail::vec(slot,272);view.pose.up=detail::vec(slot,296);
         valid &= detail::finite(view.pose.position)&&detail::finite(view.pose.forward)&&detail::finite(view.pose.up);
         for(unsigned j=0;j<16;j++) {

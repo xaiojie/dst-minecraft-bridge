@@ -52,7 +52,7 @@ static void solid(const FrameView& view,uint64_t id) {
     check(view.pose.view[0]==1 && view.pose.projection[15]==1,"matrix layout mismatch");
 }
 static void shared_process_contract() {
-    char directory[]="build/shared-XXXXXX";check(mkdtemp(directory)!=nullptr,"mkdtemp failed");
+    char directory[]="/tmp/dstmc-axis-shared-XXXXXX";check(mkdtemp(directory)!=nullptr,"mkdtemp failed");
     auto dir=std::filesystem::absolute(directory);
     pid_t child=fork();check(child>=0,"fork failed");
     if(child==0) {
@@ -96,6 +96,15 @@ int main(int argc,char** argv) {
     auto reject=[&](const char* name,const std::function<void(void*)>& mutate) {
         test(name,[&] {std::vector<uint64_t> copy((mapping.size+7)/8);std::memcpy(copy.data(),mapping.data,mapping.size);mutate(copy.data());check(!read_frame(copy.data(),mapping.size,key()),"malformed frame accepted");});
     };
+    test("reflected_frame_is_readable",[&] {
+        std::vector<uint64_t> copy((mapping.size+7)/8);std::memcpy(copy.data(),mapping.data,mapping.size);
+        double minus=-1;std::memcpy(reinterpret_cast<uint8_t*>(copy.data())+4096+176,&minus,8);
+        auto f=read_frame(copy.data(),mapping.size,key());check(f.has_value() && f->axes[0]==-1,"supported reflected frame rejected");
+    });
+    reject("unsupported_reflection_rejected",[](void* p){double n=-1;std::memcpy(static_cast<uint8_t*>(p)+4096+176+4*8,&n,8);});
+    reject("scaled_axes_rejected",[](void* p){double n=2;std::memcpy(static_cast<uint8_t*>(p)+4096+176,&n,8);});
+    reject("nan_axes_rejected",[](void* p){double n=NAN;std::memcpy(static_cast<uint8_t*>(p)+4096+176,&n,8);});
+    reject("sheared_axes_rejected",[](void* p){double n=.01;std::memcpy(static_cast<uint8_t*>(p)+4096+176+8,&n,8);});
     test("truncated_file_rejected",[&]{check(!read_frame(mapping.data,mapping.size-1,key()),"truncated file accepted");});
     reject("odd_sequence_rejected",[](void* p){put64(p,4096,3);});
     reject("oversize_rejected",[](void* p){put32(p,4096+72,0xffffffff);});

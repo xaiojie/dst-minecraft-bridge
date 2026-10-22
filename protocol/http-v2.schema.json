@@ -434,12 +434,7 @@
           "$ref": "#/$defs/Vec3"
         },
         "axes": {
-          "type": "array",
-          "items": {
-            "type": "number"
-          },
-          "minItems": 9,
-          "maxItems": 9
+          "$ref": "#/$defs/Axes"
         },
         "frame_path": {
           "type": "string",
@@ -640,6 +635,36 @@
               "type": "null"
             }
           ]
+        },
+        "dst_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vec3"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mc_origin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Vec3"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "axes": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Axes"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -659,7 +684,10 @@
         "generation",
         "width",
         "height",
-        "latest_frame"
+        "latest_frame",
+        "dst_origin",
+        "mc_origin",
+        "axes"
       ],
       "additionalProperties": false,
       "allOf": [
@@ -693,6 +721,15 @@
               },
               "height": {
                 "type": "null"
+              },
+              "dst_origin": {
+                "type": "null"
+              },
+              "mc_origin": {
+                "type": "null"
+              },
+              "axes": {
+                "type": "null"
               }
             }
           },
@@ -703,6 +740,15 @@
               },
               "epoch": {
                 "$ref": "#/$defs/UUID"
+              },
+              "dst_origin": {
+                "$ref": "#/$defs/Vec3"
+              },
+              "mc_origin": {
+                "$ref": "#/$defs/Vec3"
+              },
+              "axes": {
+                "$ref": "#/$defs/Axes"
               }
             }
           }
@@ -930,6 +976,36 @@
         "reason"
       ],
       "additionalProperties": false
+    },
+    "Axes": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "enum": [
+        [
+          1,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          1
+        ],
+        [
+          -1,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
     }
   },
   "anyOf": [

@@ -46,6 +46,21 @@ int main(int argc, char **argv) {
     std::cout << "PASS window_proof_current_identity_only "
                  "missing_and_expired_proof_rejected\n";
   }
+  {
+    CameraService reflected([] { return 1000; });
+    auto f = frame(); f->axes[0] = -1; f->mc_origin = {5, 7, 9};
+    f->pose.forward = {1, 0, 0}; f->pose.up = {0, 1, 0};
+    reflected.offer(f, {});
+    auto l = reflected.lease_latest(f->key.pair_hash, f->key.epoch);
+    assert(l && l->pose.position.x == 14 && l->pose.position.y == -5 && l->pose.position.z == 14 && "reflected_position_about_nonzero_origins");
+    assert(l->pose.forward.x == -1 && l->pose.up.y == 1 && "directions_use_axes_without_translation");
+    assert(l->pose.view[0] == -1 && l->pose.view[12] == 14 && l->pose.view[13] == 5 && l->pose.view[14] == -14 && "converted_view_preserves_rays");
+    auto rotated = pose_to_dst(*f,FramePose{{1,2,3},{1,0,0},{0,1,0},{0,0,1,0,0,1,0,0,-1,0,0,0,3,-2,-1,1},{}});
+    assert(rotated.view[2]==-1 && rotated.view[12]==14 && rotated.view[13]==5 && rotated.view[14]==14 && "rotated_view_uses_column_major_transform");
+    auto changed = frame(2); reflected.offer(changed, {});
+    assert(!reflected.lease_latest(f->key.pair_hash, f->key.epoch) && "changed_transform_invalidates_cached_frame");
+    std::cout << "PASS reflected_lease_and_transform_mismatch\n";
+  }
   uint64_t now = 1000;
   CameraService s([&] { return now; });
   auto f = frame();

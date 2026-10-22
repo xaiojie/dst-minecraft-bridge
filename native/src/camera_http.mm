@@ -141,7 +141,27 @@ struct Mapping {
       munmap(base, length);
   }
 };
-void discover(dstmc::FrameKey expected) {
+// Strict active-binding metadata. Missing fields intentionally reject older status producers.
+dstmc::WorldTransform parse_transform(NSDictionary *status) {
+  auto number=[](id value) -> double {
+    if (![value isKindOfClass:[NSNumber class]] || CFGetTypeID((CFTypeRef)value)==CFBooleanGetTypeID() || !std::isfinite([value doubleValue]))
+      throw std::runtime_error("invalid transform number");
+    return [value doubleValue];
+  };
+  auto vector=[&](id value) -> dstmc::Vec3 {
+    NSDictionary *v=object(value);fields(v,@[@"x",@"y",@"z"]);
+    return {number(v[@"x"]),number(v[@"y"]),number(v[@"z"])};
+  };
+  dstmc::WorldTransform t;
+  t.dst_origin=vector(status[@"dst_origin"]);t.mc_origin=vector(status[@"mc_origin"]);
+  id axes=status[@"axes"];
+  if (![axes isKindOfClass:[NSArray class]] || [axes count]!=9)
+    throw std::runtime_error("missing or invalid transform axes");
+  for (unsigned i=0;i<9;i++)t.axes[i]=number(axes[i]);
+  if (!dstmc::valid_transform(t))throw std::runtime_error("unsupported transform axes");
+  return t;
+}
+void discover_frame(dstmc::FrameKey expected) {
   NSDictionary *s = get_status();
   if (![s[@"protocol"] isEqual:@2] || ![s[@"status"] isEqual:@"PAIRED"])
     throw std::runtime_error("MC not paired");
@@ -170,6 +190,8 @@ void discover(dstmc::FrameKey expected) {
     state().service.release();
     throw;
   }
+  auto transform=parse_transform(s);
+  if(!state().service.validate_transform(transform))throw std::runtime_error("active binding transform changed");
   // Refresh physical size even while an exact frame is pinned.
   state().service.resize(width, height);
   auto latest = parse_key(object(s[@"latest_frame"]));
@@ -199,10 +221,21 @@ void discover(dstmc::FrameKey expected) {
   auto frame = dstmc::read_frame(mapping->base, mapping->length, expected);
   if (!frame)
     throw std::runtime_error("exact complete frame unavailable");
+  if (!dstmc::same_transform(*frame,transform))
+    throw std::runtime_error("frame binding transform mismatch");
   if (frame->width != width || frame->height != height)
     throw std::runtime_error("stream resize");
   state().service.offer(std::make_shared<dstmc::FrameView>(std::move(*frame)),
                         mapping);
+}
+void discover(dstmc::FrameKey expected) {
+  try { discover_frame(expected); }
+  catch (...) {
+    state().service.release();
+    std::lock_guard<std::mutex> lock(state().window_mutex);
+    state().window_proof=WindowProof{};
+    throw;
+  }
 }
 NSArray *matrix(const std::array<float, 16> &m) {
   NSMutableArray *a = [NSMutableArray arrayWithCapacity:16];

@@ -104,7 +104,7 @@ MC HTTP 使用 `127.0.0.1:39379` 的 `/v2/handshake`、`/v2/exchange`、`/v2/sta
 
 ## Task 4: 第一人称镜头与原生深度合成——画面关口
 
-> 当前执行状态（2026-10-22）：候选代码及两轮审查修复已保存，代码复核无未解决发现。现有测试世界的 Klei 在线登录待恢复，camera、same-frame、transparency、depth occlusion、UI 五项实机验收仍为 NOT_VERIFIED；任务 4 未完成，不进入任务 5。网络由用户处理，恢复后继续原存档实测。
+> 当前执行状态（2026-10-22）：候选代码及两轮审查修复已保存。已修正 Steam 的 Intel 环境触发 ARM-only Python 工具链失败的问题，用户由 Steam 进入原世界，图形扩展加载和持续回调已实测。两帧 960×540 原生第一人称校准及红蓝标记确认 X 反射，正在把固定轴变换贯穿持久配对、帧和镜头。camera、same-frame、transparency、depth occlusion、UI 五项双游戏实机验收仍为 NOT_VERIFIED；任务 4 未完成，不进入任务 5。后台仍有部分 Klei 服务 SSL 错误，不能据此宣称联网完全恢复。
 
 **Files:** 创建 `native/src/{camera_service.cpp,compositor.mm,scene_depth.mm}`、`native/include/{camera_service.h,compositor.h}`、`native/tests/{lease_test.cpp,compositor_test.mm}`；创建 `dst-mod/{modmain.lua,modinfo.lua}`、`dst-mod/scripts/dstmc/{camera.lua,connection.lua,world.lua}`、`dst-mod/scripts/components/dstmcidentity.lua`；创建 `mc/src/client/java/dev/jay/dstmc/client/PassthroughWindow.java`、`mc/src/client/java/dev/jay/dstmc/client/mixin/{WindowCreateMixin,WindowPresentMixin}.java`、`tests/test_first_person_gate.py`，修改 `native/src/entry.mm`。
 

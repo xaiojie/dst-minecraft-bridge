@@ -139,6 +139,21 @@ static void sprite_replay_test(GLuint target) {
   assert(glGetError() == GL_NO_ERROR);
 }
 int main() {
+  {
+    // Literal actual MatrixV from frames 8947/8948: forward -Z, reflected native X.
+    FrameView f;f.axes={-1,0,0,0,1,0,0,0,1};f.width=960;f.height=540;
+    f.dst_origin={-179.50582885742,0,440.20126342773};f.mc_origin={0,64,0};
+    f.pose.position={0,66,0};f.pose.forward={0,0,-1};f.pose.up={0,1,0};
+    f.pose.view={1,0,0,0,0,1,0,0,0,0,1,0,0,-66,0,1};
+    f.pose.projection={.5625,0,0,0,0,1,0,0,0,0,-1.0100503,-1,0,0,-2.0100503,0};
+    RenderProbe p;p.viewport={0,0,960,540};p.depth_range={0,1};
+    p.shader_matrices={{"MatrixV",0,{-1,0,0,0,0,1,0,0,0,0,1,0,-179.505829,-2,-440.201263,1}},{"MatrixP",1,f.pose.projection}};
+    assert(matching_camera(f,p) && "actual_native_reflection_matches_saved_basis");
+    f.axes[0]=1;assert(!matching_camera(f,p));f.axes[0]=-1;
+    p.shader_matrices[0].value[12]+=.01;assert(!matching_camera(f,p));
+    std::cout<<"PASS measured_native_reflection_and_origins_match\n";
+  }
+
   CGLPixelFormatAttribute attrs[] = {
       kCGLPFAAccelerated,          kCGLPFAColorSize,
       (CGLPixelFormatAttribute)24, kCGLPFADepthSize,
@@ -174,6 +189,7 @@ int main() {
   uint8_t colors[] = {255, 0, 0, 255, 0, 0, 0, 0}, hud[8] = {};
   float md[] = {depth(2, .05, 100), depth(2, .05, 100)};
   auto f = std::make_shared<FrameView>();
+  f->axes = {1,0,0,0,1,0,0,0,1};
   f->width = 2;
   f->height = 1;
   f->key.id = 1;
@@ -222,7 +238,11 @@ int main() {
     assert(c.compose(f->key, p, host).status ==
                ComposeStatus::SKIPPED_MISMATCH &&
            "reflected_view_rejected");
+    f->axes[0] = -1;
+    assert(c.compose(f->key, p, host).status == ComposeStatus::COMPOSITED && "matching_reflected_view_accepted");
     p.shader_matrices[0].value[0] = 1;
+    assert(c.compose(f->key, p, host).status == ComposeStatus::SKIPPED_MISMATCH && "identity_view_rejected_for_reflected_binding");
+    f->axes[0] = 1;
     assert(c.compose(f->key, p, 0).status == ComposeStatus::DEPTH_UNAVAILABLE);
     now = 250;
     assert(c.compose(f->key, p, host).status == ComposeStatus::SKIPPED_STALE);

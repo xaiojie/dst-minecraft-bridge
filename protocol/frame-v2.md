@@ -10,14 +10,17 @@ This contract is shared by the Java ARM64 producer and C++ x86_64 consumer. No g
 
 Pair hash input is UTF-8 JSON with no BOM, whitespace or final newline. Keys appear in this **fixed order**: `dst_world`, `dst_shard`, `mc_world`, `mc_dimension`, `region`. UUIDs are lowercase RFC 4122 strings; strings escape quotes and backslashes with a backslash and U+0000–001F as lowercase `\u00xx`. Other valid Unicode stays UTF-8; there is no Unicode normalization. Invalid surrogate sequences are rejected. `BridgeTypes.canonicalPair` and `pairHash` implement this representation. The golden input and SHA-256 are in `fixtures/frame-v2.json`.
 
-Initial calibration is one DST unit to one MC block, identity axes:
+Production first-person calibration is one DST unit to one MC block with the persistent X reflection `S = diag(-1,1,1)`:
 
 ```
-MC = DST - dstOrigin + mcOrigin
-DST = MC - mcOrigin + dstOrigin
+MC = mcOrigin + S * (DST - dstOrigin)
+DST = dstOrigin + S * (MC - mcOrigin)
+directionMC = S * directionDST
 ```
 
-The golden origins `(100,0,-50)` and `(0,64,0)` map DST `(106.5,2,-47)` to MC `(6.5,66,3)`. `WorldTransform.toMc` / `toDst` never recalibrate in response to movement. `PairingStore(Path)` atomically saves a pair's first origins; `loadOrCreate(pair, dstOrigin, mcOrigin)` returns those saved origins on subsequent calls. Different pairs use different SHA-256 file names. Malformed records fail closed. Creation is protected by a stable lock inode, and each record is forced, atomically renamed, then its parent directory is forced. The current binary store is private to Java; the shared interchange format is this document and HTTP schema.
+Only `IDENTITY` and `REFLECT_X` are supported. The two-origin `WorldTransform` constructor and three-argument `PairingStore.loadOrCreate` retain explicit identity compatibility; production `WorldExchange` always requires `REFLECT_X`. The unchanged identity golden origins `(100,0,-50)` and `(0,64,0)` map DST `(106.5,2,-47)` to MC `(6.5,66,3)`; reflection maps it to `(-6.5,66,3)`. Axes returned by Java are defensive copies; positions and directions never recalibrate with movement. There is no AABB transform consumer in this stage.
+
+Both private Java persistence formats now save mode and origins: PairingStore magic `DSP3` saves canonical pair, two Vec3 origins, then the UTF mode name; WorldExchange magic `DMB3` saves DST UUID/shard, two Vec3 origins and UTF mode name. Legacy `DSP2`/`DMB2` records decode as identity without rewriting. An incompatible requested mode returns/throws `TRANSFORM_MISMATCH`; the production HTTP handshake returns `400 REQUEST_REJECTED` with that reason before activating pairing or frame publication. No implicit migration, reset or deletion occurs. Re-handshake/restart retains original origins and mode. Unknown versions/modes, invalid origins and trailing data fail closed. PairingStore retains its stable lock inode; both stores retain forced atomic writes and parent-directory forcing. Pair files remain keyed by pair SHA-256. WorldExchange remains confined to the MC server thread and owns its independent per-save binding.
 
 `RequestLedger(Path, pair, epoch)` owns an exclusive OS file lock for that pair until `close()`. A second live owner is rejected immediately. Use try-with-resources and close before reopening a ledger. `receive(Command)` rejects foreign identity **before** inspecting/mutating command state. The first valid receipt is forced to durable `PENDING` before returning. `pollPending(): Optional<Command>` removes one item from the in-memory game-thread scheduling queue; duplicate receipts return the existing outcome and never enqueue again. Reusing an ID with different parameters or epoch is rejected. A game-thread consumer calls `finish(id, result)` only after actual application/rejection. `APPLIED` and `REJECTED` terminal outcomes cannot be rewritten. `UNRESOLVED` may be reconciled explicitly through `finish`, but is never automatically queued.
 
@@ -67,7 +70,7 @@ Slot `i` starts at `4096 + i*stride`:
 | 120 | 8 | layerBytes = width*height*4 |
 | 128 | 24 | DST origin, 3 float64 |
 | 152 | 24 | MC origin, 3 float64 |
-| 176 | 72 | DST→MC 3×3 axes, 9 float64, identity in initial calibration |
+| 176 | 72 | DST→MC 3×3 axes, 9 float64, exactly identity or diag(-1,1,1) |
 | 248 | 24 | Pose position in MC space, 3 float64 |
 | 272 | 24 | Pose forward in MC space, 3 float64 |
 | 296 | 24 | Pose up in MC space, 3 float64 |
@@ -79,7 +82,7 @@ The three packed layers immediately follow the header in world/depth/HUD order, 
 
 ## Atomic publication and leases
 
-The protocol uses aligned, lock-free 64-bit atomics on ARM64 and x86_64. Java uses little-endian ByteBuffer VarHandles; C++ uses lock-free compiler atomic operations on the mapped words. The header is initialized before the mapping is announced and then remains immutable. There is one Java producer per mapping.
+The protocol uses aligned, lock-free 64-bit atomics on ARM64 and x86_64. Java uses little-endian ByteBuffer VarHandles; C++ uses lock-free compiler atomic operations on the mapped words. The header is initialized before the mapping is announced and then remains immutable. There is one Java producer per mapping. Origins and axes cannot change within a mapping/epoch; such publication rejects before mutating any slot.
 
 1. Writer CAS-acquires a slot's lease from 0 to UINT64_MAX. A nonzero lease prevents selection; if all three are held, `publish` returns false without advancing its frame ID or sequence.
 2. Writer stores an odd commit sequence with volatile/full ordering before changing metadata or pixels, writes the complete header and three layers, then release-stores the nonzero even sequence.
@@ -97,7 +100,7 @@ Readers check capacity before multiplying and validate the exact calculated stri
 
 | Bind address | Method / route | Purpose |
 |---|---|---|
-| 127.0.0.1:39379 | POST /v2/handshake | Pair/epoch, fixed origins, identity axes and new mapping path |
+| 127.0.0.1:39379 | POST /v2/handshake | Pair/epoch, fixed origins, persisted supported axes and new mapping path |
 | 127.0.0.1:39379 | POST /v2/exchange | Commands/events and confirmed authoritative state/results |
 | 127.0.0.1:39379 | GET /v2/status | Protocol and live identity/status |
 | 127.0.0.1:39380 | POST /v2/camera/lease | Frame-keyed camera lease in DST space |
@@ -121,8 +124,8 @@ cd .. && make -C native contract-test
 Before handshake it reports `status: UNPAIRED`, the copy's persistent `mc_world`,
 `pid`, random process `run_id`, `started_at_ms`, server tick `heartbeat`,
 `peer_last_seen_ms` (0 before heartbeat exchange), `fixture` and `stage_ready`.
-`pair`, `epoch`, `frame_path`, `generation`, `latest_frame`, `width`, `height` are null.
-After handshake status is `PAIRED` and pair/epoch identify the active session.
+`pair`, `epoch`, `dst_origin`, `mc_origin`, `axes`, `frame_path`, `generation`, `latest_frame`, `width`, `height` are null.
+After handshake status is `PAIRED`; pair/epoch and non-null `dst_origin`, `mc_origin`, `axes` identify the active binding, including while stream fields are null.
 Until a complete current-generation frame commits, stream fields remain null.
 Then `latest_frame` is the exact committed FrameKey and MUST match active pair/epoch;
 `frame_path` is an absolute mmap path, `generation` is positive, width/height are
@@ -137,7 +140,7 @@ with `HTTP_UINT64_NOT_EXACT` at exhaustion. Binary frame fields remain uint64.
 Existing handshake input remains unchanged. The MC origin must be `(0,64,0)`;
 only `dst_mc_bridge:stage` / `ground` is supported. Each independent copied save
 stores one MC UUID and at most one DST pair; a different DST world/shard is rejected
-with `WORLD_MISMATCH`, including after restart. Re-handshake retains the first origin.
+with `WORLD_MISMATCH`, including after restart. Re-handshake retains the first origins and axis mode.
 The final intended copy is reserved for the real DST world. Mock pairing tests
 run in `DST-MC-Frame-Fixture`, selected explicitly by `-PtestSave=...` at launch.
 Its `/test/scene` endpoint is available only under the fixture VM property AND
@@ -176,3 +179,11 @@ continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowe
 ### Window activation identity
 
 `GET /v2/window?pair_hash=<hash>&epoch=<uuid>` requires the expected session identity. `hash` is the 64 lowercase hexadecimal characters of SHA-256 of canonical PairKey JSON; `uuid` is the lowercase hyphenated Epoch UUID. Query order is exactly `pair_hash` then `epoch`, with no extra fields or alternate encoding. The native service compares both values against the actual last successfully composited and presented FrameKey, and requires that proof to be younger than 250 ms. Offered or acknowledged camera leases do not create window activation proof. Missing, different or expired identity returns `409 GATE_NOT_READY`. The strict WindowResponse JSON shape is unchanged. MC also binds each request to its local session generation and a 200 ms deadline measured from dispatch, and clears pending/cached activation on session change.
+
+### Native transform validation
+
+Native discovery requires the active status origins and axes before reusing a pinned lease, and compares them exactly with newly read frame metadata. Missing/malformed/unsupported metadata, mismatched binding or failed discovery releases the cached frame and invalidates window proof. Older status producers without these fields intentionally fail closed; deploy matching Java/native versions together. The binary offsets and identity golden fixture remain unchanged. Readers accept exactly the two supported unit-scale matrices, rejecting NaN, shear, scale and other reflections.
+
+For the saved transform, native converts position and forward/up vectors using the inverse above. View conversion is `V_DST = V_MC * [S, mcOrigin - S*dstOrigin]`. Actual native `MatrixV` must match every resulting entry at the existing tolerance; ray-defining projection entries and viewport/depth range retain existing strict checks. Thus measured native negative-X views match only reflected bindings. No image flip or camera endpoint sign patch is applied. After this view alignment, both inverse projections reconstruct the same camera coordinate basis, so comparing reconstructed camera-space depth remains valid despite different near/far planes; raw cross-engine depth is never compared. Reflection does not alter the existing inverse-projection shader.
+
+Pure tests use the measured frames 8947/8948 matrices and offscreen fixtures; they do not establish live ground depth, five-item graphics acceptance, or performance. The actual shoreline/water capture is insufficient for those gates.

@@ -42,7 +42,7 @@ class NativeHttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='dstmc-http-fixture-') as temp:
             temp=pathlib.Path(temp);frame=temp/'frame.bin'
             shutil.copyfile(ROOT/'protocol/fixtures/frame-v2.bin',frame)
-            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'],generation=1)
+            status=dict(protocol=2,status='PAIRED',pair=key['pair'],epoch=key['epoch'],latest_frame=key,frame_path=str(frame),width=fixture['width'],height=fixture['height'],generation=1,dst_origin=dict(x=100,y=0,z=-50),mc_origin=dict(x=0,y=64,z=0),axes=[1,0,0,0,1,0,0,0,1])
             class Status(BaseHTTPRequestHandler):
                 def do_GET(self):
                     data=json.dumps(status).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)

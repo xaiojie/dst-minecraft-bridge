@@ -164,15 +164,10 @@ bool matching_camera(const FrameView &f, const RenderProbe &p) {
   }
   if (!v || !projection)
     return false;
-  double delta[3] = {f.dst_origin.x - f.mc_origin.x,
-                     f.dst_origin.y - f.mc_origin.y,
-                     f.dst_origin.z - f.mc_origin.z};
+  if (!valid_transform(f)) return false;
+  const auto expected = pose_to_dst(f,f.pose).view;
   for (int i = 0; i < 16; i++) {
-    double expected = f.pose.view[i];
-    if (i >= 12)
-      for (int c = 0; c < 3; c++)
-        expected -= f.pose.view[c * 4 + i - 12] * delta[c];
-    if (!std::isfinite((*v)[i]) || std::abs((*v)[i] - expected) > 0.001)
+    if (!std::isfinite((*v)[i]) || !std::isfinite(expected[i]) || std::abs((*v)[i] - expected[i]) > 0.001)
       return false;
   }
   // Near/far differ by engine; all ray-defining projection entries must agree.

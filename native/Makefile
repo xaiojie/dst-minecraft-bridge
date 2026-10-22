@@ -51,3 +51,10 @@ gl-test: compositor-test
 .PHONY: compositor-test
 compositor-test: $(BUILD)/compositor_test
 	./$(BUILD)/compositor_test
+
+$(BUILD)/transform_status_test: tests/transform_status_test.mm src/camera_http.mm src/camera_service.cpp include/camera_http.h include/camera_service.h include/frame_protocol.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(GLFLAGS) tests/transform_status_test.mm src/camera_http.mm src/camera_service.cpp -o $@
+.PHONY: transform-status-test
+transform-status-test: $(BUILD)/transform_status_test
+	$(BUILD)/transform_status_test
