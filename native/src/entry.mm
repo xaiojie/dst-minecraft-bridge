@@ -74,7 +74,8 @@ void present() {
     camera_service().release();
   }
   present_window(c.depth.camera().viewport[2], c.depth.camera().viewport[3],
-                 presented);
+                 presented ? std::optional<dstmc::FrameKey>(c.displayed->key)
+                           : std::nullopt);
   c.composited = false;
   c.displayed.reset();
   c.depth.reset();

@@ -19,7 +19,7 @@ struct State {
   std::mutex key_mutex, window_mutex;
   dstmc::FrameKey current_key{};
   NSDictionary *window_info = nil;
-  uint64_t last_composite = 0;
+  WindowProof window_proof;
   bool enabled = false;
   std::string directory;
 };
@@ -214,10 +214,12 @@ NSDictionary *vec(dstmc::Vec3 v) {
   return @{@"x" : @(v.x), @"y" : @(v.y), @"z" : @(v.z)};
 }
 NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
-  if ([path isEqual:@"/v2/window"] && [method isEqual:@"GET"]) {
+  if ([path hasPrefix:@"/v2/window"] && [method isEqual:@"GET"]) {
     std::lock_guard<std::mutex> lock(state().window_mutex);
-    if (!state().window_info || milliseconds() - state().last_composite >= 250)
-      throw std::runtime_error("no recently composited frame");
+    if (!state().window_info ||
+        !state().window_proof.accepts(path.UTF8String, milliseconds()))
+      throw std::runtime_error(
+          "no recently composited frame for requested identity");
     return [[state().window_info retain] autorelease];
   }
   if (![method isEqual:@"POST"])
@@ -426,10 +428,11 @@ void report_compose(const dstmc::RenderProbe &camera, dstmc::FrameKey key,
     });
   }
 }
-void present_window(int pw, int ph, bool composited) {
-  if (composited) {
+void present_window(int pw, int ph,
+                    std::optional<dstmc::FrameKey> composited_frame) {
+  if (composited_frame) {
     std::lock_guard<std::mutex> lock(state().window_mutex);
-    state().last_composite = milliseconds();
+    state().window_proof.recorded(*composited_frame, milliseconds());
   }
   // Cocoa view geometry is captured only on the native UI thread. Render pixels
   // come from the profiled scene.

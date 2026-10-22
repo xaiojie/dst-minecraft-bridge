@@ -102,7 +102,7 @@ Readers check capacity before multiplying and validate the exact calculated stri
 | 127.0.0.1:39379 | GET /v2/status | Protocol and live identity/status |
 | 127.0.0.1:39380 | POST /v2/camera/lease | Frame-keyed camera lease in DST space |
 | 127.0.0.1:39380 | POST /v2/camera/applied | Confirm/reject that specific camera frame |
-| 127.0.0.1:39380 | GET /v2/window | DST content screen origin, logical points, physical pixels, scale |
+| 127.0.0.1:39380 | GET /v2/window?pair_hash=<hash>&epoch=<uuid> | DST content screen origin, logical points, physical pixels, scale; identity-bound composition proof |
 
 Both services bind loopback only. A legacy protocol=1 owner of 39379 is a visible conflict requiring that test instance to be closed; never kill an unrelated process. Network callbacks queue work for game/render threads and do not invoke game APIs. Receipt PENDING is never displayed as application. HTTP implementations and game APIs belong to subsequent tasks.
 
@@ -172,3 +172,7 @@ compiles its native leased reader explicitly for x86_64. It captures real stone,
 removes that block via the fixture-only server-thread API, verifies the pixels
 disappear, checks matched camera pose/depth/premultiplied alpha, then samples
 continuous new-frame/heartbeat progress for60seconds. No disk fallback is allowed.
+
+### Window activation identity
+
+`GET /v2/window?pair_hash=<hash>&epoch=<uuid>` requires the expected session identity. `hash` is the 64 lowercase hexadecimal characters of SHA-256 of canonical PairKey JSON; `uuid` is the lowercase hyphenated Epoch UUID. Query order is exactly `pair_hash` then `epoch`, with no extra fields or alternate encoding. The native service compares both values against the actual last successfully composited and presented FrameKey, and requires that proof to be younger than 250 ms. Offered or acknowledged camera leases do not create window activation proof. Missing, different or expired identity returns `409 GATE_NOT_READY`. The strict WindowResponse JSON shape is unchanged. MC also binds each request to its local session generation and a 200 ms deadline measured from dispatch, and clears pending/cached activation on session change.

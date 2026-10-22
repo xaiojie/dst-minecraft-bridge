@@ -1,3 +1,4 @@
+#include "camera_http.h"
 #include "camera_service.h"
 #include <cassert>
 #include <iostream>
@@ -20,6 +21,30 @@ int main(int argc, char **argv) {
     std::string stop;
     std::getline(std::cin, stop);
     return 0;
+  }
+  {
+    bridge::WindowProof proof;
+    FrameKey a{}, b{};
+    a.pair_hash[0] = 1;
+    a.epoch[0] = 1;
+    b = a;
+    b.epoch[0] = 2;
+    assert(!proof.accepts(bridge::WindowProof::request(a), 1000));
+    proof.recorded(a, 1000);
+    assert(proof.accepts(bridge::WindowProof::request(a), 1010));
+    assert(!proof.accepts(bridge::WindowProof::request(b), 1010) &&
+           "fresh_B_request_must_reject_A_composite");
+    b = a;
+    b.pair_hash[0] = 2;
+    assert(!proof.accepts(bridge::WindowProof::request(b), 1010));
+    assert(!proof.accepts("/v2/window", 1010));
+    assert(!proof.accepts(bridge::WindowProof::request(a) + "&extra=1", 1010));
+    assert(!proof.accepts(bridge::WindowProof::request(a), 1250));
+    proof.recorded(b, 1260);
+    assert(proof.accepts(bridge::WindowProof::request(b), 1261));
+    assert(!proof.accepts(bridge::WindowProof::request(a), 1261));
+    std::cout << "PASS window_proof_current_identity_only "
+                 "missing_and_expired_proof_rejected\n";
   }
   uint64_t now = 1000;
   CameraService s([&] { return now; });

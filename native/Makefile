@@ -37,7 +37,7 @@ $(BUILD)/libdstmc_probe.dylib: src/entry.mm src/camera_http.mm src/gl_observer.m
 	mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(GLFLAGS) -dynamiclib src/entry.mm src/camera_http.mm src/gl_observer.mm src/frame_reader.cpp src/camera_service.cpp src/compositor.mm src/scene_depth.mm -o $@
 
-$(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h
+$(BUILD)/lease_test: tests/lease_test.cpp src/camera_service.cpp include/camera_service.h include/frame_protocol.h include/camera_http.h include/compositor.h include/gl_observer.h
 	mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) tests/lease_test.cpp src/camera_service.cpp -o $@
 .PHONY: lease-test

@@ -41,7 +41,7 @@ public final class PassthroughWindow {
         if(!CONFIGURED)return;
         // Capture session identity only on the client thread. Re-pairing may keep
         // BridgeClient.active() true, so a boolean is not an activation proof.
-        Object session=BridgeClient.active()?BridgeMod.server.active():null;
+        var session=BridgeClient.active()?BridgeMod.server.active():null;
         if(ACTIVATION.session(session)){
             if(pending!=null){pending.response().cancel(false);pending=null;}
             restore();
@@ -58,7 +58,8 @@ public final class PassthroughWindow {
         if(active&&!ACTIVATION.active(session,now))restore();
         if(pending==null&&now-lastPoll>=50_000_000L){
             lastPoll=now;
-            var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window")).timeout(Duration.ofMillis(150)).GET().build();
+            String identity="?pair_hash="+java.util.HexFormat.of().formatHex(dev.jay.dstmc.protocol.BridgeTypes.pairHash(session.pair()))+"&epoch="+session.epoch();
+            var request=HttpRequest.newBuilder(URI.create("http://127.0.0.1:39380/v2/window"+identity)).timeout(Duration.ofMillis(150)).GET().build();
             var ticket=ACTIVATION.dispatch(now);
             var responseFuture=HTTP.sendAsync(request,HttpResponse.BodyHandlers.ofString()).thenApply(response->{
                 if(response.statusCode()!=200||response.body().length()>4096)throw new IllegalStateException("native fusion inactive");

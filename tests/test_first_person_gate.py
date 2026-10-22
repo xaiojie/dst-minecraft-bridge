@@ -24,6 +24,7 @@ class NativeGateTests(unittest.TestCase):
     def test_lease_lifecycle(self):
         result=subprocess.run([str(NATIVE_BUILD/'lease_test')],capture_output=True,text=True,check=True)
         self.assertIn('late_camera_ack_rejected',result.stdout)
+        self.assertIn('window_proof_current_identity_only',result.stdout)
     def test_real_offscreen_depth_and_state(self):
         result=subprocess.run([str(NATIVE_BUILD/'compositor_test')],capture_output=True,text=True,check=True)
         self.assertIn('transparent_pixel_preserves_host',result.stdout)
