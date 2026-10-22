@@ -1,0 +1,3 @@
+# Archived review patches and exact event excerpts retain original whitespace.
+handoff/development-log/*.diff -whitespace
+handoff/observations/legacy-prototype/*.txt -whitespace
