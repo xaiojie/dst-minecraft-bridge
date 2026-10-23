@@ -21,6 +21,7 @@ struct State {
   dstmc::FrameKey current_key{};
   NSDictionary *window_info = nil;
   WindowProof window_proof;
+  WindowGeometryProof geometry_proof;
   bool enabled = false;
   std::atomic<bool> input_mc{true};
   uint64_t input_version=0;
@@ -252,6 +253,7 @@ void discover(dstmc::FrameKey expected) {
     state().service.release();
     std::lock_guard<std::mutex> lock(state().window_mutex);
     state().window_proof=WindowProof{};
+    state().geometry_proof=WindowGeometryProof{};
     throw;
   }
 }
@@ -292,8 +294,10 @@ NSDictionary *handle(NSString *path, NSString *method, NSDictionary *body) {
 
   if ([path hasPrefix:@"/v2/window"] && [method isEqual:@"GET"]) {
     std::lock_guard<std::mutex> lock(state().window_mutex);
-    if (!state().window_info ||
-        !state().window_proof.accepts(path.UTF8String, milliseconds()))
+    const bool geometry = [path hasPrefix:@"/v2/window/geometry?"];
+    if (!state().window_info || !(geometry
+        ? state().geometry_proof.accepts(path.UTF8String, milliseconds())
+        : state().window_proof.accepts(path.UTF8String, milliseconds())))
       throw std::runtime_error(
           "no recently composited frame for requested identity");
     return [[state().window_info retain] autorelease];
@@ -679,6 +683,7 @@ void present_window(int pw, int ph,
   }
   // Cocoa view geometry is captured only on the native UI thread. Render pixels
   // come from the profiled scene.
+  auto geometry_key=key();
   if ([NSThread isMainThread]) {
     NSWindow *w = [[[NSOpenGLContext currentContext] view] window];
     NSView *v = w.contentView;
@@ -696,8 +701,10 @@ void present_window(int pw, int ph,
           @"logical_height" : @(r.size.height),
           @"physical_width" : @(pw),
           @"physical_height" : @(ph),
-          @"scale" : @(pw / r.size.width)
+          @"scale" : @(pw / r.size.width),
+          @"scale_y" : @(ph / r.size.height)
         } retain];
+        state().geometry_proof.recorded(geometry_key,milliseconds());
       }
     }
   }

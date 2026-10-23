@@ -60,3 +60,8 @@ uv run --with lupa --with jsonschema python tools/check_development.py --out evi
 5. 保存退出再进入，核对方块、原生生物、事件记录和临时代理清理；断开任一游戏后重连。
 6. 跳上方块、搭高台、在平台上下攻击，验证 Y 轴位置、碰撞、受击范围和镜头。
 7. 最后采集60秒指标。`tools/record_acceptance.py --out 新目录 --native-log 当前启动目录/camera-gate.jsonl` 从当前日志偏移开始采样，按不同帧计数，不能用重复合成次数冒充帧率。未提供同次运行证据的功能项保持 NOT_VERIFIED。
+
+
+## Windows native migration
+
+Windows x64 source, CMake/CI, Steam wrapper and loader, DPI/bootstrap geometry, Windows save locking and atomic persistence, Lua mailbox, reversible deployment and platform packaging are implemented. See [Windows startup and acceptance](windows-start.md) and [current handoff](HANDOFF.md). MinGW cross-compilation builds actual PE32+ x64 binaries. Portable contracts and Mac Java/native/Python/Lua checks are separate from Windows-only loader/HTTP execution and real dual-game acceptance. Actual Windows visual/input/collision/combat/save/performance checks remain NOT_VERIFIED until the joint session.

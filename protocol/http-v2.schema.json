@@ -1024,6 +1024,10 @@
         "scale": {
           "type": "number",
           "exclusiveMinimum": 0
+        },
+        "scale_y": {
+          "type": "number",
+          "exclusiveMinimum": 0
         }
       },
       "required": [
@@ -1037,7 +1041,7 @@
         "scale"
       ],
       "additionalProperties": false,
-      "description": "Screen origin and logical size in macOS points; physical size in framebuffer pixels; content area excludes window chrome."
+      "description": "Content rectangle excluding window chrome. Coordinates use macOS desktop points or Windows physical desktop pixels; framebuffer size is physical. scale_y defaults to scale for older producers. Geometry route does not grant activation."
     },
     "ErrorResponse": {
       "type": "object",
@@ -1524,6 +1528,15 @@
         "response": {
           "$ref": "#/$defs/CameraLeaseResponse"
         }
+      }
+    },
+    "127.0.0.1:39380/v2/window/geometry": {
+      "GET": {
+        "query": "pair_hash (SHA256 hex), epoch (UUID)",
+        "response": {
+          "$ref": "#/$defs/WindowResponse"
+        },
+        "description": "Fresh active-session client geometry for bootstrap only. Never authorizes transparency or input suppression."
       }
     }
   }

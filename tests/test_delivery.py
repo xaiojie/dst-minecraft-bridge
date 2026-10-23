@@ -6,17 +6,19 @@ import unittest
 import zipfile
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 def module(name):
-    spec=importlib.util.spec_from_file_location(name,ROOT/'tools'/f'{name}.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+    spec=importlib.util.spec_from_file_location('tools.'+name,ROOT/'tools'/f'{name}.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 class DeliveryTests(unittest.TestCase):
     def test_package_allowlist_excludes_saves_tokens_symlinks(self):
         pack=module('package_release')
         with tempfile.TemporaryDirectory() as td:
             root=pathlib.Path(td);(root/'dst-mod').mkdir();(root/'dst-mod/modmain.lua').write_text('return {}')
             (root/'dst-mod/token.txt').write_text('private');(root/'mc/run/saves/private').mkdir(parents=True)
-            (root/'mc/run/saves/private/level.dat').write_bytes(b'game');(root/'mc/src').mkdir();(root/'mc/src/secret.java').symlink_to(root/'dst-mod/token.txt')
+            (root/'mc/run/saves/private/level.dat').write_bytes(b'game');(root/'mc/src').mkdir();
+            try:(root/'mc/src/secret.java').symlink_to(root/'dst-mod/token.txt')
+            except OSError:pass # Windows hosts without symlink privilege still test the source/save allowlist
             (root/'native/build').mkdir(parents=True);(root/'native/build/libdstmc_probe.dylib').write_bytes(b'library')
             (root/'mc/build/libs').mkdir(parents=True);(root/'mc/build/libs/dst-mc.jar').write_bytes(b'mod')
-            result=pack.package(root,root/'out.zip')
+            result=pack.package(root,root/'out.zip',platform='macos')
             with zipfile.ZipFile(root/'out.zip')as z:
                 names=z.namelist();self.assertIn('dst-mod/modmain.lua',names);self.assertIn('native/build/libdstmc_probe.dylib',names)
                 self.assertFalse(any('token' in n or 'level.dat' in n or 'secret.java' in n for n in names))

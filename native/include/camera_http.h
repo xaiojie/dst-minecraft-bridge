@@ -36,6 +36,19 @@ public:
            now - completed_at_ < 250;
   }
 };
+// Geometry may be used to resize the producer before the first composed frame.
+// Its proof is deliberately distinct from WindowProof, which gates takeover.
+class WindowGeometryProof {
+  std::optional<dstmc::FrameKey> session_;
+  uint64_t observed_at_ = 0;
+public:
+  void recorded(dstmc::FrameKey key,uint64_t now){session_=key;observed_at_=now;}
+  bool accepts(const std::string &path,uint64_t now)const{
+    if(!session_||now<observed_at_||now-observed_at_>=250)return false;
+    auto expected=WindowProof::request(*session_);expected.replace(0,10,"/v2/window/geometry");
+    return path==expected;
+  }
+};
 dstmc::CameraService &camera_service();
 bool enabled();
 dstmc::FrameKey key();

@@ -8,11 +8,33 @@
 #include <optional>
 #include <utility>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 namespace dstmc {
+#if !defined(_MSC_VER)
 static_assert(__atomic_always_lock_free(8,nullptr),"v2 requires lock-free aligned 64-bit atomics");
-#if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#endif
+#if !defined(_WIN32) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error v2 native reader currently supports little-endian hosts only
 #endif
+// The ABI uses aligned shared 64-bit words, not process-local std::atomic objects.
+// MSVC interlocked operations provide a full fence; GNU uses acquire/release.
+inline bool compare_exchange64(uint64_t* p,uint64_t& expected,uint64_t desired) {
+#if defined(_MSC_VER)
+    auto prior=uint64_t(_InterlockedCompareExchange64(reinterpret_cast<volatile long long*>(p),static_cast<long long>(desired),static_cast<long long>(expected)));
+    if(prior==expected)return true;expected=prior;return false;
+#else
+    return __atomic_compare_exchange_n(p,&expected,desired,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+#endif
+}
+inline uint64_t load64(const uint64_t* p) {
+#if defined(_MSC_VER)
+    return uint64_t(_InterlockedCompareExchange64(reinterpret_cast<volatile long long*>(const_cast<uint64_t*>(p)),0,0));
+#else
+    return __atomic_load_n(p,__ATOMIC_ACQUIRE);
+#endif
+}
 struct FrameKey { std::array<uint8_t,32> pair_hash; std::array<uint8_t,16> epoch; uint64_t id; };
 struct Vec3 { double x,y,z; };
 struct FramePose {
@@ -76,7 +98,7 @@ struct FrameView : WorldTransform {
 private:
     uint64_t* lease_{};uint64_t token_{};
     void release() noexcept {
-        if(lease_) { uint64_t expected=token_;__atomic_compare_exchange_n(lease_,&expected,0,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);lease_=nullptr; }
+        if(lease_) { uint64_t expected=token_;compare_exchange64(lease_,expected,0);lease_=nullptr; }
     }
     friend std::optional<FrameView> read_frame(const void*,size_t,FrameKey);
 };
@@ -103,10 +125,10 @@ inline std::optional<FrameView> read_frame(const void* memory,size_t length,Fram
         uint64_t token=tokens.fetch_add(1,std::memory_order_relaxed);
         if(token==0 || token==UINT64_MAX) token=tokens.fetch_add(2,std::memory_order_relaxed)+1;
         uint64_t free=0;
-        if(!__atomic_compare_exchange_n(lease,&free,token,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) continue;
+        if(!compare_exchange64(lease,free,token)) continue;
         FrameView view;view.lease_=lease;view.token_=token;
         auto seq=reinterpret_cast<const uint64_t*>(slot);
-        view.sequence=__atomic_load_n(seq,__ATOMIC_ACQUIRE);
+        view.sequence=load64(seq);
         if(!view.sequence || view.sequence%2) continue;
         if(std::memcmp(slot+16,expected.pair_hash.data(),32) || std::memcmp(slot+48,expected.epoch.data(),16) || load<uint64_t>(slot,64)!=expected.id) continue;
         view.width=load<uint32_t>(slot,72);view.height=load<uint32_t>(slot,76);
@@ -124,7 +146,7 @@ inline std::optional<FrameView> read_frame(const void* memory,size_t length,Fram
             view.pose.view[j]=load<float>(slot,320+j*4);view.pose.projection[j]=load<float>(slot,384+j*4);
             valid &= std::isfinite(view.pose.view[j])&&std::isfinite(view.pose.projection[j]);
         }
-        if(!valid || __atomic_load_n(seq,__ATOMIC_ACQUIRE)!=view.sequence) continue;
+        if(!valid || load64(seq)!=view.sequence) continue;
         view.key=expected;view.color=slot+512;view.depth=view.color+view.layer_bytes;view.hud=view.depth+view.layer_bytes;
         return view;
     }

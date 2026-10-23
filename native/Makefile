@@ -72,3 +72,10 @@ $(BUILD)/scene_pipeline_test: tests/scene_pipeline_test.mm src/entry.mm src/comp
 .PHONY: pipeline-test
 pipeline-test: $(BUILD)/scene_pipeline_test
 	$(BUILD)/scene_pipeline_test
+
+$(BUILD)/window_geometry_test: tests/window_geometry_test.cpp include/camera_http.h
+	mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $< -o $@
+.PHONY: geometry-test
+geometry-test: $(BUILD)/window_geometry_test
+	$(BUILD)/window_geometry_test

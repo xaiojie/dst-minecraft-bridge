@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from tools.prepare_test_copy import prepare
 
-JAVA = '/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home/bin/java'
+from tools.platform_support import find_java
+JAVA = str(find_java())
 
 class TestCopy(unittest.TestCase):
     def setUp(self):

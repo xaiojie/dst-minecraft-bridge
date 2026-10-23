@@ -36,7 +36,7 @@ tasks.register('exchangeTest', JavaExec) { dependsOn contractTestClasses; classp
 tasks.named('runClient') {
     doFirst {
         def launch = file('.gradle/loom-cache/launch.cfg')
-        def installed = providers.gradleProperty('minecraftAssets').getOrElse(System.getProperty('user.home') + '/Downloads/.minecraft/assets')
+        def installed = providers.gradleProperty('minecraftAssets').getOrElse((System.getProperty('os.name').startsWith('Windows') ? System.getenv('APPDATA') + '/.minecraft/assets' : System.getProperty('user.home') + '/Downloads/.minecraft/assets'))
         if (!file(installed).isDirectory()) throw new GradleException('Missing Minecraft assets: use -PminecraftAssets=/absolute/path/to/assets')
         launch.text = launch.text.replace("${gradle.gradleUserHomeDir}/caches/fabric-loom/assets", installed).replace('\t1.21.11-29', '\t29')
     }

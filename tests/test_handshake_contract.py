@@ -14,7 +14,9 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-JAVA_HOME = pathlib.Path('/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home')
+from tools.platform_support import find_java
+JAVA = find_java()
+JAVAC = JAVA.with_name('javac'+JAVA.suffix)
 EXCHANGE = ROOT / 'mc/src/main/java/dev/jay/dstmc/server/WorldExchange.java'
 CONNECTION = ROOT / 'dst-mod/scripts/dstmc/connection.lua'
 
@@ -109,7 +111,7 @@ class HandshakePayloadTests(unittest.TestCase):
 
     def test_java_accepts_the_real_lua_payload_and_stays_strict(self):
         """Compile the real gate and feed it the values extracted from the Lua source."""
-        if not (JAVA_HOME / 'bin/javac').exists():
+        if not JAVAC.exists():
             self.skipTest('JDK 21 unavailable')
         pair = self.body['pair']
         harness = f"""
@@ -153,17 +155,18 @@ public class HandshakeContractCheck {{
 """
         sources = [EXCHANGE,
                    ROOT / 'mc/src/main/java/dev/jay/dstmc/protocol/BridgeTypes.java',
-                   ROOT / 'mc/src/main/java/dev/jay/dstmc/protocol/WorldTransform.java']
+                   ROOT / 'mc/src/main/java/dev/jay/dstmc/protocol/WorldTransform.java',
+                   ROOT / 'mc/src/main/java/dev/jay/dstmc/protocol/AtomicFiles.java']
         with tempfile.TemporaryDirectory(prefix='dstmc-handshake-check-') as temp:
             check = pathlib.Path(temp) / 'HandshakeContractCheck.java'
             check.write_text(harness)
-            subprocess.run([str(JAVA_HOME / 'bin/javac'), '-d', temp, *map(str, sources), str(check)],
+            subprocess.run([str(JAVAC), '-d', temp, *map(str, sources), str(check)],
                            check=True, capture_output=True, text=True)
             args = [pair['dst_world'], pair['dst_shard'], pair['mc_dimension'], pair['region'],
                     self.body['epoch'],
                     str(self.body['dst_origin']['x']), str(self.body['dst_origin']['y']), str(self.body['dst_origin']['z']),
                     str(self.body['mc_origin']['x']), str(self.body['mc_origin']['y']), str(self.body['mc_origin']['z'])]
-            result = subprocess.run([str(JAVA_HOME / 'bin/java'), '-cp', temp,
+            result = subprocess.run([str(JAVA), '-cp', temp,
                                      'dev.jay.dstmc.harness.HandshakeContractCheck', *map(str, args)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

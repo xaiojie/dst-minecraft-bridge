@@ -20,6 +20,7 @@ try:
 except ImportError:
     LuaRuntime=None
 
+@unittest.skipIf(os.name=='nt','macOS GL tests; Windows has CMake/CTest backend tests')
 class NativeGateTests(unittest.TestCase):
     def test_lease_lifecycle(self):
         result=subprocess.run([str(NATIVE_BUILD/'lease_test')],capture_output=True,text=True,check=True)
@@ -30,6 +31,7 @@ class NativeGateTests(unittest.TestCase):
         self.assertIn('transparent_pixel_preserves_host',result.stdout)
         self.assertIn('closer_surface_wins',result.stdout)
 
+@unittest.skipIf(os.name=='nt','macOS native HTTP fixture; Windows uses native DLL smoke tests')
 class NativeHttpTests(unittest.TestCase):
     def test_exact_frame_ack_expiry_and_malformed_http(self):
         for port in (39379,39380):
@@ -134,7 +136,8 @@ class NativeHttpTests(unittest.TestCase):
 
 class WindowActivationTests(unittest.TestCase):
     def test_session_and_dispatch_deadline(self):
-        java_home=pathlib.Path('/Library/Java/JavaVirtualMachines/liberica-jdk-21-full.jdk/Contents/Home')
+        from tools.platform_support import find_java
+        java=find_java();javac=java.with_name('javac'+java.suffix)
         source=ROOT/'mc/src/client/java/dev/jay/dstmc/client/WindowActivation.java'
         harness="""
 package dev.jay.dstmc.client;
@@ -163,8 +166,8 @@ public class WindowActivationCheck {
 """
         with tempfile.TemporaryDirectory(prefix='dstmc-window-policy-') as temp:
             check=pathlib.Path(temp)/'WindowActivationCheck.java';check.write_text(harness)
-            subprocess.run([str(java_home/'bin/javac'),'-d',temp,str(source),str(check)],check=True,capture_output=True,text=True)
-            result=subprocess.run([str(java_home/'bin/java'),'-cp',temp,'dev.jay.dstmc.client.WindowActivationCheck'],capture_output=True,text=True)
+            subprocess.run([str(javac),'-d',temp,str(source),str(check)],check=True,capture_output=True,text=True)
+            result=subprocess.run([str(java),'-cp',temp,'dev.jay.dstmc.client.WindowActivationCheck'],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
 
 @unittest.skipUnless(LuaRuntime,'Lua behavioral checks require lupa (isolated test environment)')

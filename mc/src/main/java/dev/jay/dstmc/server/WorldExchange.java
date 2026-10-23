@@ -60,7 +60,6 @@ public final class WorldExchange {
         active=new HandshakeResult(bound,epoch,transform,"");return active;
     }
     private static void writeAtomic(Path path,byte[] data)throws IOException{
-        Path tmp=Files.createTempFile(path.getParent(),".pending-",".tmp");
-        try{try(var ch=FileChannel.open(tmp,StandardOpenOption.WRITE)){var b=java.nio.ByteBuffer.wrap(data);while(b.hasRemaining())ch.write(b);ch.force(true);}Files.move(tmp,path,StandardCopyOption.ATOMIC_MOVE);try(var dir=FileChannel.open(path.getParent(),StandardOpenOption.READ)){dir.force(true);}}finally{Files.deleteIfExists(tmp);}
+        AtomicFiles.write(path,data);
     }
 }

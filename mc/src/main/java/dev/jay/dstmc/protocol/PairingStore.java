@@ -40,11 +40,6 @@ public final class PairingStore {
     private static Vec3 readVec(DataInputStream in) throws IOException { return new Vec3(in.readDouble(),in.readDouble(),in.readDouble()); }
     private static void writeVec(DataOutputStream out,Vec3 p) throws IOException { out.writeDouble(p.x());out.writeDouble(p.y());out.writeDouble(p.z()); }
     static void atomicWrite(Path file,byte[] data) throws IOException {
-        Path tmp=Files.createTempFile(file.getParent(),".pending-",".tmp");
-        try {
-            try(var channel=FileChannel.open(tmp,StandardOpenOption.WRITE)) { var b=java.nio.ByteBuffer.wrap(data); while(b.hasRemaining()) channel.write(b); channel.force(true); }
-            Files.move(tmp,file,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
-            try(var parent=FileChannel.open(file.getParent(),StandardOpenOption.READ)) { parent.force(true); }
-        } finally { Files.deleteIfExists(tmp); }
+        AtomicFiles.write(file,data);
     }
 }

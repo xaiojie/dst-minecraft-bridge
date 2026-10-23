@@ -2,18 +2,28 @@
 -- Files contain only control metadata; image pixels stay in the leased mmap ring.
 local json=require('json')
 local identity=require('components/dstmcidentity')
-local M={};local directory,pending
+local M={};local directory,pending,windows_path
 function M.Bind(path)
-    if type(path)=='string' and path:sub(1,1)=='/' and io and os and os.rename then directory=path;return true end
+    if type(path)~='string' then return false end
+    local drive=path:match('^%a:[/\\]')~=nil
+    local unc=path:sub(1,2)=='\\\\'
+    if (path:sub(1,1)=='/' or drive or unc) and io and os and os.rename then directory=path;windows_path=drive or unc;return true end
     return false
 end
 function M.Active()return directory~=nil end
-function M.Close()directory=nil;pending=nil end
+function M.Close()directory=nil;pending=nil;windows_path=nil end
 function M.Request(path,body,callback)
     if not directory or pending then return false end
     local id=identity.NewUUID();local temporary=directory..'/request-'..id..'.tmp'
     local f=io.open(temporary,'w');if not f then M.Close();return false end
-    local ok=pcall(function()f:write(json.encode({id=id,path=path,body=body}));f:close();assert(os.rename(temporary,directory..'/request.json'))end)
+    local ok=pcall(function()
+        f:write(json.encode({id=id,path=path,body=body}));f:close()
+        -- Lua's Windows rename cannot replace an existing file. There is only
+        -- one producer and one outstanding request; readers safely skip the
+        -- brief absent-file interval and never see partial JSON.
+        if windows_path then os.remove(directory..'/request.json')end
+        assert(os.rename(temporary,directory..'/request.json'))
+    end)
     if not ok then pcall(function()f:close()end);os.remove(temporary);M.Close();return false end
     pending={id=id,callback=callback,at=GetTimeRealSeconds()};return true
 end

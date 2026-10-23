@@ -55,6 +55,12 @@ def emit(value):
 
 
 def main(argv=None, *, environment=None):
+    if sys.platform=='win32':
+        if __package__:
+            from . import windows_steam
+        else:
+            import windows_steam
+        return windows_steam.main(argv,environment=environment)
     parser = argparse.ArgumentParser(
         description='Invoked by Steam as "ABSOLUTE_WRAPPER_PATH" %command%. '
                     'A Steam app ID marker is an operational guard, not authentication.',
@@ -66,17 +72,22 @@ def main(argv=None, *, environment=None):
     args = parser.parse_args(argv)
     environment = dict(os.environ if environment is None else environment)
     marker, blockers = steam_marker(environment)
-    executable = preflight.DEFAULT_EXE.resolve()
-    app = executable.parents[2]
     if args.app is None and not args.dry_run:
         emit({'blockers': ['missing_app'], 'message': 'Steam must supply the canonical APP via %command%.'})
-        return 2
-    if args.app is not None and Path(args.app).resolve() != app:
-        emit({'blockers': ['noncanonical_app'], 'message': 'Only the canonical DST .app is accepted.'})
         return 2
     if blockers and not args.dry_run:
         emit({'blockers': blockers, 'message': 'Actual starts require SteamAppId or SteamGameId=322330; '
               'all supplied IDs must agree. Start through Steam.'})
+        return 2
+
+    try:
+        executable = preflight.resolve_dst_executable()
+    except ValueError as error:
+        emit({'blockers': [str(error)]})
+        return 1
+    app = executable.parents[2]
+    if args.app is not None and Path(args.app).resolve() != app:
+        emit({'blockers': ['noncanonical_app'], 'message': 'Only the DST .app registered in Steam is accepted.'})
         return 2
 
     result = preflight.preflight(executable, preflight.DEFAULT_CLUSTER)

@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 
+@unittest.skipIf(sys.platform=='win32','macOS Steam wrapper; Windows wrapper tested separately')
 class SteamWrapperTests(unittest.TestCase):
     def setUp(self):
         source = Path(__file__).resolve().parents[1] / 'tools/steam_dst.py'
@@ -48,7 +49,7 @@ class SteamWrapperTests(unittest.TestCase):
         self.open_returncode = 0
         self.addCleanup(patch.stopall)
         patch.object(self.wrapper, 'ROOT', self.root).start()
-        patch.object(self.wrapper.preflight, 'DEFAULT_EXE', self.exe).start()
+        patch.object(self.wrapper.preflight, 'resolve_dst_executable', return_value=self.exe).start()
         patch.object(self.wrapper.preflight, 'preflight', self.check).start()
         patch.object(self.wrapper.subprocess, 'run', self.open_boundary).start()
 
@@ -107,6 +108,15 @@ class SteamWrapperTests(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assert_no_launch_effects()
         self.assertEqual(self.exe, self.preflight_calls[0][0])
+
+    def test_install_discovery_failure_prevents_preflight_and_writes(self):
+        with patch.object(self.wrapper.preflight, 'resolve_dst_executable',
+                          side_effect=ValueError('ambiguous_dst_installs')):
+            code, output = self.run_wrapper()
+        self.assertEqual(1, code)
+        self.assertIn('ambiguous_dst_installs', json.loads(output)['blockers'])
+        self.assertEqual([], self.preflight_calls)
+        self.assert_no_launch_effects()
 
     # Break: trusting preflight.ready without checking the required library and entitlements.
     def test_library_architecture_and_both_entitlements_are_required(self):
@@ -228,6 +238,7 @@ class FreshInterpreterReadOnlyTests(unittest.TestCase):
                 'from pathlib import Path\n'
                 f'DEFAULT_EXE = Path({str(app / "Contents/MacOS/game")!r})\n'
                 f'DEFAULT_CLUSTER = Path({str(root / "cluster")!r})\n'
+                'def resolve_dst_executable(): return DEFAULT_EXE\n'
                 'def preflight(executable, cluster):\n'
                 '    return {"ready": False, "blockers": ["fixture_blocker"],\n'
                 '            "extension": {"path": "/fixture/probe.dylib", "architecture": "x86_64"},\n'

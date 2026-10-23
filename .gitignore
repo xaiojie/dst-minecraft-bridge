@@ -2,6 +2,9 @@
 .superpowers/
 **/.gradle/
 **/build/
+native/build-*/
+*.dll
+*.exe
 mc/run/
 evidence/
 *.dylib

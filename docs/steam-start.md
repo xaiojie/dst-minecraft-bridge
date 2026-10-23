@@ -12,7 +12,7 @@
 3. 点击 Steam「开始游戏」，进入原测试世界。
 4. 恢复时移除本项目添加的整段启动前缀和包装器配置，恢复原来保存的启动选项；若原来为空，清空本次新增的整行。
 
-包装器只接受包含 `preflight.DEFAULT_EXE` 的规范 DST `.app`。实际启动要求 `SteamAppId` 或 `SteamGameId` 为 `322330`，且所有已提供的标记一致；这是防止误操作的检查，不是身份认证。检查可执行文件、已有进程、探针库、库的 `x86_64` 架构和两项所需 entitlement 后，才会产生证据和调用 `/usr/bin/open`。旧 `preflight.py --launch` 继续拒绝直接启动。
+包装器读取 Steam 的 `libraryfolders.vdf` 和 `appmanifest_322330.acf`，只接受当前登记安装的 DST `.app`；支持迁移到外置 Steam 库，不会选用未登记的旧副本。安装缺失、登记冲突或元数据异常时拒绝启动。实际启动要求 `SteamAppId` 或 `SteamGameId` 为 `322330`，且所有已提供的标记一致；这是防止误操作的检查，不是身份认证。检查可执行文件、已有进程、探针库、库的 `x86_64` 架构和两项所需 entitlement 后，才会产生证据和调用 `/usr/bin/open`。旧 `preflight.py --launch` 继续拒绝直接启动。
 
 包装器执行形状为 `steam_dst.py [--dry-run] APP [GAME_ARG ...]`。包装器选项放在 APP 前；APP 后的所有参数原样传给游戏，包括空格、单引号和以 `--` 开头的参数。不使用 shell 重建命令。Steam 提供的覆盖层库优先保留，也合并原有 `DYLD_INSERT_LIBRARIES` 并去重，再加入当前探针库。DYLD 变量通过 `open --env` 仅传给目标应用，不放进 `open` 进程环境；不设置全局环境。
 

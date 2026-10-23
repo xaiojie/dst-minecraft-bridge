@@ -87,7 +87,8 @@ void present() {
     c.compositor.hud(*displayed);
     glBindFramebufferEXT(GL_FRAMEBUFFER_EXT,fbo);glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
   }
-  present_window(c.scene_camera.viewport[2],c.scene_camera.viewport[3],
+  GLint viewport[4];glGetIntegerv(GL_VIEWPORT,viewport);
+  present_window(viewport[2],viewport[3],
       proven ? std::optional<dstmc::FrameKey>(displayed->key) : std::nullopt);
   c.displayed.reset();
   c.depth.reset();

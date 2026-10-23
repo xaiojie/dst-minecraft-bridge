@@ -12,7 +12,7 @@ public final class FramePublisherTest {
  static void completed(FramePublisher p,long g){p.world(g,POSE,rgba(),depth());p.hud(g,rgba());}
  static void check(boolean b,String s){if(!b)throw new AssertionError(s);}
  static int readNative(Path helper,FramePublisher p,FrameKey key)throws Exception{
-  return new ProcessBuilder("/usr/bin/arch","-x86_64",helper.toString(),p.path().toString(),HexFormat.of().formatHex(pairHash(key.pair())),key.epoch().toString().replace("-",""),Long.toUnsignedString(key.id())).inheritIO().start().waitFor();
+  var command=new ArrayList<String>();if(System.getProperty("os.name").startsWith("Mac"))command.addAll(List.of("/usr/bin/arch","-x86_64"));command.addAll(List.of(helper.toString(),p.path().toString(),HexFormat.of().formatHex(pairHash(key.pair())),key.epoch().toString().replace("-",""),Long.toUnsignedString(key.id())));return new ProcessBuilder(command).inheritIO().start().waitFor();
  }
  interface Test{void run()throws Exception;}
  static int failures;
@@ -35,9 +35,17 @@ public final class FramePublisherTest {
   test("resize_discards_pending_readback",()->{try(var p=publisher()){long old=p.generation();p.world(old,POSE,rgba(),depth());p.resize(2,1);p.hud(old,rgba());check(p.publishCompleted().isEmpty(),"stale resize callback published");check(p.generation()!=old,"generation unchanged");}});
   // Break: native-endian packed integers swap red/blue or leave straight alpha.
   test("alpha_and_channel_order",()->{
-   check(System.getProperty("os.arch").equals("aarch64"),"test requires actual ARM64 Java producer");
-   var helper=Files.createTempDirectory("publisher-native").resolve("rgba-reader");
-   check(new ProcessBuilder("clang++","-arch","x86_64","-std=c++17","-Wall","-Wextra","-Werror","-O2","-I../native/include","src/contractTest/cpp/publisher_rgba_reader.cpp","-o",helper.toString()).inheritIO().start().waitFor()==0,"native reader compile failed");
+   Path helper;
+   if(System.getProperty("os.name").startsWith("Windows")){
+    helper=Path.of(System.getenv().getOrDefault("DSTMC_RGBA_READER","../native/build-windows/Release/publisher_rgba_reader.exe")).toAbsolutePath();
+    if(!Files.isRegularFile(helper))helper=Path.of("../native/build-windows/publisher_rgba_reader.exe").toAbsolutePath();
+    check(Files.isRegularFile(helper),"build Windows CMake publisher_rgba_reader before Java checks");
+   }else{
+    helper=Files.createTempDirectory("publisher-native").resolve("rgba-reader");
+    var compile=new ArrayList<String>(List.of("clang++","-std=c++17","-Wall","-Wextra","-Werror","-O2","-I../native/include","src/contractTest/cpp/publisher_rgba_reader.cpp","-o",helper.toString()));
+    if(System.getProperty("os.name").startsWith("Mac")){compile.add(1,"-arch");compile.add(2,"x86_64");}
+    check(new ProcessBuilder(compile).inheritIO().start().waitFor()==0,"native reader compile failed");
+   }
    try(var p=publisher()){
     // Input is already premultiplied, as real GL blend output is. Do not call
     // the conversion helper here: the producer must preserve these exact bytes.
